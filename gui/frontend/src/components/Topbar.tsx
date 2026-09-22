@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import { Bell, Menu, Search } from "lucide-react";
 
 export default function Topbar({
@@ -17,7 +18,21 @@ export default function Topbar({
   symbols: string[];
   onMenu: () => void;
 }) {
-  const clock = new Date().toLocaleTimeString("en-US", { hour12: false });
+  // placeholder during SSR/hydration — time is set in an effect so the
+  // static prerendered HTML always matches the first client render
+  const [clock, setClock] = useState("--:--:--");
+  useEffect(() => {
+    const fmt = () =>
+      setClock(
+        new Date().toLocaleTimeString("en-US", {
+          hour12: false,
+          timeZone: "UTC",
+        })
+      );
+    fmt();
+    const id = setInterval(fmt, 1000);
+    return () => clearInterval(id);
+  }, []);
   return (
     <header className="sticky top-0 z-30 backdrop-blur-xl bg-ink-950/70 border-b border-white/[0.06]">
       <div className="px-4 sm:px-6 py-3 flex items-center gap-3">
