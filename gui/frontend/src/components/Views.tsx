@@ -164,7 +164,13 @@ export function OrdersView({
     <div className="space-y-5">
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-5">
         <div className="xl:col-span-2 space-y-5">
-          <OrdersTable orders={orders} onCancel={live} allowCancelAll={live} page={page} />
+          <OrdersTable
+            orders={orders}
+            onCancel={live}
+            allowCancelAll={live}
+            page={page}
+            onModified={() => fetchPage(offset)}
+          />
           <FillsTable fills={fills} />
         </div>
         <div>

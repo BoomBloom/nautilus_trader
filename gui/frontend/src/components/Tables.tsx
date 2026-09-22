@@ -1,7 +1,7 @@
 "use client";
 
-import { useState } from "react";
-import { cancelAllOrders, cancelOrder } from "@/lib/api";
+import { Fragment, useState } from "react";
+import { cancelAllOrders, cancelOrder, modifyOrder } from "@/lib/api";
 import { fmtMoney, fmtNum } from "@/lib/format";
 import type { Fill, Order, Position } from "@/lib/types";
 
@@ -149,15 +149,21 @@ export function OrdersTable({
   onCancel = false,
   allowCancelAll = false,
   page = null,
+  onModified = null,
 }: {
   orders: Order[];
   onCancel?: boolean;
   allowCancelAll?: boolean;
   page?: { limit: number; offset: number; total: number; onPage: (o: number) => void } | null;
+  onModified?: (() => void) | null;
 }) {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [allBusy, setAllBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [editId, setEditId] = useState<string | null>(null);
+  const [editQty, setEditQty] = useState("");
+  const [editPrice, setEditPrice] = useState("");
+  const [modId, setModId] = useState<string | null>(null);
 
   const cancel = async (id: string) => {
     setBusyId(id);
@@ -180,6 +186,39 @@ export function OrdersTable({
       setErr(e instanceof Error ? e.message : "Cancel all failed");
     } finally {
       setAllBusy(false);
+    }
+  };
+
+  const startEdit = (o: Order) => {
+    setEditId(o.id);
+    setEditQty(String(o.qty ?? ""));
+    setEditPrice(o.price != null ? String(o.price) : "");
+    setErr(null);
+  };
+
+  const saveModify = async (o: Order) => {
+    const isLimit = /LIMIT/.test(o.type || "");
+    if (!editQty.trim()) {
+      setErr("Qty is required to modify an order");
+      return;
+    }
+    if (isLimit && !editPrice.trim()) {
+      setErr("Price is required to modify a limit order");
+      return;
+    }
+    setModId(o.id);
+    setErr(null);
+    try {
+      await modifyOrder(o.id, {
+        qty: editQty.trim(),
+        ...(isLimit ? { price: editPrice.trim() } : {}),
+      });
+      setEditId(null);
+      onModified?.();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Modify failed");
+    } finally {
+      setModId(null);
     }
   };
 
@@ -235,8 +274,10 @@ export function OrdersTable({
             {orders.map((o) => {
               const canCancel = onCancel && OPEN_STATUSES.has((o.status || "").toUpperCase());
               const filled = o.filled_qty != null && o.filled_qty > 0;
+              const isLimit = /LIMIT/.test(o.type || "");
               return (
-                <tr key={o.id} className="hover:bg-white/[0.03] transition">
+                <Fragment key={o.id}>
+                <tr className="hover:bg-white/[0.03] transition">
                   <td className="px-5 py-2.5 font-mono text-slate-500 text-[12px]">{o.id}</td>
                   <td className="px-5 py-2.5 font-semibold text-white">{o.symbol}</td>
                   <td className="px-5 py-2.5">
@@ -264,10 +305,19 @@ export function OrdersTable({
                     </span>
                   </td>
                   {onCancel && (
-                    <td className="px-5 py-2.5 text-right">
+                    <td className="px-5 py-2.5 text-right whitespace-nowrap">
+                      {editId !== o.id && (
+                        <button
+                          onClick={() => startEdit(o)}
+                          disabled={!canCancel || busyId === o.id}
+                          className="text-[11px] font-bold uppercase px-2 py-1 mr-1.5 rounded bg-indigo-500/15 text-indigo-300 hover:bg-indigo-500/25 disabled:opacity-30 disabled:cursor-not-allowed transition"
+                        >
+                          Modify
+                        </button>
+                      )}
                       <button
                         onClick={() => cancel(o.id)}
-                        disabled={!canCancel || busyId === o.id}
+                        disabled={!canCancel || busyId === o.id || modId === o.id}
                         className="text-[11px] font-bold uppercase px-2 py-1 rounded bg-rose-500/15 text-rose-400 hover:bg-rose-500/25 disabled:opacity-30 disabled:cursor-not-allowed transition"
                       >
                         {busyId === o.id ? "…" : "Cancel"}
@@ -275,6 +325,50 @@ export function OrdersTable({
                     </td>
                   )}
                 </tr>
+                {editId === o.id && (
+                  <tr className="bg-indigo-500/[0.05]">
+                    <td colSpan={colCount} className="px-5 py-3">
+                      <div className="flex flex-wrap items-center gap-3">
+                        <span className="text-[10px] uppercase tracking-wider text-slate-500 font-semibold">
+                          Modify {o.symbol} {o.id}
+                        </span>
+                        <label className="flex items-center gap-2 text-[12px] text-slate-400">
+                          Qty
+                          <input
+                            value={editQty}
+                            onChange={(e) => setEditQty(e.target.value)}
+                            className="w-24 rounded bg-white/[0.06] border border-white/[0.08] px-2 py-1 text-[12px] text-white font-mono focus:outline-none focus:border-indigo-500/60"
+                          />
+                        </label>
+                        {isLimit && (
+                          <label className="flex items-center gap-2 text-[12px] text-slate-400">
+                            Price
+                            <input
+                              value={editPrice}
+                              onChange={(e) => setEditPrice(e.target.value)}
+                              className="w-28 rounded bg-white/[0.06] border border-white/[0.08] px-2 py-1 text-[12px] text-white font-mono focus:outline-none focus:border-indigo-500/60"
+                            />
+                          </label>
+                        )}
+                        <button
+                          onClick={() => saveModify(o)}
+                          disabled={modId === o.id}
+                          className="text-[11px] font-bold uppercase px-2 py-1 rounded bg-indigo-500/15 text-indigo-300 hover:bg-indigo-500/25 disabled:opacity-30 disabled:cursor-not-allowed transition"
+                        >
+                          {modId === o.id ? "…" : "Save"}
+                        </button>
+                        <button
+                          onClick={() => setEditId(null)}
+                          disabled={modId === o.id}
+                          className="text-[11px] font-bold uppercase px-2 py-1 rounded bg-white/[0.06] text-slate-300 hover:bg-white/[0.1] disabled:opacity-30 disabled:cursor-not-allowed transition"
+                        >
+                          Discard
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                )}
+                </Fragment>
               );
             })}
           </tbody>
