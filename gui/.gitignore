@@ -11,3 +11,5 @@ out/
 __pycache__/
 *.py[cod]
 .venv/
+# root .gitignore has `requirements*` — keep backend deps tracked
+!requirements.txt
