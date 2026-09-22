@@ -39,3 +39,59 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt pytest httpx
       - run: pytest tests -q
+
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: gui/backend/requirements.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: |
+            gui/frontend/package-lock.json
+            gui/e2e/package-lock.json
+      - name: Backend deps
+        working-directory: gui/backend
+        run: pip install -r requirements.txt
+      - name: Frontend deps and build
+        working-directory: gui/frontend
+        run: |
+          npm ci
+          npm run build
+      - name: Start backend
+        working-directory: gui/backend
+        run: |
+          nohup uvicorn app.main:app --host 127.0.0.1 --port 8000 > /tmp/backend.log 2>&1 &
+          echo $! > /tmp/backend.pid
+      - name: Start frontend
+        working-directory: gui/frontend
+        run: |
+          nohup npm run start -- -p 3000 > /tmp/frontend.log 2>&1 &
+          echo $! > /tmp/frontend.pid
+      - name: Wait for servers
+        run: |
+          for i in $(seq 1 60); do
+            curl -sf http://127.0.0.1:8000/api/health >/dev/null \
+              && curl -sf -o /dev/null http://127.0.0.1:3000/ && break
+            sleep 2
+          done
+          curl -sf http://127.0.0.1:8000/api/health
+          echo
+          curl -sf -o /dev/null http://127.0.0.1:3000/ && echo "frontend up"
+      - name: Install Playwright
+        working-directory: gui/e2e
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+      - name: Run browser E2E
+        working-directory: gui/e2e
+        env:
+          BASE_URL: http://127.0.0.1:3000
+        run: npm test

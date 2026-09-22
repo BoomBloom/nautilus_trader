@@ -1,0 +1,11 @@
+{
+  "name": "nautilus-gui-e2e",
+  "private": true,
+  "description": "Browser E2E for the Nautilus GUI (Playwright)",
+  "scripts": {
+    "test": "node run.js"
+  },
+  "devDependencies": {
+    "playwright": "1.63.0"
+  }
+}

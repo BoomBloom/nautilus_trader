@@ -13,3 +13,6 @@ __pycache__/
 .venv/
 # root .gitignore has `requirements*` — keep backend deps tracked
 !requirements.txt
+
+# E2E screenshots (regenerated per run)
+e2e/shots/
