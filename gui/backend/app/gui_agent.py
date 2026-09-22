@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from nautilus_trader.config import StrategyConfig
-from nautilus_trader.model import InstrumentId, OrderSide, TimeInForce
+from nautilus_trader.model import ClientOrderId, InstrumentId, OrderSide, TimeInForce
 from nautilus_trader.trading import Strategy
 
 from .hub import hub
@@ -104,6 +104,13 @@ class GuiAgent(Strategy):
                 self.subscribe_quotes(iid)
             except Exception as exc:
                 self._push_event("agent", f"Subscribe failed for {raw}: {exc}", "bad")
+                continue
+            # Quote streams alone never populate the engine cache — request the
+            # instrument so cache.instrument() resolves for order commands.
+            try:
+                self.request_instrument(iid)
+            except Exception as exc:
+                self._push_event("agent", f"Instrument request failed for {raw}: {exc}", "bad")
 
         self.clock.set_timer(
             "gui_agent.snapshot",
@@ -251,7 +258,7 @@ class GuiAgent(Strategy):
         if instrument is None:
             raise ValueError(f"Unknown instrument {cmd['instrument_id']}")
         side = OrderSide.BUY if str(cmd.get("side", "")).lower() == "buy" else OrderSide.SELL
-        qty = instrument.make_qty(str(cmd["qty"]))
+        qty = instrument.make_qty(float(cmd["qty"]))
         tif = TIF.get(str(cmd.get("tif", "GTC")).upper(), TimeInForce.GTC)
         tif_raw = str(cmd.get("tif", "GTC")).upper()
         order_type = str(cmd.get("type", "MARKET")).upper()
@@ -265,7 +272,7 @@ class GuiAgent(Strategy):
         if order_type == "LIMIT":
             if cmd.get("price") in (None, "", 0, "0"):
                 raise ValueError("Limit orders require a price")
-            price = instrument.make_price(str(cmd["price"]))
+            price = instrument.make_price(float(cmd["price"]))
             order = self.order_factory.limit(
                 iid,
                 side,
@@ -277,7 +284,7 @@ class GuiAgent(Strategy):
         elif order_type == "STOP_MARKET":
             if cmd.get("trigger_price") in (None, "", 0, "0"):
                 raise ValueError("STOP_MARKET orders require a trigger price")
-            trigger = instrument.make_price(str(cmd["trigger_price"]))
+            trigger = instrument.make_price(float(cmd["trigger_price"]))
             order = self.order_factory.stop_market(
                 iid,
                 side,
@@ -291,8 +298,8 @@ class GuiAgent(Strategy):
                 raise ValueError("STOP_LIMIT orders require a price")
             if cmd.get("trigger_price") in (None, "", 0, "0"):
                 raise ValueError("STOP_LIMIT orders require a trigger price")
-            price = instrument.make_price(str(cmd["price"]))
-            trigger = instrument.make_price(str(cmd["trigger_price"]))
+            price = instrument.make_price(float(cmd["price"]))
+            trigger = instrument.make_price(float(cmd["trigger_price"]))
             order = self.order_factory.stop_limit(
                 iid,
                 side,
@@ -328,22 +335,22 @@ class GuiAgent(Strategy):
         )
 
     def _cmd_cancel(self, cmd: dict) -> None:
-        order = self.cache.order(cmd["order_id"])
+        order = self.cache.order(ClientOrderId.from_str(str(cmd["order_id"])))
         if order is None:
             raise ValueError(f"Order not found: {cmd['order_id']}")
-        self.cancel_order(order)
+        self.cancel_order(order.client_order_id)
         self._push_event("order", f"Cancel {cmd['order_id']}", "warn")
 
     def _cmd_modify(self, cmd: dict) -> None:
-        order = self.cache.order(cmd["order_id"])
+        order = self.cache.order(ClientOrderId.from_str(str(cmd["order_id"])))
         if order is None:
             raise ValueError(f"Order not found: {cmd['order_id']}")
         instrument = self.cache.instrument(order.instrument_id)
         if instrument is None:
             raise ValueError("Instrument not in cache")
-        qty = instrument.make_qty(str(cmd["qty"])) if cmd.get("qty") else order.quantity
-        price = instrument.make_price(str(cmd["price"])) if cmd.get("price") else order.price
-        self.modify_order(order, qty, price)
+        qty = instrument.make_qty(float(cmd["qty"])) if cmd.get("qty") else order.quantity
+        price = instrument.make_price(float(cmd["price"])) if cmd.get("price") else order.price
+        self.modify_order(order.client_order_id, qty, price)
         self._push_event("order", f"Modify {cmd['order_id']}", "info")
 
     # ------------------------------------------------------------------ market data → candles
