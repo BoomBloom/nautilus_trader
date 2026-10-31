@@ -25,8 +25,23 @@
 //! Requests can await default and per-key quotas from one or more shared
 //! [`RateLimiter`](crate::ratelimiter::RateLimiter) instances. Sharing a limiter across clients
 //! enforces one process-wide budget for scopes such as an IP address or account. The client accepts
-//! default and per-request headers, repeated query values, raw bodies, client-level and per-request
-//! timeouts, and an optional proxy.
+//! default and per-request headers, repeated query values, raw bodies, and client-level and
+//! per-request timeouts.
+//!
+//! # Proxy routing
+//!
+//! By default the client honors ambient proxy configuration: with `use_system_proxy` left at its
+//! default of `true` and no explicit `proxy_url`, requests are routed through the proxy named by
+//! `HTTP_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY` (lowercase variants included), except destinations
+//! matched by `NO_PROXY`.
+//!
+//! This default is a deliberate trust decision on the process environment: an actor who controls
+//! it chooses the proxy that observes all plaintext HTTP traffic and the CONNECT tunnels that
+//! carry HTTPS.
+//!
+//! An optional explicit `proxy_url` applies to both HTTP and HTTPS traffic and always takes
+//! precedence over ambient lookup. Passing `use_system_proxy(false)` disables ambient lookup, so
+//! requests route directly only when `proxy_url` is unset.
 //!
 //! HTTP status errors remain [`HttpResponse`] values for adapter-specific handling. The transport
 //! retries requests canceled before transmission on reused connections, and allows two retries for
@@ -37,12 +52,28 @@
 //! # Connection and response policy
 //!
 //! Production clients built through [`HttpClient::builder`] enable `TCP_NODELAY`, pooled idle
-//! connections, HTTP/2 keepalive while idle, and adaptive HTTP/2 flow control. Buffered responses
-//! retain only configured header fields and reject bodies larger than 100 MiB, including chunked
-//! bodies without a declared length. [`HttpClient::get_stream`] consumes bodies incrementally
-//! without a total size limit. Transport error messages carry the request URL without its query
-//! string or fragment, and the `_url_redacted` request methods omit the URL entirely; the client
-//! itself logs request metadata only, never URLs.
+//! connections, and HTTP/2 keepalive while idle.
+//!
+//! HTTP/2 connections use fixed flow-control windows of 16 MiB per stream and 32 MiB per
+//! connection, larger than Hyper's fixed defaults of 2 MiB and 5 MiB. Setting
+//! `NAUTILUS_HTTP2_ADAPTIVE_WINDOW=true` before building a client enables Hyper's adaptive windows
+//! instead, which start at 65,535 bytes and grow toward 16 MiB through PING probes and SETTINGS
+//! updates. Cloudflare-fronted endpoints can reset large response bodies mid-transfer under
+//! adaptive windows. The value `false` keeps fixed windows, and any other value fails the build.
+//!
+//! Buffered requests advertise gzip unless default or per-request headers set `Accept-Encoding`.
+//! Gzip responses are decoded before return; unsupported encodings and corrupt bodies are errors.
+//! The request deadline includes gzip decoding. Responses whose method or status forbids content
+//! preserve their encoding metadata. Decoded responses omit `Content-Encoding` and `Content-Length`,
+//! even when selected through `header_keys`.
+//!
+//! Buffered responses reject wire bodies larger than 100 MiB, including chunked bodies without a
+//! declared length. Decoded bodies have a separate 100 MiB default limit, configurable through
+//! `max_decompressed_bytes`. [`HttpClient::get_stream`] returns raw body chunks without decoding,
+//! adding `Accept-Encoding`, or applying a total size limit. Request URLs in transport errors and
+//! response-stream diagnostics are limited to their origin (scheme, host, and port). Setting `redact_url(true)` on the
+//! builder omits the origin too. This policy controls the URL context added by this client;
+//! diagnostic messages from lower layers are unchanged. The client logs request metadata only, never URLs.
 //!
 //! Hyper owns the lifecycle of individual pooled connections, so this client exposes no socket
 //! state sink or explicit reconnect operation. Callers observe connection failure through each
@@ -52,6 +83,8 @@ pub mod client;
 pub mod error;
 pub mod types;
 
+mod stream;
+
 #[cfg(not(all(feature = "simulation", madsim)))]
 mod connector;
 #[cfg(all(feature = "simulation", madsim))]
@@ -59,18 +92,19 @@ mod simulation;
 #[cfg(not(all(feature = "simulation", madsim)))]
 mod transport;
 
-mod stream;
-
 #[cfg(all(test, not(all(feature = "simulation", madsim))))]
 mod tests;
 
 // Re-exports
 pub use client::{HttpClient, HttpRedirectPolicy, InnerHttpClient};
 pub use error::HttpClientError;
-pub use http::{Method, StatusCode, header::USER_AGENT};
+pub use http::{
+    Method, StatusCode,
+    header::{RETRY_AFTER, USER_AGENT},
+};
 use nautilus_core::consts::NAUTILUS_USER_AGENT;
 pub use stream::HttpResponseStream;
-pub use types::{HttpMethod, HttpResponse, HttpStatus};
+pub use types::{HttpMethod, HttpResponse, HttpStatus, parse_retry_after};
 pub use url::Url;
 
 /// Returns the standard headers every NautilusTrader HTTP and WebSocket client sends.

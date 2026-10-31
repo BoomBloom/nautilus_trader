@@ -23,6 +23,7 @@ pub mod custom;
 pub mod delta;
 pub mod depth;
 pub mod funding;
+pub mod greeks;
 pub mod index_price;
 pub mod instrument;
 pub mod instrument_status;
@@ -37,11 +38,11 @@ pub mod report;
 pub mod snapshot;
 pub mod trade;
 
-#[cfg(feature = "arrow-display")]
-pub mod display;
-
 mod depth_display;
 mod display_conversion;
+
+#[cfg(feature = "arrow-display")]
+pub mod display;
 
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -58,9 +59,9 @@ use std::{
 use arrow::{
     array::{
         Array, ArrayRef, BinaryArray, BinaryViewArray, Decimal128Array, DictionaryArray,
-        FixedSizeBinaryArray, Int32Array, Int64Array, StringArray, StringBuilder,
-        StringDictionaryBuilder, StringViewArray, StructArray, TimestampNanosecondArray,
-        UInt8Array, UInt32Array, UInt64Array,
+        Int32Array, Int64Array, StringArray, StringBuilder, StringDictionaryBuilder,
+        StringViewArray, StructArray, TimestampNanosecondArray, UInt8Array, UInt32Array,
+        UInt64Array,
     },
     buffer::NullBuffer,
     datatypes::{DataType, Field, Int8Type, Int32Type, Schema, TimeUnit},
@@ -79,10 +80,7 @@ use nautilus_model::{
     identifiers::InstrumentId,
     types::{
         Currency, Money, PRICE_ERROR, PRICE_UNDEF, Price, QUANTITY_UNDEF, Quantity,
-        fixed::{
-            FIXED_PRECISION, FIXED_PRECISION_STANDARD, PRECISION_BYTES, correct_price_raw,
-            correct_quantity_raw,
-        },
+        fixed::{FIXED_PRECISION, FIXED_PRECISION_STANDARD},
         money::MoneyRaw,
         price::PriceRaw,
         quantity::{QUANTITY_RAW_MAX, QuantityRaw},
@@ -93,14 +91,12 @@ use pyo3::prelude::*;
 use rust_decimal::Decimal;
 use ustr::Ustr;
 
-use self::legacy::legacy_enum_dictionary_column;
 pub use self::legacy::{
-    is_legacy_enum_field, is_nautilus_legacy_schema, is_nautilus_timestamp_schema,
-    is_timestamp_field, normalize_legacy_fixed_columns, normalized_legacy_data_type,
-    normalized_timestamp_type,
+    is_nautilus_legacy_schema, is_nautilus_timestamp_schema, is_timestamp_field,
+    normalize_legacy_fixed_columns, normalized_legacy_data_type, normalized_timestamp_type,
 };
 
-// Define metadata key constants constants
+// Define metadata key constants
 pub const KEY_BAR_TYPE: &str = "bar_type";
 pub const KEY_IDENTIFIER: &str = "identifier";
 pub const KEY_INSTRUMENT_ID: &str = "instrument_id";
@@ -132,6 +128,17 @@ pub const FIXED_DECIMAL_PRECISION: u8 = 38;
 pub const FIXED_DECIMAL_SCALE: i8 = 16;
 pub(crate) const EMPTY_DEPTH_PRECISION: (u8, u8) = (0, 0);
 
+/// Returns `metadata` with the catalog type discriminator set to `type_name`.
+#[must_use]
+pub fn metadata_with_type_name(
+    type_name: &str,
+    metadata: Option<HashMap<String, String>>,
+) -> HashMap<String, String> {
+    let mut metadata = metadata.unwrap_or_default();
+    metadata.insert(KEY_TYPE_NAME.to_string(), type_name.to_string());
+    metadata
+}
+
 /// Returns the open Arrow data type used for nanosecond instants.
 #[must_use]
 pub fn timestamp_data_type() -> DataType {
@@ -142,7 +149,7 @@ pub fn timestamp_data_type() -> DataType {
 ///
 /// # Errors
 ///
-/// Returns an [`ArrowError`] when a value exceeds Arrow's signed timestamp range.
+/// Returns an error if a value exceeds Arrow's signed timestamp range.
 pub fn timestamp_array(
     values: impl IntoIterator<Item = u64>,
 ) -> Result<TimestampNanosecondArray, ArrowError> {
@@ -153,7 +160,7 @@ pub fn timestamp_array(
 ///
 /// # Errors
 ///
-/// Returns an [`ArrowError`] when a value exceeds Arrow's signed timestamp range.
+/// Returns an error if a value exceeds Arrow's signed timestamp range.
 pub fn optional_timestamp_array(
     values: impl IntoIterator<Item = Option<u64>>,
 ) -> Result<TimestampNanosecondArray, ArrowError> {
@@ -178,7 +185,7 @@ pub fn optional_timestamp_array(
 ///
 /// # Errors
 ///
-/// Returns an [`EncodingError`] when the value is negative.
+/// Returns an error if the value is negative.
 pub fn decode_timestamp(
     values: &TimestampNanosecondArray,
     name: &'static str,
@@ -202,26 +209,27 @@ pub fn decode_timestamp(
 ///
 /// # Errors
 ///
-/// Returns an [`ArrowError`] when a timestamp exceeds the signed Arrow range or the batch is
-/// otherwise invalid.
+/// Returns an error if a timestamp exceeds the signed Arrow range or the batch is otherwise
+/// invalid.
 pub fn record_batch_with_timestamps(
     schema: Arc<Schema>,
     columns: Vec<ArrayRef>,
 ) -> Result<RecordBatch, ArrowError> {
     validate_encode_precisions(schema.metadata())?;
 
+    if columns.len() != schema.fields().len() {
+        return Err(ArrowError::InvalidArgumentError(format!(
+            "number of columns({}) must match number of fields({}) in schema",
+            columns.len(),
+            schema.fields().len()
+        )));
+    }
+
     let columns = schema
         .fields()
         .iter()
         .zip(columns)
         .map(|(field, column)| {
-            if field.data_type() == &enum_dictionary_data_type()
-                && column.data_type() == &DataType::UInt8
-                && is_legacy_enum_field(field.name())
-            {
-                return legacy_enum_dictionary_column(field, column.as_ref());
-            }
-
             if field.data_type() != &timestamp_data_type()
                 || column.data_type() != &DataType::UInt64
             {
@@ -266,7 +274,7 @@ fn timestamp_column(field: &Field, column: &dyn Array) -> Result<ArrayRef, Arrow
 ///
 /// # Errors
 ///
-/// Returns an [`EncodingError`] for negative timestamps or invalid arrays.
+/// Returns an error if timestamps are negative or arrays are invalid.
 pub fn record_batch_with_u64_timestamps(batch: &RecordBatch) -> Result<RecordBatch, EncodingError> {
     let mut changed = false;
     let mut fields = Vec::with_capacity(batch.num_columns());
@@ -274,8 +282,8 @@ pub fn record_batch_with_u64_timestamps(batch: &RecordBatch) -> Result<RecordBat
 
     for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
         if field.data_type() != &timestamp_data_type() {
-            fields.push(field.clone());
-            columns.push(column.clone());
+            fields.push(Arc::clone(field));
+            columns.push(Arc::clone(column));
             continue;
         }
         let values = column
@@ -326,7 +334,7 @@ pub fn enum_dictionary_data_type() -> DataType {
 ///
 /// # Errors
 ///
-/// Returns an [`ArrowError`] if the number of distinct values exceeds the `Int8` key range.
+/// Returns an error if the number of distinct values exceeds the `Int8` key range.
 pub fn enum_dictionary_array(
     values: impl IntoIterator<Item = impl Display>,
 ) -> Result<DictionaryArray<Int8Type>, ArrowError> {
@@ -357,7 +365,7 @@ pub fn money_data_type() -> DataType {
 ///
 /// # Errors
 ///
-/// Returns an [`ArrowError`] if an amount or dictionary value cannot be represented.
+/// Returns an error if an amount or dictionary value cannot be represented.
 pub fn money_array(
     values: impl IntoIterator<Item = Option<Money>>,
 ) -> Result<StructArray, ArrowError> {
@@ -399,8 +407,8 @@ pub fn money_array(
 ///
 /// # Errors
 ///
-/// Returns an [`ArrowError`] naming `field` when the value has more than 16 decimal places or
-/// cannot be rescaled exactly.
+/// Returns an error if the value has more than 16 decimal places or cannot be rescaled exactly. The
+/// error names `field`.
 pub fn decimal_to_arrow(value: &Decimal, field: &'static str) -> Result<i128, ArrowError> {
     let value = value.normalize();
     let scale = value.scale();
@@ -430,7 +438,7 @@ pub fn decimal_to_arrow(value: &Decimal, field: &'static str) -> Result<i128, Ar
 ///
 /// # Errors
 ///
-/// Returns an [`EncodingError`] if the value is NULL or outside `rust_decimal`'s range.
+/// Returns an error if the value is NULL or outside `rust_decimal`'s range.
 pub fn decode_decimal(
     values: &Decimal128Array,
     field: &'static str,
@@ -450,7 +458,7 @@ pub fn decode_decimal(
 ///
 /// # Errors
 ///
-/// Returns an [`EncodingError`] if the struct is NULL, malformed, or outside the model range.
+/// Returns an error if the struct is NULL, malformed, or outside the model range.
 pub fn decode_money(
     values: &StructArray,
     field: &'static str,
@@ -552,17 +560,6 @@ pub enum EncodingError {
     ParseError(&'static str, String),
     #[error("Invalid column type `{0}` at index {1}: expected {2}, found {3}")]
     InvalidColumnType(&'static str, usize, DataType, DataType),
-    #[error(
-        "Precision mode mismatch for `{field}`: catalog data has {actual_bytes} byte values, \
-         but this build expects {expected_bytes} bytes. The catalog was created with a different \
-         precision mode (standard=8 bytes, high=16 bytes). Rebuild the catalog or change your \
-         build's precision mode. See: https://nautilustrader.io/docs/latest/getting_started/installation#precision-mode"
-    )]
-    PrecisionMismatch {
-        field: &'static str,
-        expected_bytes: i32,
-        actual_bytes: i32,
-    },
     #[error("Arrow error: {0}")]
     ArrowError(#[from] arrow::error::ArrowError),
 }
@@ -592,7 +589,7 @@ pub fn is_json_string_field(field: &Field) -> bool {
 ///
 /// # Errors
 ///
-/// Returns an [`ArrowError::InvalidArgumentError`] if `raw` is [`PRICE_ERROR`].
+/// Returns an error if `raw` is [`PRICE_ERROR`].
 pub fn price_raw_to_decimal(
     raw: PriceRaw,
     field: &'static str,
@@ -623,8 +620,8 @@ pub fn price_raw_to_decimal(
 ///
 /// # Errors
 ///
-/// Returns an [`ArrowError::InvalidArgumentError`] if a non-sentinel quantity does not fit in
-/// Arrow's signed decimal representation.
+/// Returns an error if a non-sentinel quantity does not fit in Arrow's signed decimal
+/// representation.
 pub fn quantity_raw_to_decimal(
     raw: QuantityRaw,
     field: &'static str,
@@ -660,7 +657,7 @@ pub fn quantity_raw_to_decimal(
 ///
 /// # Errors
 ///
-/// Returns an [`ArrowError`] if the values do not fit the declared decimal type.
+/// Returns an error if the values do not fit the declared decimal type.
 pub fn price_decimal_array(
     values: impl IntoIterator<Item = PriceRaw>,
     field: &'static str,
@@ -677,7 +674,7 @@ pub fn price_decimal_array(
 ///
 /// # Errors
 ///
-/// Returns an [`ArrowError`] if a value does not fit or the declared decimal type is invalid.
+/// Returns an error if a value does not fit or the declared decimal type is invalid.
 pub fn quantity_decimal_array(
     values: impl IntoIterator<Item = QuantityRaw>,
     field: &'static str,
@@ -694,8 +691,8 @@ pub fn quantity_decimal_array(
 ///
 /// # Errors
 ///
-/// Returns an [`ArrowError`] if a value is `PRICE_UNDEF` or does not fit the declared decimal
-/// type, so the required decoders can read back every written value.
+/// Returns an error if a value is `PRICE_UNDEF` or does not fit the declared decimal type, so the
+/// required decoders can read back every written value.
 pub fn required_price_decimal_array(
     values: impl IntoIterator<Item = PriceRaw>,
     field: &'static str,
@@ -718,8 +715,8 @@ pub fn required_price_decimal_array(
 ///
 /// # Errors
 ///
-/// Returns an [`ArrowError`] if a value is `QUANTITY_UNDEF` or does not fit the declared decimal
-/// type, so the required decoders can read back every written value.
+/// Returns an error if a value is `QUANTITY_UNDEF` or does not fit the declared decimal type, so
+/// the required decoders can read back every written value.
 pub fn required_quantity_decimal_array(
     values: impl IntoIterator<Item = QuantityRaw>,
     field: &'static str,
@@ -786,7 +783,7 @@ fn decimal_to_raw<T: TryFrom<i128>>(
 ///
 /// # Errors
 ///
-/// Returns an [`EncodingError`] if the value cannot be represented by this build.
+/// Returns an error if the value cannot be represented by this build.
 pub fn decode_decimal_price(
     values: &Decimal128Array,
     precision: u8,
@@ -807,7 +804,7 @@ pub fn decode_decimal_price(
 ///
 /// # Errors
 ///
-/// Returns an [`EncodingError`] if the value is null or cannot be represented by this build.
+/// Returns an error if the value is null or cannot be represented by this build.
 pub fn decode_required_decimal_price(
     values: &Decimal128Array,
     precision: u8,
@@ -827,7 +824,7 @@ pub fn decode_required_decimal_price(
 ///
 /// # Errors
 ///
-/// Returns an [`EncodingError`] if the value cannot be represented by this build.
+/// Returns an error if the value cannot be represented by this build.
 pub fn decode_decimal_quantity(
     values: &Decimal128Array,
     precision: u8,
@@ -848,7 +845,7 @@ pub fn decode_decimal_quantity(
 ///
 /// # Errors
 ///
-/// Returns an [`EncodingError`] if the value is null or cannot be represented by this build.
+/// Returns an error if the value is null or cannot be represented by this build.
 pub fn decode_required_decimal_quantity(
     values: &Decimal128Array,
     precision: u8,
@@ -868,7 +865,7 @@ pub fn decode_required_decimal_quantity(
 ///
 /// # Errors
 ///
-/// Returns an [`EncodingError`] if the value is null.
+/// Returns an error if the value is null.
 pub fn decode_required_timestamp(
     values: &UInt64Array,
     field: &'static str,
@@ -911,203 +908,34 @@ pub(crate) fn decode_required_u8(
     Ok(values.value(row))
 }
 
-#[cfg(test)]
-trait PriceRawSource {
-    fn raw_price(self) -> PriceRaw;
-}
-
-#[cfg(test)]
-impl PriceRawSource for &[u8] {
-    fn raw_price(self) -> PriceRaw {
-        PriceRaw::from_le_bytes(
-            self.try_into()
-                .expect("Price raw bytes must be exactly the size of PriceRaw"),
-        )
-    }
-}
-
-#[cfg(test)]
-impl PriceRawSource for i128 {
-    fn raw_price(self) -> PriceRaw {
-        decimal_to_price_raw(self, "test", 0).expect("Decimal price must fit the current build")
-    }
-}
-
-#[inline]
-#[cfg(test)]
-fn get_raw_price(value: impl PriceRawSource) -> PriceRaw {
-    value.raw_price()
-}
-
-#[inline]
-#[cfg(not(test))]
-fn get_raw_price(value: &[u8]) -> PriceRaw {
-    PriceRaw::from_le_bytes(
-        value
-            .try_into()
-            .expect("Price raw bytes must be exactly the size of PriceRaw"),
-    )
-}
-
-#[cfg(test)]
-trait QuantityRawSource {
-    fn raw_quantity(self) -> QuantityRaw;
-}
-
-#[cfg(test)]
-impl QuantityRawSource for &[u8] {
-    fn raw_quantity(self) -> QuantityRaw {
-        QuantityRaw::from_le_bytes(
-            self.try_into()
-                .expect("Quantity raw bytes must be exactly the size of QuantityRaw"),
-        )
-    }
-}
-
-#[cfg(test)]
-impl QuantityRawSource for i128 {
-    fn raw_quantity(self) -> QuantityRaw {
-        decimal_to_quantity_raw(self, "test", 0)
-            .expect("Decimal quantity must fit the current build")
-    }
-}
-
-#[inline]
-#[cfg(test)]
-fn get_raw_quantity(value: impl QuantityRawSource) -> QuantityRaw {
-    value.raw_quantity()
-}
-
-#[inline]
-#[cfg(not(test))]
-fn get_raw_quantity(value: &[u8]) -> QuantityRaw {
-    QuantityRaw::from_le_bytes(
-        value
-            .try_into()
-            .expect("Quantity raw bytes must be exactly the size of QuantityRaw"),
-    )
-}
-
-/// Gets raw price bytes and corrects for floating-point precision errors in stored data.
-///
-/// Data from catalogs may have been created with `int(value * FIXED_SCALAR)` which
-/// introduces floating-point errors. This corrects the raw value to the nearest valid
-/// multiple of the scale factor for the given precision.
-///
-/// Sentinel values (`PRICE_UNDEF`, `PRICE_ERROR`) are preserved unchanged.
-#[inline]
-fn get_corrected_raw_price(bytes: &[u8], precision: u8) -> PriceRaw {
-    let raw = get_raw_price(bytes);
-
-    // Preserve sentinel values unchanged
-    if raw == PRICE_UNDEF || raw == PRICE_ERROR {
-        return raw;
-    }
-
-    correct_price_raw(raw, precision)
-}
-
-/// Gets raw quantity bytes and corrects for floating-point precision errors in stored data.
-///
-/// Data from catalogs may have been created with `int(value * FIXED_SCALAR)` which
-/// introduces floating-point errors. This corrects the raw value to the nearest valid
-/// multiple of the scale factor for the given precision.
-///
-/// Sentinel values (`QUANTITY_UNDEF`) are preserved unchanged.
-#[inline]
-fn get_corrected_raw_quantity(bytes: &[u8], precision: u8) -> QuantityRaw {
-    let raw = get_raw_quantity(bytes);
-
-    // Preserve sentinel values unchanged
-    if raw == QUANTITY_UNDEF {
-        return raw;
-    }
-
-    correct_quantity_raw(raw, precision)
-}
-
-/// Decodes a [`Price`] from raw bytes with bounds validation.
-///
-/// Uses corrected raw values to handle floating-point precision errors in stored data.
-/// Sentinel values (`PRICE_UNDEF`, `PRICE_ERROR`) are preserved unchanged.
-///
-/// # Errors
-///
-/// Returns an [`EncodingError::ParseError`] if the price value is out of bounds.
-pub fn decode_price(
-    bytes: &[u8],
-    precision: u8,
+pub(crate) fn validate_required_column(
+    values: &dyn Array,
     field: &'static str,
-    row: usize,
-) -> Result<Price, EncodingError> {
-    let raw = get_corrected_raw_price(bytes, precision);
-    Price::from_raw_checked(raw, precision)
-        .map_err(|e| EncodingError::ParseError(field, format!("row {row}: {e}")))
+) -> Result<(), EncodingError> {
+    if let Some(row) = first_logical_null(values) {
+        return Err(EncodingError::ParseError(
+            field,
+            format!("row {row}: required value is null"),
+        ));
+    }
+
+    Ok(())
 }
 
-/// Decodes a [`Quantity`] from raw bytes with bounds validation.
-///
-/// Uses corrected raw values to handle floating-point precision errors in stored data.
-/// Sentinel values (`QUANTITY_UNDEF`) are preserved unchanged.
-///
-/// # Errors
-///
-/// Returns an [`EncodingError::ParseError`] if the quantity value is out of bounds.
-pub fn decode_quantity(
-    bytes: &[u8],
-    precision: u8,
-    field: &'static str,
-    row: usize,
-) -> Result<Quantity, EncodingError> {
-    let raw = get_corrected_raw_quantity(bytes, precision);
-    Quantity::from_raw_checked(raw, precision)
-        .map_err(|e| EncodingError::ParseError(field, format!("row {row}: {e}")))
+pub(crate) fn first_logical_null(values: &dyn Array) -> Option<usize> {
+    values
+        .logical_nulls()
+        .and_then(|nulls| nulls.iter().position(|valid| !valid))
 }
 
-/// Decodes a [`Price`] from raw bytes, using precision 0 for sentinel values.
-///
-/// For order book data where sentinel values indicate empty levels.
-///
-/// # Errors
-///
-/// Returns an [`EncodingError::ParseError`] if the price value is out of bounds.
-pub fn decode_price_with_sentinel(
-    bytes: &[u8],
-    precision: u8,
-    field: &'static str,
-    row: usize,
-) -> Result<Price, EncodingError> {
-    let raw = get_raw_price(bytes);
-    let (final_raw, final_precision) = if raw == PRICE_UNDEF {
-        (raw, 0)
-    } else {
-        (get_corrected_raw_price(bytes, precision), precision)
-    };
-    Price::from_raw_checked(final_raw, final_precision)
-        .map_err(|e| EncodingError::ParseError(field, format!("row {row}: {e}")))
+#[cfg(test)]
+fn get_raw_price(value: i128) -> PriceRaw {
+    decimal_to_price_raw(value, "test", 0).expect("Decimal price must fit the current build")
 }
 
-/// Decodes a [`Quantity`] from raw bytes, using precision 0 for sentinel values.
-///
-/// For order book data where sentinel values indicate empty levels.
-///
-/// # Errors
-///
-/// Returns an [`EncodingError::ParseError`] if the quantity value is out of bounds.
-pub fn decode_quantity_with_sentinel(
-    bytes: &[u8],
-    precision: u8,
-    field: &'static str,
-    row: usize,
-) -> Result<Quantity, EncodingError> {
-    let raw = get_raw_quantity(bytes);
-    let (final_raw, final_precision) = if raw == QUANTITY_UNDEF {
-        (raw, 0)
-    } else {
-        (get_corrected_raw_quantity(bytes, precision), precision)
-    };
-    Quantity::from_raw_checked(final_raw, final_precision)
-        .map_err(|e| EncodingError::ParseError(field, format!("row {row}: {e}")))
+#[cfg(test)]
+fn get_raw_quantity(value: i128) -> QuantityRaw {
+    decimal_to_quantity_raw(value, "test", 0).expect("Decimal quantity must fit the current build")
 }
 
 /// Provides Apache Arrow schema definitions for data types.
@@ -1139,7 +967,7 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an `ArrowError` if the encoding fails.
+    /// Returns an error if the encoding fails.
     fn encode_batch<T>(
         metadata: &HashMap<String, String>,
         data: &[T],
@@ -1210,7 +1038,7 @@ pub fn schema_without_identifier_column(schema: &Schema) -> Schema {
         .fields()
         .iter()
         .enumerate()
-        .filter_map(|(index, field)| (index != identifier_index).then_some(field.clone()))
+        .filter_map(|(index, field)| (index != identifier_index).then_some(Arc::clone(field)))
         .collect::<Vec<_>>();
 
     Schema::new_with_metadata(fields, schema.metadata().clone())
@@ -1223,7 +1051,7 @@ pub fn schema_without_identifier_column(schema: &Schema) -> Schema {
 ///
 /// # Errors
 ///
-/// Returns an [`ArrowError`] if the record batch cannot be rebuilt.
+/// Returns an error if the record batch cannot be rebuilt.
 pub fn record_batch_with_identifier_column(
     batch: RecordBatch,
     identifier: Option<&str>,
@@ -1236,8 +1064,8 @@ pub fn record_batch_with_identifier_column(
 ///
 /// # Errors
 ///
-/// Returns an [`ArrowError`] if the number of identifier values differs from
-/// the record batch row count or the record batch cannot be rebuilt.
+/// Returns an error if the number of identifier values differs from the record batch row count or
+/// the record batch cannot be rebuilt.
 pub fn record_batch_with_identifier_values(
     batch: RecordBatch,
     identifier_values: Vec<Option<String>>,
@@ -1282,7 +1110,7 @@ pub fn identifier_array_from_display<T: Display>(
 ///
 /// # Errors
 ///
-/// Returns an [`ArrowError`] if the record batch cannot be rebuilt.
+/// Returns an error if the record batch cannot be rebuilt.
 pub fn record_batch_without_identifier_column(
     mut batch: RecordBatch,
 ) -> Result<RecordBatch, ArrowError> {
@@ -1303,7 +1131,7 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an `EncodingError` if the decoding fails.
+    /// Returns an error if the decoding fails.
     fn decode_batch(
         metadata: &HashMap<String, String>,
         record_batch: RecordBatch,
@@ -1319,7 +1147,7 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an `EncodingError` if the decoding fails.
+    /// Returns an error if the decoding fails.
     fn decode_typed_batch(
         metadata: &HashMap<String, String>,
         record_batch: RecordBatch,
@@ -1347,7 +1175,7 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an `EncodingError` if the decoding fails.
+    /// Returns an error if the decoding fails.
     fn decode_data_batch(
         metadata: &HashMap<String, String>,
         record_batch: RecordBatch,
@@ -1360,7 +1188,7 @@ pub trait WriteStream {
     ///
     /// # Errors
     ///
-    /// Returns a `DataStreamingError` if writing or finishing the stream fails.
+    /// Returns an error if writing or finishing the stream fails.
     fn write(&mut self, record_batch: &RecordBatch) -> Result<(), DataStreamingError>;
 }
 
@@ -1379,8 +1207,8 @@ impl<T: Write> WriteStream for T {
 /// # Errors
 ///
 /// Returns an error if:
-/// - `column_index` is out of range: `EncodingError::MissingColumn`.
-/// - The column type is neither Utf8 nor Utf8View: `EncodingError::InvalidColumnType`.
+/// - `column_index` is out of range.
+/// - The column type is neither Utf8 nor Utf8View.
 pub fn extract_column_string<'a>(
     cols: &'a [ArrayRef],
     column_key: &'static str,
@@ -1590,8 +1418,8 @@ impl U32ColumnRef<'_> {
 /// # Errors
 ///
 /// Returns an error if:
-/// - `column_index` is out of range: `EncodingError::MissingColumn`.
-/// - The column type is neither Binary nor BinaryView: `EncodingError::InvalidColumnType`.
+/// - `column_index` is out of range.
+/// - The column type is neither Binary nor BinaryView.
 pub fn extract_column_binary<'a>(
     cols: &'a [ArrayRef],
     column_key: &'static str,
@@ -1649,8 +1477,8 @@ impl BinaryColumnRef<'_> {
 /// # Errors
 ///
 /// Returns an error if:
-/// - `column_index` is out of range: `EncodingError::MissingColumn`.
-/// - The column type does not match `expected_type`: `EncodingError::InvalidColumnType`.
+/// - `column_index` is out of range.
+/// - The column type does not match `expected_type`.
 pub fn extract_column<'a, T: Array + 'static>(
     cols: &'a [ArrayRef],
     column_key: &'static str,
@@ -1674,21 +1502,17 @@ pub fn extract_column<'a, T: Array + 'static>(
     Ok(downcasted_values)
 }
 
-/// Extracts a column by name when present, falling back to an index for older schemas.
+/// Extracts a column by name.
 ///
 /// # Errors
 ///
-/// Returns an error if the resolved column is missing or has the wrong type.
-pub fn extract_column_by_name_or_index<'a, T: Array + 'static>(
+/// Returns an error if the column is missing or has the wrong type.
+pub fn extract_column_by_name<'a, T: Array + 'static>(
     record_batch: &'a RecordBatch,
     column_key: &'static str,
-    fallback_index: usize,
     expected_type: DataType,
 ) -> Result<&'a T, EncodingError> {
-    let column_index = record_batch
-        .schema()
-        .index_of(column_key)
-        .unwrap_or(fallback_index);
+    let column_index = record_batch.schema().index_of(column_key)?;
     extract_column::<T>(
         record_batch.columns(),
         column_key,
@@ -1748,39 +1572,14 @@ pub fn optional_ustr_value(values: Option<&StringArray>, row: usize) -> Option<U
     values.and_then(|column| (!column.is_null(row)).then(|| Ustr::from(column.value(row))))
 }
 
-/// Validates that a [`FixedSizeBinaryArray`] has the expected precision byte width.
-///
-/// This detects precision mode mismatches that occur when catalog data was encoded
-/// with a different precision mode (64-bit standard vs 128-bit high-precision).
-///
-/// # Errors
-///
-/// Returns [`EncodingError::PrecisionMismatch`] if the actual byte width doesn't
-/// match [`PRECISION_BYTES`].
-pub fn validate_precision_bytes(
-    array: &FixedSizeBinaryArray,
-    field: &'static str,
-) -> Result<(), EncodingError> {
-    let actual = array.value_length();
-    if actual != PRECISION_BYTES {
-        return Err(EncodingError::PrecisionMismatch {
-            field,
-            expected_bytes: PRECISION_BYTES,
-            actual_bytes: actual,
-        });
-    }
-    Ok(())
-}
-
 /// Converts a vector of `OrderBookDelta` into an Arrow `RecordBatch`.
 ///
 /// # Errors
 ///
 /// Returns an error if:
-/// - `data` is empty: `EncodingError::EmptyData`.
-/// - Instrument IDs differ, or non-clear precision metadata differs:
-///   `EncodingError::MixedMetadata`.
-/// - Encoding fails: `EncodingError::ArrowError`.
+/// - `data` is empty.
+/// - Instrument IDs differ, or non-clear precision metadata differs.
+/// - Encoding fails.
 pub fn book_deltas_to_arrow_record_batch_bytes(
     data: &[OrderBookDelta],
 ) -> Result<RecordBatch, EncodingError> {
@@ -1810,9 +1609,9 @@ pub fn book_deltas_to_arrow_record_batch_bytes(
 /// # Errors
 ///
 /// Returns an error if:
-/// - `data` is empty: `EncodingError::EmptyData`.
-/// - Metadata differs between rows: `EncodingError::MixedMetadata`.
-/// - Encoding fails: `EncodingError::ArrowError`.
+/// - `data` is empty.
+/// - Metadata differs between rows.
+/// - Encoding fails.
 pub fn book_depths_to_arrow_record_batch_bytes(
     data: &[OrderBookDepth],
 ) -> Result<RecordBatch, EncodingError> {
@@ -1836,9 +1635,9 @@ pub fn book_depths_to_arrow_record_batch_bytes(
 /// # Errors
 ///
 /// Returns an error if:
-/// - `data` is empty: `EncodingError::EmptyData`.
-/// - Metadata differs between rows: `EncodingError::MixedMetadata`.
-/// - Encoding fails: `EncodingError::ArrowError`.
+/// - `data` is empty.
+/// - Metadata differs between rows.
+/// - Encoding fails.
 pub fn quotes_to_arrow_record_batch_bytes(
     data: &[QuoteTick],
 ) -> Result<RecordBatch, EncodingError> {
@@ -1850,9 +1649,9 @@ pub fn quotes_to_arrow_record_batch_bytes(
 /// # Errors
 ///
 /// Returns an error if:
-/// - `data` is empty: `EncodingError::EmptyData`.
-/// - Metadata differs between rows: `EncodingError::MixedMetadata`.
-/// - Encoding fails: `EncodingError::ArrowError`.
+/// - `data` is empty.
+/// - Metadata differs between rows.
+/// - Encoding fails.
 pub fn trades_to_arrow_record_batch_bytes(
     data: &[TradeTick],
 ) -> Result<RecordBatch, EncodingError> {
@@ -1864,9 +1663,9 @@ pub fn trades_to_arrow_record_batch_bytes(
 /// # Errors
 ///
 /// Returns an error if:
-/// - `data` is empty: `EncodingError::EmptyData`.
-/// - Metadata differs between rows: `EncodingError::MixedMetadata`.
-/// - Encoding fails: `EncodingError::ArrowError`.
+/// - `data` is empty.
+/// - Metadata differs between rows.
+/// - Encoding fails.
 pub fn bars_to_arrow_record_batch_bytes(data: &[Bar]) -> Result<RecordBatch, EncodingError> {
     encode_batch_with_metadata(data)
 }
@@ -1876,9 +1675,9 @@ pub fn bars_to_arrow_record_batch_bytes(data: &[Bar]) -> Result<RecordBatch, Enc
 /// # Errors
 ///
 /// Returns an error if:
-/// - `data` is empty: `EncodingError::EmptyData`.
-/// - Metadata differs between rows: `EncodingError::MixedMetadata`.
-/// - Encoding fails: `EncodingError::ArrowError`.
+/// - `data` is empty.
+/// - Metadata differs between rows.
+/// - Encoding fails.
 pub fn mark_prices_to_arrow_record_batch_bytes(
     data: &[MarkPriceUpdate],
 ) -> Result<RecordBatch, EncodingError> {
@@ -1890,9 +1689,9 @@ pub fn mark_prices_to_arrow_record_batch_bytes(
 /// # Errors
 ///
 /// Returns an error if:
-/// - `data` is empty: `EncodingError::EmptyData`.
-/// - Metadata differs between rows: `EncodingError::MixedMetadata`.
-/// - Encoding fails: `EncodingError::ArrowError`.
+/// - `data` is empty.
+/// - Metadata differs between rows.
+/// - Encoding fails.
 pub fn index_prices_to_arrow_record_batch_bytes(
     data: &[IndexPriceUpdate],
 ) -> Result<RecordBatch, EncodingError> {
@@ -1904,19 +1703,13 @@ pub fn index_prices_to_arrow_record_batch_bytes(
 /// # Errors
 ///
 /// Returns an error if:
-/// - `data` is empty: `EncodingError::EmptyData`.
-/// - Encoding fails: `EncodingError::ArrowError`.
-#[expect(clippy::missing_panics_doc)] // Guarded by empty check
+/// - `data` is empty.
+/// - Metadata differs between rows.
+/// - Encoding fails.
 pub fn instrument_status_to_arrow_record_batch_bytes(
     data: &[InstrumentStatus],
 ) -> Result<RecordBatch, EncodingError> {
-    if data.is_empty() {
-        return Err(EncodingError::EmptyData);
-    }
-
-    let first = data.first().unwrap();
-    let metadata = first.metadata();
-    InstrumentStatus::encode_batch(&metadata, data).map_err(EncodingError::ArrowError)
+    encode_batch_with_metadata(data)
 }
 
 /// Converts a vector of `OptionGreeks` into an Arrow `RecordBatch`.
@@ -1924,19 +1717,13 @@ pub fn instrument_status_to_arrow_record_batch_bytes(
 /// # Errors
 ///
 /// Returns an error if:
-/// - `data` is empty: `EncodingError::EmptyData`.
-/// - Encoding fails: `EncodingError::ArrowError`.
-#[expect(clippy::missing_panics_doc)] // Guarded by empty check
+/// - `data` is empty.
+/// - Metadata differs between rows.
+/// - Encoding fails.
 pub fn option_greeks_to_arrow_record_batch_bytes(
     data: &[OptionGreeks],
 ) -> Result<RecordBatch, EncodingError> {
-    if data.is_empty() {
-        return Err(EncodingError::EmptyData);
-    }
-
-    let first = data.first().unwrap();
-    let metadata = first.metadata();
-    OptionGreeks::encode_batch(&metadata, data).map_err(EncodingError::ArrowError)
+    encode_batch_with_metadata(data)
 }
 
 /// Converts a vector of `InstrumentClose` into an Arrow `RecordBatch`.
@@ -1944,16 +1731,16 @@ pub fn option_greeks_to_arrow_record_batch_bytes(
 /// # Errors
 ///
 /// Returns an error if:
-/// - `data` is empty: `EncodingError::EmptyData`.
-/// - Metadata differs between rows: `EncodingError::MixedMetadata`.
-/// - Encoding fails: `EncodingError::ArrowError`.
+/// - `data` is empty.
+/// - Metadata differs between rows.
+/// - Encoding fails.
 pub fn instrument_closes_to_arrow_record_batch_bytes(
     data: &[InstrumentClose],
 ) -> Result<RecordBatch, EncodingError> {
     encode_batch_with_metadata(data)
 }
 
-fn encode_batch_with_metadata<T>(data: &[T]) -> Result<RecordBatch, EncodingError>
+pub(crate) fn encode_batch_with_metadata<T>(data: &[T]) -> Result<RecordBatch, EncodingError>
 where
     T: EncodeToRecordBatch,
 {
@@ -1976,7 +1763,9 @@ mod tests {
             Bar, BarSpecification, BarType, BookOrder, DEPTH10_LEN, OrderBookDelta, OrderBookDepth,
             QuoteTick, order::NULL_ORDER,
         },
-        enums::{AggregationSource, BarAggregation, BookAction, OrderSide, PriceType},
+        enums::{
+            AggregationSource, BarAggregation, BookAction, MarketStatusAction, OrderSide, PriceType,
+        },
         identifiers::InstrumentId,
         types::{Price, Quantity},
     };
@@ -2018,6 +1807,26 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "Invalid argument error: Metadata 'price_precision' is 17, maximum supported catalog scale is 16"
+        );
+    }
+
+    #[rstest]
+    fn test_record_batch_with_timestamps_rejects_surplus_columns() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts_event",
+            timestamp_data_type(),
+            false,
+        )]));
+        let columns = vec![
+            Arc::new(UInt64Array::from(vec![1])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![2])) as ArrayRef,
+        ];
+
+        let error = record_batch_with_timestamps(schema, columns).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Invalid argument error: number of columns(2) must match number of fields(1) in schema"
         );
     }
 
@@ -2080,6 +1889,51 @@ mod tests {
         );
 
         let result = quotes_to_arrow_record_batch_bytes(&[first, second]);
+
+        assert!(matches!(
+            result,
+            Err(EncodingError::MixedMetadata { index: 1 })
+        ));
+    }
+
+    #[rstest]
+    fn test_instrument_status_to_arrow_record_batch_rejects_mixed_instruments() {
+        let status = |instrument_id: &str, ts: u64| {
+            InstrumentStatus::new(
+                InstrumentId::from(instrument_id),
+                MarketStatusAction::Trading,
+                ts.into(),
+                ts.into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+
+        let result = instrument_status_to_arrow_record_batch_bytes(&[
+            status("AAA.XNAS", 1),
+            status("BBB.XNAS", 2),
+        ]);
+
+        assert!(matches!(
+            result,
+            Err(EncodingError::MixedMetadata { index: 1 })
+        ));
+    }
+
+    #[rstest]
+    fn test_option_greeks_to_arrow_record_batch_rejects_mixed_instruments() {
+        let greeks = |instrument_id: &str| OptionGreeks {
+            instrument_id: InstrumentId::from(instrument_id),
+            ..OptionGreeks::default()
+        };
+
+        let result = option_greeks_to_arrow_record_batch_bytes(&[
+            greeks("BTC-20260529-100000-C.OKX"),
+            greeks("BTC-20260529-110000-C.OKX"),
+        ]);
 
         assert!(matches!(
             result,
@@ -2434,16 +2288,20 @@ mod schema_invariant_tests {
             perpetual_contract::PerpetualContract, tokenized_asset::TokenizedAsset,
         },
         reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
-        types::{PRICE_ERROR, PRICE_UNDEF, Price, QUANTITY_UNDEF, Quantity},
+        types::{
+            PRICE_ERROR, PRICE_UNDEF, Price, QUANTITY_UNDEF, Quantity,
+            fixed::{FIXED_PRECISION, FIXED_PRECISION_STANDARD},
+        },
     };
     use rstest::rstest;
     use rust_decimal::Decimal;
 
     use super::{
         ArrowSchemaProvider, DecodeFromRecordBatch, EncodeToRecordBatch, FIXED_DECIMAL_PRECISION,
-        FIXED_DECIMAL_SCALE, KEY_IDENTIFIER, QUANTITY_RAW_MAX, decimal_to_arrow, decode_decimal,
-        decode_decimal_price, fixed_decimal_data_type, is_timestamp_field, price_decimal_array,
-        quantity_decimal_array, timestamp_data_type,
+        FIXED_DECIMAL_SCALE, KEY_IDENTIFIER, QUANTITY_RAW_MAX, STANDARD_TO_DECIMAL_SCALE,
+        decimal_to_arrow, decode_decimal, decode_decimal_price, decode_decimal_quantity,
+        fixed_decimal_data_type, is_timestamp_field, price_decimal_array, quantity_decimal_array,
+        timestamp_data_type,
     };
 
     #[derive(Clone, Copy, Debug)]
@@ -2516,27 +2374,21 @@ mod schema_invariant_tests {
             assert_fields_match_schema(
                 catalog_field_map(QuoteTick::get_fields()),
                 &QuoteTick::get_schema(None),
-                &[
-                    "bid_price",
-                    "ask_price",
-                    "bid_size",
-                    "ask_size",
-                    KEY_IDENTIFIER,
-                ],
+                &[KEY_IDENTIFIER],
             );
         };
         (TradeTick) => {
             assert_fields_match_schema(
                 catalog_field_map(TradeTick::get_fields()),
                 &TradeTick::get_schema(None),
-                &["price", "size", KEY_IDENTIFIER],
+                &[KEY_IDENTIFIER],
             );
         };
         (Bar) => {
             assert_fields_match_schema(
                 catalog_field_map(Bar::get_fields()),
                 &Bar::get_schema(None),
-                &["open", "high", "low", "close", "volume", KEY_IDENTIFIER],
+                &[KEY_IDENTIFIER],
             );
         };
         (MarkPriceUpdate) => {
@@ -2600,6 +2452,42 @@ mod schema_invariant_tests {
         assert_eq!(
             decode_decimal_price(&array, price.precision, "price", 0).unwrap(),
             price,
+        );
+    }
+
+    #[rstest]
+    #[case("price", false)]
+    #[case("size", true)]
+    fn decimal_decode_rejects_spurious_digits_with_row_context(
+        #[case] field: &'static str,
+        #[case] quantity: bool,
+    ) {
+        let array = Decimal128Array::from(vec![0, STANDARD_TO_DECIMAL_SCALE])
+            .with_precision_and_scale(FIXED_DECIMAL_PRECISION, FIXED_DECIMAL_SCALE)
+            .unwrap();
+
+        let error = if quantity {
+            decode_decimal_quantity(&array, 0, field, 1).unwrap_err()
+        } else {
+            decode_decimal_price(&array, 0, field, 1).unwrap_err()
+        };
+
+        let raw = if FIXED_PRECISION == FIXED_PRECISION_STANDARD {
+            1
+        } else {
+            STANDARD_TO_DECIMAL_SCALE
+        };
+
+        let scale = 10_i128.pow(u32::from(FIXED_PRECISION));
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Error parsing `{field}`: row 1: Invalid fixed-point raw value {raw} for precision 0: \
+             remainder {raw} when divided by scale {scale}. \
+             Raw value should be a multiple of {scale}. \
+             This indicates data corruption or incorrect precision/scaling upstream"
+            )
         );
     }
 

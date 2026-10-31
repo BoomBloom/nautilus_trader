@@ -1,7 +1,7 @@
 version = 1
 repository = "https://github.com/nautechsystems/nautilus_engineering"
-revision = "17adc2db33b00154f76bf604e8ba8f7e20c5a4e5"
-manifest_sha256 = "591f89f0394dfd8a02a4c3bda884dbdc02298d2da3a1cb4861ed8d4c6d67e97e"
+revision = "0a9f6fb2d3c3422b34cda9e4ea5eb9833b58f33d"
+manifest_sha256 = "e2e91502b0682520f8a8cc302ce87b33687cef8421f4c4244103022cfb4ff866"
 marker_file = ".nautilus-engineering.syncing"
 profiles = ["sync"]
 
@@ -38,13 +38,13 @@ executable = false
 [[file]]
 artifact = "pre-commit-zizmor"
 path = ".nautilus-engineering/pre-commit/zizmor.yaml"
-sha256 = "c156b701b14fea09ed9e6af84c20e3065a26d5240a22c85ce174ce8388c215f0"
+sha256 = "87887f9f623502a425f560e8a96f86a18857a7c30fd852d65418f8a262a82190"
 executable = false
 
 [[file]]
 artifact = "shared-tool-catalog"
 path = ".nautilus-engineering/tools.toml"
-sha256 = "5ce24820adec9df3f67cd940f885cf21016ddeedb734c65ef300e359d207e156"
+sha256 = "91a705d4cda38f74e107cb6a5ad96a86733e4696672dedd6880a9fc67afff323"
 executable = false
 
 [[file]]
@@ -62,7 +62,7 @@ executable = false
 [[file]]
 artifact = "markdown-standard"
 path = "docs/developer_guide/markdown_style.md"
-sha256 = "2ee144dd592ea5aa4f8c6d53feeb2c08e491f2dc4854932e31840047b0e9627a"
+sha256 = "8b3ef01847dbb0799c22d7f7a11810fac9e5e92bbce0de990a774b6997e1ac19"
 executable = false
 
 [[file]]
@@ -80,7 +80,7 @@ executable = true
 [[file]]
 artifact = "cargo-cooldown-check"
 path = "scripts/check-cargo-cooldown.sh"
-sha256 = "dd36ed72236b3fc1e4e94793a6d6c9aa54bc9dd209d2a1bf3d7b2c6c2d99d95b"
+sha256 = "4972e595ec3c014a05bb9d00fef77b2dc5b507e2f4de3832076681677cfcbdb9"
 executable = true
 
 [[file]]
@@ -98,13 +98,13 @@ executable = true
 [[file]]
 artifact = "no-build-package-check"
 path = "scripts/check-no-build-packages.sh"
-sha256 = "4f34c20dc50135b158d7b646e01a6f7de16709760a5789c6aa8267d2e2d08d5a"
+sha256 = "e3a0ba4a63ab95b8634ea39c19d98c255180e8118d0de9fcfcbb92ff2bde2263"
 executable = true
 
 [[file]]
 artifact = "github-action-pin-check"
 path = "scripts/ci/check-github-action-shas.sh"
-sha256 = "96d69ba4c985fb7e19b9274d40c2bfdd5f54f607735af73f8f21f7a0c81d7191"
+sha256 = "1bb731e945822869fcb3d9a835e56e067cf6f5a241ebfe3d7cd262d59367e676"
 executable = true
 
 [[file]]
@@ -134,7 +134,7 @@ executable = true
 [[file]]
 artifact = "security-audit"
 path = "scripts/security-audit.py"
-sha256 = "19e3739aed79265c576125f73c72a3a171947193cae8b99f70d56745d306f2fb"
+sha256 = "00c190ea859d95941b60d8b4d8fe5721d2c2f80403d445b46d229bf44080b8d7"
 executable = false
 
 [[file]]
@@ -152,5 +152,5 @@ executable = true
 [[file]]
 artifact = "uv-version"
 path = "scripts/uv-version.sh"
-sha256 = "655d4b377b619707cdbdab8ad565cadc9bffb08770763869f22df76ad3b6652d"
+sha256 = "6210a88e69fdfe7fb51ae77d18ba6019a5b2a143d54e7feaf4d9d83caab4aa49"
 executable = true

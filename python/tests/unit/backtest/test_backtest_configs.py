@@ -19,6 +19,7 @@ Test backtest configs behavior.
 from __future__ import annotations
 
 import datetime as dt
+from collections.abc import Callable
 from decimal import Decimal
 
 import pandas as pd
@@ -53,12 +54,16 @@ from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import LeveragedMarginModel
 from nautilus_trader.model import Money
 from nautilus_trader.model import NautilusDataType
+from nautilus_trader.model import NautilusInstrumentType
+from nautilus_trader.model import NautilusRecordType
 from nautilus_trader.model import OmsType
 from nautilus_trader.model import OtoTriggerMode
 from nautilus_trader.model import PriceType
 from nautilus_trader.model import StandardMarginModel
+from nautilus_trader.persistence import CatalogBackend
 from nautilus_trader.persistence import DataCatalogConfig
 from nautilus_trader.persistence import RotationConfig
+from nautilus_trader.persistence import RotationMode
 from nautilus_trader.persistence import StreamingConfig
 from nautilus_trader.risk import RiskEngineConfig
 from nautilus_trader.trading import ImportableControllerConfig
@@ -177,9 +182,10 @@ def test_engine_config_accepts_streaming_and_catalog_configs(
     """
     Test engine config retains streaming and catalog configs.
     """
+    promotion_catalog = DataCatalogConfig(path="bucket/output", fs_protocol="s3")
     streaming = StreamingConfig(
-        catalog_path="/data/output",
-        fs_protocol="s3",
+        writer_path="/data/stream",
+        catalog=promotion_catalog,
         flush_interval_ms=250,
         replace_existing=True,
     )
@@ -188,63 +194,245 @@ def test_engine_config_accepts_streaming_and_catalog_configs(
     config = config_type(streaming=streaming, catalogs=[catalog])
 
     assert type(config.streaming) is StreamingConfig
-    assert config.streaming.catalog_path == "/data/output"
-    assert config.streaming.fs_protocol == "s3"
+    assert config.streaming.writer_path == "/data/stream"
+    assert config.streaming.catalog == promotion_catalog
     assert config.streaming.flush_interval_ms == 250
     assert config.streaming.replace_existing is True
     assert config.catalogs == [catalog]
 
 
-def test_streaming_config_consumes_rotation_inputs() -> None:
+def test_data_catalog_config_exposes_constructor_values() -> None:
     """
-    Test streaming config converts public rotation inputs to typed values.
+    Test data catalog config keeps every constructor value and parses the codec name.
     """
-    config = StreamingConfig(
-        catalog_path="bucket/output",
+    config = DataCatalogConfig(
+        path="bucket/catalog",
         fs_protocol="s3",
-        flush_interval_ms=250,
-        replace_existing=True,
-        rotation_mode="SCHEDULED_DATES",
-        rotation_interval_ns=5_000,
-        schedule_ns=750,
+        catalog_backend=CatalogBackend.External("DuckLake"),
+        params={"snapshot_id": 7},
+        name="history",
+        read_only=True,
+        fs_rust_storage_options={"region": "eu-west-1"},
+        batch_size=512,
+        compression="ZSTD",
+        max_row_group_size=2048,
     )
 
-    assert config.catalog_path == "bucket/output"
+    assert config.path == "bucket/catalog"
     assert config.fs_protocol == "s3"
-    assert config.flush_interval_ms == 250
-    assert config.replace_existing is True
-    assert config.rotation_mode == "SCHEDULED_DATES"
-    assert config.rotation_interval_ns == 5_000
-    assert config.schedule_ns == 750
+    assert config.catalog_backend == CatalogBackend.External("DuckLake")
+    assert config.params == {"snapshot_id": 7}
+    assert config.name == "history"
+    assert config.read_only is True
+    assert config.fs_rust_storage_option_keys == ["region"]
+    assert config.batch_size == 512
+    assert config.compression == "zstd"
+    assert config.max_row_group_size == 2048
 
 
-def test_streaming_config_exposes_shared_rotation() -> None:
+def test_data_catalog_config_defaults_typed_settings_to_none() -> None:
     """
-    Retain shared rotation and legacy readback properties.
+    Test data catalog config leaves the typed settings to the backend defaults.
+    """
+    config = DataCatalogConfig(path="/data/catalog")
+
+    assert config.batch_size is None
+    assert config.compression is None
+    assert config.max_row_group_size is None
+
+
+def test_data_catalog_config_repr_redacts_storage_option_values() -> None:
+    """
+    Test data catalog config repr shows storage option keys with redacted values.
+    """
+    config = DataCatalogConfig(
+        path="bucket/catalog",
+        fs_protocol="s3",
+        fs_rust_storage_options={"aws_secret_access_key": "catalog-secret-sentinel"},
+    )
+
+    result = repr(config)
+
+    assert "catalog-secret-sentinel" not in result
+    assert 'fs_rust_storage_options: Some({"aws_secret_access_key": <redacted>})' in result
+
+
+@pytest.mark.parametrize("compression", ["lzo", "zip"])
+def test_data_catalog_config_rejects_unsupported_compression(compression: str) -> None:
+    """
+    Test data catalog config rejects LZO and unknown codec names at construction.
+    """
+    with pytest.raises(ValueError, match="unknown compression") as exc_info:
+        DataCatalogConfig(path="/data/catalog", compression=compression)
+
+    assert str(exc_info.value) == (
+        f"unknown compression `{compression}`; "
+        "valid values: uncompressed, snappy, gzip, brotli, lz4, zstd"
+    )
+
+
+@pytest.mark.parametrize("field", ["batch_size", "max_row_group_size"])
+def test_data_catalog_config_rejects_zero_count(field: str) -> None:
+    """
+    Test data catalog config rejects a zero row count at construction.
+    """
+    with pytest.raises(ValueError, match=f"invalid {field}") as exc_info:
+        DataCatalogConfig(path="/data/catalog", **{field: 0})
+
+    assert str(exc_info.value) == (
+        f"invalid {field}: must be a positive number of rows; omit the field for the backend default"
+    )
+
+
+def test_streaming_config_defaults_to_feather_without_catalog() -> None:
+    """
+    Test streaming config keeps only Feather files when no catalog is configured.
+    """
+    config = StreamingConfig(writer_path="/data/stream")
+
+    assert config.writer_path == "/data/stream"
+    assert config.catalog is None
+    assert config.writer_backend == "Feather"
+    assert config.flush_interval_ms == 1000
+    assert config.replace_existing is False
+    assert config.rotation_config.mode == RotationMode.NO_ROTATION
+    assert config.rotation_config.timezone is None
+    assert config.promotion_interval_ms is None
+    assert config.promote_on_close is True
+    assert config.delete_feather_after_promotion is False
+    assert config.use_ts_event_for_ts_init is False
+
+
+def test_streaming_config_consumes_promotion_options() -> None:
+    """
+    Test streaming config retains typed promotion options for its catalog.
+    """
+    catalog = DataCatalogConfig(path="/data/catalog")
+
+    config = StreamingConfig(
+        writer_path="/data/stream",
+        catalog=catalog,
+        promotion_interval_ms=5_000,
+        promote_on_close=False,
+        delete_feather_after_promotion=True,
+        use_ts_event_for_ts_init=True,
+    )
+
+    assert config.catalog == catalog
+    assert config.writer_backend == "Parquet"
+    assert config.promotion_interval_ms == 5_000
+    assert config.promote_on_close is False
+    assert config.delete_feather_after_promotion is True
+    assert config.use_ts_event_for_ts_init is True
+
+
+def test_streaming_config_writer_backend_follows_external_catalog() -> None:
+    """
+    Test an external catalog backend selects the writer factory of the same name.
     """
     config = StreamingConfig(
-        catalog_path="catalog",
-        rotation_config=RotationConfig.interval(17),
-        writer_backend="parquet",
+        writer_path="/data/stream",
+        catalog=DataCatalogConfig(
+            path="/data/catalog",
+            catalog_backend=CatalogBackend.External("DuckLake"),
+        ),
     )
-    assert config.rotation_config.mode == "interval"
-    assert config.rotation_config.interval_ns == 17
-    assert config.rotation_mode == "INTERVAL"
-    assert config.rotation_interval_ns == 17
-    assert config.writer_backend == "Parquet"
+
+    assert config.writer_backend == "DuckLake"
 
 
-def test_streaming_config_rejects_ambiguous_rotation() -> None:
+def test_streaming_config_exposes_scheduled_rotation() -> None:
     """
-    Reject conflicting rotation representations.
+    Test streaming config exposes scheduled rotation with its timezone.
     """
-    with pytest.raises(ValueError, match="cannot be combined"):
-        StreamingConfig(
-            catalog_path="catalog",
-            rotation_config=RotationConfig.size(17),
-            rotation_mode="SIZE",
-            max_file_size=23,
-        )
+    config = StreamingConfig(
+        writer_path="/data/stream",
+        rotation_config=RotationConfig.scheduled_dates(
+            5_000,
+            750,
+            timezone="Australia/Sydney",
+        ),
+    )
+
+    assert config.rotation_config.mode == RotationMode.SCHEDULED_DATES
+    assert config.rotation_config.interval_ns == 5_000
+    assert config.rotation_config.schedule_ns == 750
+    assert config.rotation_config.timezone == "Australia/Sydney"
+    assert config.rotation_config.max_size is None
+
+
+def test_rotation_config_scheduled_dates_defaults_to_utc() -> None:
+    """
+    Test scheduled rotation defaults to UTC, matching v1.
+    """
+    rotation = RotationConfig.scheduled_dates(5_000, 750)
+
+    assert rotation.timezone == "UTC"
+
+
+@pytest.mark.parametrize(
+    ("create", "field"),
+    [
+        (lambda: RotationConfig.size(0), "rotation_config.max_size"),
+        (lambda: RotationConfig.interval(0), "rotation_config.interval_ns"),
+        (lambda: RotationConfig.scheduled_dates(0, 0), "rotation_config.interval_ns"),
+        (
+            lambda: RotationConfig.scheduled_dates(1, 0, timezone="Mars/Olympus_Mons"),
+            "rotation_config.timezone",
+        ),
+    ],
+)
+def test_rotation_config_rejects_invalid_parameters(
+    create: Callable[[], RotationConfig],
+    field: str,
+) -> None:
+    """
+    Test rotation constructors reject zero sizes, zero intervals, and unknown timezones.
+    """
+    with pytest.raises(ValueError, match=f"invalid {field}"):
+        create()
+
+
+def test_streaming_config_types_are_enums() -> None:
+    """
+    Test streaming config keeps its type selectors and record filters as enums.
+    """
+    config = StreamingConfig(
+        writer_path="/data/output",
+        data_types=[NautilusDataType.QuoteTick, NautilusRecordType.OrderFilled],
+        instrument_types=[NautilusInstrumentType.Equity],
+        record_filters={NautilusRecordType.AccountState: ["SIM-001"]},
+    )
+
+    assert config.data_types == [NautilusDataType.QuoteTick]
+    assert config.record_types == [NautilusRecordType.OrderFilled]
+    assert config.instrument_types == [NautilusInstrumentType.Equity]
+    assert config.record_filters == {NautilusRecordType.AccountState: ["SIM-001"]}
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"data_types": ["quotes"]}, "streaming type must be NautilusDataType"),
+        ({"record_types": ["order_filled"]}, "record_type must be NautilusRecordType"),
+        ({"instrument_types": ["equity"]}, "instrument_type must be NautilusInstrumentType"),
+        ({"record_filters": {"account_state": None}}, "record_type must be NautilusRecordType"),
+    ],
+)
+def test_streaming_config_rejects_type_strings(kwargs: dict, message: str) -> None:
+    """
+    Test streaming config rejects strings where it expects type enums.
+    """
+    with pytest.raises(TypeError, match=message):
+        StreamingConfig(writer_path="/data/output", **kwargs)
+
+
+def test_streaming_config_rejects_flat_rotation_arguments() -> None:
+    """
+    Test streaming config takes rotation only through `rotation_config`.
+    """
+    with pytest.raises(TypeError, match="rotation_mode"):
+        StreamingConfig(writer_path="/data/stream", rotation_mode="SIZE")
 
 
 def test_venue_config_required_params() -> None:
@@ -290,10 +478,10 @@ def test_venue_config_optional_params() -> None:
     """
     instrument_id = InstrumentId.from_str("BTCUSDT.BINANCE")
     fill_model = BestPriceFillModel(prob_fill_on_limit=0.9, prob_slippage=0.1)
-    latency_model = StaticLatencyModel(base_latency_nanos=1_000)
     margin_model = StandardMarginModel()
+    latency_model = StaticLatencyModel(base_latency_nanos=1_000)
     module = FXRolloverInterestModule(
-        records=[InterestRateRecord(location="USD", time="17:00", value=0.01)],
+        records=[InterestRateRecord(location="USD", time="17:00", value=Decimal("0.01"))],
     )
     config = BacktestVenueConfig(
         name="BINANCE",
@@ -320,10 +508,10 @@ def test_venue_config_optional_params() -> None:
         base_currency=Currency.from_str("USDT"),
         default_leverage=Decimal(5),
         leverages={instrument_id: Decimal(3)},
-        margin_model=margin_model,
-        modules=[module],
         fill_model=fill_model,
+        margin_model=margin_model,
         latency_model=latency_model,
+        modules=[module],
         price_protection_points=7,
     )
     assert config.name == "BINANCE"
@@ -506,12 +694,48 @@ def test_data_config_minimal() -> None:
     instrument_id = InstrumentId.from_str("EUR/USD.SIM")
     config = BacktestDataConfig(
         data_type=NautilusDataType.QuoteTick,
-        catalog_path="/data/catalog",
+        catalog=DataCatalogConfig(path="/data/catalog"),
         instrument_id=instrument_id,
     )
     assert config.data_type == NautilusDataType.QuoteTick
-    assert config.catalog_path == "/data/catalog"
+    assert config.catalog.path == "/data/catalog"
     assert config.instrument_id == instrument_id
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "catalog_path",
+        "catalog_backend",
+        "catalog_fs_protocol",
+        "catalog_fs_storage_options",
+        "catalog_fs_rust_storage_options",
+    ],
+)
+def test_data_config_rejects_removed_catalog_arguments(field: str) -> None:
+    """
+    Test flat catalog arguments fail explicitly.
+    """
+    with pytest.raises(TypeError, match=field):
+        BacktestDataConfig(
+            data_type=NautilusDataType.QuoteTick,
+            catalog=DataCatalogConfig(path="/data/catalog"),
+            instrument_id=InstrumentId.from_str("EUR/USD.SIM"),
+            **{field: "removed"},
+        )
+
+
+@pytest.mark.parametrize("path", ["", "   "])
+def test_data_config_rejects_empty_catalog_path(path: str) -> None:
+    """
+    Test nested catalog paths retain nonempty validation.
+    """
+    with pytest.raises(ValueError, match=r"catalog\.path"):
+        BacktestDataConfig(
+            data_type=NautilusDataType.QuoteTick,
+            catalog=DataCatalogConfig(path=path),
+            instrument_id=InstrumentId.from_str("EUR/USD.SIM"),
+        )
 
 
 def test_data_config_requires_identifier() -> None:
@@ -521,7 +745,7 @@ def test_data_config_requires_identifier() -> None:
     with pytest.raises(ValueError, match="instrument_id"):
         BacktestDataConfig(
             data_type=NautilusDataType.QuoteTick,
-            catalog_path="/data/catalog",
+            catalog=DataCatalogConfig(path="/data/catalog"),
         )
 
 
@@ -532,7 +756,7 @@ def test_data_config_with_instrument_id() -> None:
     instrument_id = InstrumentId.from_str("EUR/USD.SIM")
     config = BacktestDataConfig(
         data_type=NautilusDataType.QuoteTick,
-        catalog_path="/data/catalog",
+        catalog=DataCatalogConfig(path="/data/catalog"),
         instrument_id=instrument_id,
     )
     assert config.instrument_id == instrument_id
@@ -547,10 +771,18 @@ def test_data_config_readback_redacts_storage_option_values() -> None:
     bar_spec = BarSpecification(1, BarAggregation.MINUTE, PriceType.LAST)
     config = BacktestDataConfig(
         data_type=NautilusDataType.Bar,
-        catalog_path="/data/catalog",
-        catalog_fs_protocol="s3",
-        catalog_fs_storage_options={"access_key": "secret"},
-        catalog_fs_rust_storage_options={"region": "ap-southeast-2"},
+        catalog=DataCatalogConfig(
+            path="/data/catalog",
+            fs_protocol="s3",
+            catalog_backend=CatalogBackend.External("Research"),
+            name="history",
+            read_only=True,
+            batch_size=512,
+            compression="snappy",
+            max_row_group_size=2048,
+            params={"snapshot_id": 7},
+            fs_rust_storage_options={"access_key": "secret", "region": "ap-southeast-2"},
+        ),
         instrument_ids=[instrument_id],
         start_time=1,
         end_time=2,
@@ -562,11 +794,17 @@ def test_data_config_readback_redacts_storage_option_values() -> None:
         optimize_file_loading=True,
     )
 
-    assert config.catalog_fs_protocol == "s3"
-    assert config.catalog_fs_storage_option_keys == ["access_key"]
-    assert config.catalog_fs_rust_storage_option_keys == ["region"]
-    assert not hasattr(config, "catalog_fs_storage_options")
-    assert not hasattr(config, "catalog_fs_rust_storage_options")
+    assert config.catalog.path == "/data/catalog"
+    assert config.catalog.fs_protocol == "s3"
+    assert config.catalog.catalog_backend == CatalogBackend.External("Research")
+    assert config.catalog.name == "history"
+    assert config.catalog.read_only is True
+    assert config.catalog.batch_size == 512
+    assert config.catalog.compression == "snappy"
+    assert config.catalog.max_row_group_size == 2048
+    assert config.catalog.params == {"snapshot_id": 7}
+    assert config.catalog.fs_rust_storage_option_keys == ["access_key", "region"]
+    assert not hasattr(config.catalog, "fs_rust_storage_options")
     assert config.instrument_ids == [instrument_id]
     assert config.start_time == 1
     assert config.end_time == 2
@@ -576,6 +814,28 @@ def test_data_config_readback_redacts_storage_option_values() -> None:
     assert config.bar_spec == bar_spec
     assert config.bar_types == ["EUR/USD.SIM-1-MINUTE-LAST-EXTERNAL"]
     assert config.optimize_file_loading is True
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({}, True),
+        ({"batch_deltas": False}, False),
+        ({"batch_deltas": True}, True),
+    ],
+)
+def test_data_config_batch_deltas(kwargs: dict[str, bool], expected: bool) -> None:
+    """
+    Test data config batches book deltas by default and accepts an explicit setting.
+    """
+    config = BacktestDataConfig(
+        data_type=NautilusDataType.OrderBookDelta,
+        catalog=DataCatalogConfig(path="/data/catalog"),
+        instrument_id=InstrumentId.from_str("EUR/USD.SIM"),
+        **kwargs,
+    )
+
+    assert config.batch_deltas is expected
 
 
 @pytest.mark.parametrize(
@@ -593,7 +853,7 @@ def test_data_config_accepts_compatible_timestamp_inputs(value: object) -> None:
     """
     config = BacktestDataConfig(
         data_type=NautilusDataType.QuoteTick,
-        catalog_path="/data/catalog",
+        catalog=DataCatalogConfig(path="/data/catalog"),
         instrument_id=InstrumentId.from_str("EUR/USD.SIM"),
         start_time=value,
         end_time=value,
@@ -611,7 +871,7 @@ def test_data_config_rejects_non_enum_data_type(data_type: object) -> None:
     with pytest.raises(TypeError):
         BacktestDataConfig(
             data_type=data_type,
-            catalog_path="/data/catalog",
+            catalog=DataCatalogConfig(path="/data/catalog"),
         )
 
 
@@ -621,7 +881,7 @@ def test_data_config_exposes_the_data_type_enum() -> None:
     """
     config = BacktestDataConfig(
         data_type=NautilusDataType.OrderBookDepth,
-        catalog_path="/data/catalog",
+        catalog=DataCatalogConfig(path="/data/catalog"),
         instrument_id=InstrumentId.from_str("EUR/USD.SIM"),
     )
 
@@ -635,7 +895,7 @@ def test_data_config_accepts_the_instrument_family() -> None:
     """
     config = BacktestDataConfig(
         data_type=NautilusDataType.Instrument,
-        catalog_path="/data/catalog",
+        catalog=DataCatalogConfig(path="/data/catalog"),
         instrument_id=InstrumentId.from_str("ETHUSDT-PERP.BINANCE"),
     )
 
@@ -657,7 +917,7 @@ def test_data_config_rejects_unsupported_family(data_type: NautilusDataType) -> 
     with pytest.raises(ValueError, match="data_type has unsupported value") as exc_info:
         BacktestDataConfig(
             data_type=data_type,
-            catalog_path="/data/catalog",
+            catalog=DataCatalogConfig(path="/data/catalog"),
             instrument_id=InstrumentId.from_str("EUR/USD.SIM"),
         )
 
@@ -672,10 +932,29 @@ def test_data_config_repr() -> None:
     """
     config = BacktestDataConfig(
         data_type=NautilusDataType.TradeTick,
-        catalog_path="/data/catalog",
+        catalog=DataCatalogConfig(path="/data/catalog"),
         instrument_id=InstrumentId.from_str("EUR/USD.SIM"),
     )
     assert "BacktestDataConfig" in repr(config)
+
+
+def test_data_config_repr_redacts_storage_option_values() -> None:
+    """
+    Test data config repr shows storage option keys with redacted values.
+    """
+    config = BacktestDataConfig(
+        data_type=NautilusDataType.TradeTick,
+        catalog=DataCatalogConfig(
+            path="/data/catalog",
+            fs_rust_storage_options={"aws_secret_access_key": "rust-secret-sentinel"},
+        ),
+        instrument_id=InstrumentId.from_str("EUR/USD.SIM"),
+    )
+
+    result = repr(config)
+
+    assert "rust-secret-sentinel" not in result
+    assert 'fs_rust_storage_options: Some({"aws_secret_access_key": <redacted>})' in result
 
 
 def test_run_config_auto_id() -> None:
@@ -691,7 +970,7 @@ def test_run_config_auto_id() -> None:
     )
     data = BacktestDataConfig(
         data_type=NautilusDataType.QuoteTick,
-        catalog_path="/data/catalog",
+        catalog=DataCatalogConfig(path="/data/catalog"),
         instrument_id=InstrumentId.from_str("EUR/USD.SIM"),
     )
     config = BacktestRunConfig(venues=[venue], data=[data])
@@ -711,7 +990,7 @@ def test_run_config_explicit_id() -> None:
     )
     data = BacktestDataConfig(
         data_type=NautilusDataType.QuoteTick,
-        catalog_path="/data/catalog",
+        catalog=DataCatalogConfig(path="/data/catalog"),
         instrument_id=InstrumentId.from_str("EUR/USD.SIM"),
     )
     config = BacktestRunConfig(venues=[venue], data=[data], id="my-run-001")
@@ -731,7 +1010,7 @@ def test_run_config_with_engine() -> None:
     )
     data = BacktestDataConfig(
         data_type=NautilusDataType.QuoteTick,
-        catalog_path="/data/catalog",
+        catalog=DataCatalogConfig(path="/data/catalog"),
         instrument_id=InstrumentId.from_str("EUR/USD.SIM"),
     )
     engine = BacktestEngineConfig(bypass_logging=True)
@@ -755,7 +1034,7 @@ def test_run_config_options_are_readable() -> None:
     )
     data = BacktestDataConfig(
         data_type=NautilusDataType.QuoteTick,
-        catalog_path="/data/catalog",
+        catalog=DataCatalogConfig(path="/data/catalog"),
         instrument_id=InstrumentId.from_str("EUR/USD.SIM"),
     )
     config = BacktestRunConfig(
@@ -809,7 +1088,7 @@ def test_run_config_repr() -> None:
     )
     data = BacktestDataConfig(
         data_type=NautilusDataType.QuoteTick,
-        catalog_path="/data/catalog",
+        catalog=DataCatalogConfig(path="/data/catalog"),
         instrument_id=InstrumentId.from_str("EUR/USD.SIM"),
     )
     config = BacktestRunConfig(venues=[venue], data=[data])
@@ -829,7 +1108,7 @@ def test_run_config_chunk_size_zero_rejected() -> None:
     )
     data = BacktestDataConfig(
         data_type=NautilusDataType.QuoteTick,
-        catalog_path="/data/catalog",
+        catalog=DataCatalogConfig(path="/data/catalog"),
         instrument_id=InstrumentId.from_str("EUR/USD.SIM"),
     )
     with pytest.raises(ValueError, match="chunk_size"):

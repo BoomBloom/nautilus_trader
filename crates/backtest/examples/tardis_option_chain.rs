@@ -49,7 +49,9 @@ use nautilus_model::{
     instruments::InstrumentAny,
     types::{Price, Quantity},
 };
-use nautilus_persistence::backend::catalog::ParquetDataCatalog;
+use nautilus_persistence::{
+    backend::parquet::catalog::ParquetDataCatalog, config::DataCatalogConfig,
+};
 use nautilus_trading::{Strategy, StrategyConfig, StrategyCore, nautilus_strategy};
 use rust_decimal::Decimal;
 use ustr::Ustr;
@@ -289,12 +291,12 @@ fn main() -> anyhow::Result<()> {
 
     let quote_data = BacktestDataConfig::builder()
         .data_type(NautilusDataType::QuoteTick)
-        .catalog_path(catalog_path.clone())
+        .catalog(DataCatalogConfig::new(catalog_path.clone(), None, None))
         .instrument_ids(instrument_ids.clone())
         .build()?;
     let greeks_data = BacktestDataConfig::builder()
         .data_type(NautilusDataType::OptionGreeks)
-        .catalog_path(catalog_path)
+        .catalog(DataCatalogConfig::new(catalog_path, None, None))
         .instrument_ids(instrument_ids)
         .build()?;
 
@@ -383,7 +385,7 @@ fn nearest_series(
         .iter()
         .map(|metadata| metadata.instrument_id)
         .collect();
-    let series_id = OptionSeriesId::new(
+    let series_id = OptionSeriesId::new_derived(
         venue,
         first.underlying,
         settlement_currency,
@@ -442,15 +444,12 @@ fn strike_range(selection_mode: SelectionMode) -> StrikeRange {
 fn option_fee_model() -> anyhow::Result<FeeModelAny> {
     match FEE_MODEL {
         "capped" => Ok(FeeModelAny::CappedOption(CappedOptionFeeModel::new(
-            Some(parse_decimal("0.0003")?),
-            Some(parse_decimal("0.0003")?),
+            parse_decimal("0.0003")?,
+            parse_decimal("0.0003")?,
             None,
         )?)),
         "tiered" => Ok(FeeModelAny::TieredNotionalOption(
-            TieredNotionalOptionFeeModel::new(
-                Some(parse_decimal("0.0002")?),
-                Some(parse_decimal("0.0005")?),
-            )?,
+            TieredNotionalOptionFeeModel::new(parse_decimal("0.0002")?, parse_decimal("0.0005")?)?,
         )),
         other => {
             anyhow::bail!("Invalid FEE_MODEL '{other}', expected 'capped' or 'tiered'")

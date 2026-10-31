@@ -18,6 +18,7 @@ use std::{
     fs::File,
     hint::black_box,
     io::{BufRead, BufReader},
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
@@ -30,6 +31,7 @@ use nautilus_backtest::{
 };
 use nautilus_common::{actor::DataActor, logging::logger::LoggerConfig, timer::TimeEvent};
 use nautilus_core::{UnixNanos, paths::get_test_data_path};
+use nautilus_execution::models::fee::{FeeModelAny, MakerTakerFeeModel};
 use nautilus_indicators::{
     average::ema::ExponentialMovingAverage,
     indicator::{Indicator, MovingAverage},
@@ -45,6 +47,7 @@ use nautilus_model::{
 };
 use nautilus_trading::{Strategy, StrategyConfig, StrategyCore, nautilus_strategy};
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use serde_json::Value;
 
 const DATA_FILE: &str = "btc-perp-20211231-20220201_1m.csv";
@@ -114,6 +117,11 @@ impl CanonicalScenario {
                 .book_type(BookType::L1_MBP)
                 .starting_balances(vec![Money::from("1_000_000 USDT")])
                 .queue_position(true)
+                // Matches the canonical instrument's defined rates; fingerprints pin this behavior.
+                .fee_model(
+                    FeeModelAny::MakerTaker(MakerTakerFeeModel::new(dec!(0.0002), dec!(0.0004)))
+                        .into(),
+                )
                 .build()?,
         )?;
         engine.add_instrument(&canonical_instrument())?;
@@ -191,8 +199,8 @@ impl CanonicalScenario {
                     "blake3:be57c858fd2d34e157342f64260c4d517abc2f7a5f67dce73d43858ea1b2bf1a"
                         .to_string(),
                 result_digest: expected_result_digest(
-                    "blake3:14fee63698f0b3afd4ed0fe0710733a2c677929efc975d82456c64d4e9e732c1",
-                    "blake3:c2cf16fff2bc490e553c6c2958e4e1d66a3d4d7ddbe413752bd542fcfd7d100e",
+                    "blake3:f2930cd2c5127aa2a0d4845c1735c9891a62d308963b2d791fa89310710f2b9e",
+                    "blake3:aff686ceb0181ce3f2459115269bc0f634a46aeaa5d26a6e01e380b1b08c2ffb",
                 ),
             },
             Self::PassiveLimitOrders => CanonicalFingerprint {
@@ -208,7 +216,7 @@ impl CanonicalScenario {
                     "blake3:7702ff4aa9ca1d26061419e9185a5bcfed0418fb0f24725ee36fd7d4323d79f5"
                         .to_string(),
                 result_digest:
-                    "blake3:4aaa0bdd015b1d4df4c1c850d3f1527f3d099ac717dd38500625c1d0ed24b403"
+                    "blake3:bdf55fed6226757d296b891b8c0271c4e81571ad3e569dcc1304e29d1ec05a72"
                         .to_string(),
             },
             Self::BarEmaCross => CanonicalFingerprint {
@@ -224,8 +232,8 @@ impl CanonicalScenario {
                     "blake3:ba1b5311a979bcfb6b58a4a9c478b4f00d0c577ce0c5c9cb3328f84ee921d9fc"
                         .to_string(),
                 result_digest: expected_result_digest(
-                    "blake3:e62f1f8cb2f77dc5c118b02ae0d9481236d1fd69a7f26928482e2406d9556a1e",
-                    "blake3:d269453558b68dd3dae266c1ab44fa454fdb034678fc383eb4f2b3edb4156bc1",
+                    "blake3:b39fb4859eb50b38a2bbc8dd46d2817549ecff2d463f438604922da2e4ef843e",
+                    "blake3:1be2c04ff8587ac11aa7b68119afaf787818b75391aa7fcf5634e56f63bd09cd",
                 ),
             },
         }
@@ -693,6 +701,9 @@ fn verify_input(
     let case = scenario.case_name(input);
     let fixture = load_fixture(input)?;
     let preloaded = scenario.run(&fixture)?;
+
+    write_result(&case, &preloaded)?;
+
     if let Err(e) = scenario.verify(&preloaded) {
         mismatches.push(format!("[{case}] {e}"));
     }
@@ -707,6 +718,19 @@ fn verify_input(
         ));
     }
     Ok(preloaded)
+}
+
+pub(crate) fn write_result(case: &str, result: &CanonicalBacktestResult) -> anyhow::Result<()> {
+    if let Some(directory) = std::env::var_os("NAUTILUS_BENCH_RESULT_DIR") {
+        let directory = PathBuf::from(directory);
+        std::fs::create_dir_all(&directory)?;
+        std::fs::write(
+            directory.join(format!("{case}.json")),
+            serde_json::to_vec_pretty(result.as_value())?,
+        )?;
+    }
+
+    Ok(())
 }
 
 pub(crate) fn load_fixture(input: CanonicalInput) -> anyhow::Result<CanonicalFixture> {

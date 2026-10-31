@@ -28,6 +28,7 @@ use nautilus_backtest::{
 };
 use nautilus_common::{actor::DataActor, throttler::RateLimit};
 use nautilus_core::DurationNanos;
+use nautilus_execution::models::fee::{FeeModelAny, MakerTakerFeeModel};
 use nautilus_model::{
     data::{NautilusDataType, QuoteTick},
     enums::{AccountType, BookType, OmsType, OrderSide},
@@ -36,7 +37,9 @@ use nautilus_model::{
     orderbook::OrderBook,
     types::{Currency, Quantity},
 };
-use nautilus_persistence::backend::catalog::ParquetDataCatalog;
+use nautilus_persistence::{
+    backend::parquet::catalog::ParquetDataCatalog, config::DataCatalogConfig,
+};
 use nautilus_risk::engine::config::RiskEngineConfig;
 use nautilus_testkit::common::{itch_aapl_equity, load_itch_aapl_deltas};
 use nautilus_trading::{
@@ -73,6 +76,7 @@ fn xnas_venue_config() -> BacktestVenueConfig {
         .book_type(BookType::L1_MBP)
         .starting_balances(vec!["1_000_000 USD".to_string()])
         .base_currency(Currency::from("USD"))
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()))
         .build()
         .unwrap()
 }
@@ -80,7 +84,7 @@ fn xnas_venue_config() -> BacktestVenueConfig {
 fn quote_data_config(catalog_path: &str, instrument_id: InstrumentId) -> BacktestDataConfig {
     BacktestDataConfig::builder()
         .data_type(NautilusDataType::QuoteTick)
-        .catalog_path(catalog_path.to_string())
+        .catalog(DataCatalogConfig::new(catalog_path.to_string(), None, None))
         .instrument_id(instrument_id)
         .build()
         .unwrap()

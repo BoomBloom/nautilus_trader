@@ -91,12 +91,27 @@ The sections below detail the controls at each layer of that lifecycle.
   hashes. Wildcard version requirements are prohibited.
 - **Dependency cooldowns**: Python dependency resolution excludes packages published within the
   last 7 days through `exclude-newer` in `python/pyproject.toml`. Rust crate updates remain subject
-  to a 3-day cooldown and cargo-vet review. Resolved crates.io publication dates are committed in
-  `.supply-chain/crate-dates.json` so the check can run without registry access. A security fix or
-  critical bug fix may bypass either cooldown after explicit review. These windows give the
+  to a 3-day cooldown and cargo-vet review, and every Make target that compiles Rust checks the
+  resolved lockfiles first. Resolved crates.io publication dates are committed in
+  `.supply-chain/crate-dates.json` so the check can run without registry access; dates a branch adds
+  beyond `origin/develop` are re-verified against crates.io, locally and in the CI pre-commit job.
+  A security fix or critical bug fix may bypass either cooldown after explicit review. These windows give the
   community time to detect and quarantine compromised releases. Development tools are pinned to
   explicit versions across `.nautilus-engineering/tools.toml`, `tools.toml`, `Cargo.toml`, and
   related manifests, and version bumps are reviewed during security audits.
+- **Reviewed GitHub Actions cooldown exception**: `step-security/harden-runner` v2.22.3 at commit
+  `46b06cea07f9e64621fdf066ba77ac6915163d43` is approved before the normal 14-day window.
+  The [release](https://github.com/step-security/harden-runner/releases/tag/v2.22.3) fixes GitHub's
+  DNS/proxy experiment blocking allowed connections.
+  Repeated failures prevent CI and release recovery, which justifies early adoption. The review covers
+  the DNS/proxy fix and verifies published Linux agent checksums. Only this commit's age check is exempt;
+  tag/SHA validation, release metadata checks, egress block mode, and endpoint allowlists remain enforced.
+  All other commits retain the 14-day cooldown.
+- **Container image cooldowns**: Require images to be at least 7 days old unless an exception is
+  explicitly reviewed. Measure age from `created` in the image configuration for the exact
+  pinned digest, not the bundled software release date or tag update time. For multi-architecture indexes,
+  use the newest `created` timestamp among the target-platform images. Rebuilding an image restarts
+  its cooldown.
 - **Wheel-only Python installs**: The `no-build-package` list in `[tool.uv]` enumerates every
   third-party package locked in `python/uv.lock` and forbids `uv` from building any of them from source.
   In normal operation uv prefers wheels, so the setting is a no-op; it kicks in only if a listed
@@ -247,6 +262,11 @@ gh attestation verify nautilus_trader-*.tar.gz \
   --cert-identity-regex "$IDENTITY" \
   --cert-oidc-issuer "$ISSUER"
 ```
+
+If a release finishes publication using retained build artifacts, its release notes include an additional
+verification command with `--predicate-type` for the publication recovery attestation. Use that command
+for recovered artifacts. The signed predicate records the original build commit and run separately from
+the later publication commit and run; it does not claim the later commit built the package.
 
 ### Docker images
 

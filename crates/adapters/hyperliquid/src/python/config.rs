@@ -31,11 +31,13 @@ impl HyperliquidDataClientConfig {
     /// Configuration for the Hyperliquid data client.
     ///
     /// The `stale_stream_*` options control the stream health monitor. With recovery
-    /// enabled, a stale stream is warned about first, targeted-resubscribed once per
-    /// recovery cooldown (preserving its original `l2Book` options), and escalated to
-    /// a full WebSocket reconnect after `stale_stream_max_targeted_resubscribes`
-    /// failed attempts; fresh data resets the ladder. See the Hyperliquid integration
-    /// guide ("Stream health and recovery") for details.
+    /// enabled, a stale stream is warned about first, then acted on once per recovery
+    /// cooldown. A stale order book delta stream, including depth that shares its stream,
+    /// starts shared book recovery, which resubscribes until a fresh snapshot arrives.
+    /// Depth-only and BBO streams receive a targeted resubscribe (preserving the original
+    /// `l2Book` options) and escalate to a full WebSocket reconnect after
+    /// `stale_stream_max_targeted_resubscribes` failed attempts. Fresh data resets the ladder. See the Hyperliquid integration guide
+    /// ("Stream health and recovery") for details.
     #[new]
     #[pyo3(signature = (
         environment = None,
@@ -53,6 +55,7 @@ impl HyperliquidDataClientConfig {
         stale_stream_recovery_enabled = None,
         stale_stream_recovery_cooldown_secs = None,
         stale_stream_max_targeted_resubscribes = None,
+        book_snapshot_timeout_secs = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -71,6 +74,7 @@ impl HyperliquidDataClientConfig {
         stale_stream_recovery_enabled: Option<bool>,
         stale_stream_recovery_cooldown_secs: Option<u64>,
         stale_stream_max_targeted_resubscribes: Option<u32>,
+        book_snapshot_timeout_secs: Option<u64>,
     ) -> Self {
         let defaults = Self::default();
         Self {
@@ -93,6 +97,8 @@ impl HyperliquidDataClientConfig {
                 .unwrap_or(defaults.stale_stream_recovery_cooldown_secs),
             stale_stream_max_targeted_resubscribes: stale_stream_max_targeted_resubscribes
                 .unwrap_or(defaults.stale_stream_max_targeted_resubscribes),
+            book_snapshot_timeout_secs: book_snapshot_timeout_secs
+                .unwrap_or(defaults.book_snapshot_timeout_secs),
             update_instruments_interval_mins: update_instruments_interval_mins
                 .unwrap_or(defaults.update_instruments_interval_mins),
             transport_backend: transport_backend.unwrap_or(defaults.transport_backend),
@@ -133,6 +139,7 @@ impl HyperliquidExecutionClientConfig {
         include_builder_attribution = None,
         ws_post_timeout_secs = None,
         transport_backend = None,
+        scheduled_cancel_timeout_secs = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -154,6 +161,7 @@ impl HyperliquidExecutionClientConfig {
         include_builder_attribution: Option<bool>,
         ws_post_timeout_secs: Option<u64>,
         transport_backend: Option<TransportBackend>,
+        scheduled_cancel_timeout_secs: Option<u64>,
     ) -> Self {
         let defaults = Self::default();
         Self {
@@ -179,6 +187,7 @@ impl HyperliquidExecutionClientConfig {
             ws_post_timeout_secs: ws_post_timeout_secs.unwrap_or(defaults.ws_post_timeout_secs),
             transport_backend: transport_backend.unwrap_or(defaults.transport_backend),
             outcome_settlement_poll_secs: defaults.outcome_settlement_poll_secs,
+            scheduled_cancel_timeout_secs,
         }
     }
 
@@ -189,5 +198,44 @@ impl HyperliquidExecutionClientConfig {
 
     fn __repr__(&self) -> String {
         stringify!(HyperliquidExecutionClientConfig).to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pyo3::types::PyDict;
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    #[case::default(None)]
+    #[case::enabled(Some(60))]
+    fn test_python_scheduled_cancel(#[case] timeout_secs: Option<u64>) {
+        Python::initialize();
+        Python::attach(|py| {
+            let kwargs = PyDict::new(py);
+            if let Some(timeout_secs) = timeout_secs {
+                kwargs
+                    .set_item("scheduled_cancel_timeout_secs", timeout_secs)
+                    .unwrap();
+            }
+
+            let config = py
+                .get_type::<HyperliquidExecutionClientConfig>()
+                .call((), Some(&kwargs))
+                .unwrap();
+            let getter = config
+                .getattr("scheduled_cancel_timeout_secs")
+                .unwrap()
+                .extract::<Option<u64>>()
+                .unwrap();
+            let rust_config = config
+                .extract::<PyRef<HyperliquidExecutionClientConfig>>()
+                .unwrap();
+
+            assert_eq!(getter, timeout_secs);
+            assert_eq!(rust_config.scheduled_cancel_timeout_secs, timeout_secs);
+        });
     }
 }

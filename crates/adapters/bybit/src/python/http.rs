@@ -576,8 +576,8 @@ impl BybitHttpClient {
     /// Fetches instrument info and returns the current status of each symbol.
     ///
     /// Paginates through the instruments endpoint collecting only
-    /// `(InstrumentId, MarketStatusAction)` pairs. This avoids fee-rate
-    /// fetching and full instrument parsing.
+    /// `(InstrumentId, MarketStatusAction)` pairs. This avoids full instrument
+    /// parsing.
     ///
     /// # Errors
     ///
@@ -775,7 +775,8 @@ impl BybitHttpClient {
         client_order_id=None,
         venue_order_id=None,
         quantity=None,
-        price=None
+        price=None,
+        trigger_price=None
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_modify_order<'py>(
@@ -788,6 +789,7 @@ impl BybitHttpClient {
         venue_order_id: Option<VenueOrderId>,
         quantity: Option<Quantity>,
         price: Option<Price>,
+        trigger_price: Option<Price>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
 
@@ -801,6 +803,7 @@ impl BybitHttpClient {
                     venue_order_id,
                     quantity,
                     price,
+                    trigger_price,
                 )
                 .await
                 .map_err(to_pyvalue_err)?;
@@ -809,7 +812,9 @@ impl BybitHttpClient {
         })
     }
 
-    /// Cancel an order.
+    /// Cancels an order and returns its confirmed terminal status.
+    ///
+    /// Polls until the order closes, bounded by the configured HTTP timeout.
     ///
     /// # Errors
     ///
@@ -818,6 +823,7 @@ impl BybitHttpClient {
     /// - The request fails.
     /// - The order doesn't exist.
     /// - The API returns an error.
+    /// - Terminal status confirmation times out.
     #[pyo3(name = "cancel_order")]
     #[pyo3(signature = (account_id, product_type, instrument_id, client_order_id=None, venue_order_id=None))]
     fn py_cancel_order<'py>(
@@ -1224,11 +1230,15 @@ impl BybitHttpClient {
 
     /// Fetches execution history (fills) for the account and returns a list of `FillReport`s.
     ///
-    /// Executions for instruments not currently loaded in cache will be skipped.
+    /// Funding executions and executions for instruments not currently loaded in cache are skipped.
     ///
     /// # Errors
     ///
-    /// This function returns an error if the request fails.
+    /// Returns an error if:
+    /// - The request fails.
+    /// - The instrument ID is invalid.
+    /// - Pagination cannot advance.
+    /// - A fill for a cached instrument cannot be parsed.
     ///
     /// # References
     ///
@@ -1267,12 +1277,20 @@ impl BybitHttpClient {
 
     /// Fetches position information for the account and returns a list of `PositionStatusReport`s.
     ///
-    /// Positions for instruments not currently loaded in cache will be skipped.
+    /// Derivative position reports fail as a set if any row cannot be resolved or parsed.
+    /// When SPOT position reports are enabled, an uncached instrument yields no report.
     ///
     /// # Errors
     ///
-    /// This function returns an error if the request fails, or if SPOT position reports are enabled
-    /// and no instrument is specified, because wallet balances carry no pair identity.
+    /// Returns an error if:
+    /// - The request fails.
+    /// - The instrument ID is invalid.
+    /// - Pagination cannot advance.
+    /// - A derivative position row has no symbol.
+    /// - A derivative position's instrument is not cached.
+    /// - A derivative position row cannot be parsed.
+    /// - SPOT position reports are enabled and no instrument is specified, because wallet balances
+    ///   carry no pair identity.
     ///
     /// # References
     ///

@@ -78,6 +78,8 @@ pub struct ExecTester {
     pub(super) pending_open_position_qty: Option<Decimal>,
     pub(super) buy_stop_cancel_replace_attempted: bool,
     pub(super) sell_stop_cancel_replace_attempted: bool,
+    buy_stop_replacement: Option<StopOrderReplacement>,
+    sell_stop_replacement: Option<StopOrderReplacement>,
     pub(super) buy_limit_maintenance_state: LimitOrderMaintenanceState,
     pub(super) sell_limit_maintenance_state: LimitOrderMaintenanceState,
 }
@@ -123,6 +125,7 @@ nautilus_strategy!(ExecTester, {
 
     fn on_order_canceled(&mut self, event: &OrderCanceled) {
         self.handle_limit_order_canceled(event.client_order_id);
+        self.handle_stop_order_canceled(event);
     }
 
     fn on_order_modify_rejected(&mut self, event: OrderModifyRejected) {
@@ -131,27 +134,38 @@ nautilus_strategy!(ExecTester, {
 
     fn on_order_cancel_rejected(&mut self, event: OrderCancelRejected) {
         self.finish_limit_order_maintenance(event.client_order_id);
+        self.clear_stop_order_replacement(event.client_order_id);
     }
 
     fn on_order_denied(&mut self, event: OrderDenied) {
         self.handle_limit_order_closed(event.client_order_id);
+        self.clear_stop_order_replacement(event.client_order_id);
     }
 
     fn on_order_rejected(&mut self, event: OrderRejected) {
         self.handle_limit_order_closed(event.client_order_id);
+        self.clear_stop_order_replacement(event.client_order_id);
     }
 
     fn on_order_expired(&mut self, event: OrderExpired) {
         self.handle_limit_order_closed(event.client_order_id);
+        self.clear_stop_order_replacement(event.client_order_id);
     }
 
     fn on_order_filled(&mut self, event: &OrderFilled) {
-        let is_closed = self
+        let (is_closed, is_filled) = self
             .cache()
             .order(&event.client_order_id)
-            .is_none_or(|order| order.is_closed());
+            .map_or((true, false), |order| {
+                (order.is_closed(), order.status() == OrderStatus::Filled)
+            });
+
         if is_closed {
             self.handle_limit_order_closed(event.client_order_id);
+        }
+
+        if is_filled {
+            self.clear_stop_order_replacement(event.client_order_id);
         }
     }
 
@@ -208,6 +222,9 @@ impl DataActor for ExecTester {
     }
 
     fn on_stop(&mut self) -> anyhow::Result<()> {
+        self.buy_stop_replacement = None;
+        self.sell_stop_replacement = None;
+
         if self.config.dry_run {
             log_warn!("Dry run mode, skipping cancel all orders and close all positions");
             return Ok(());
@@ -386,6 +403,8 @@ impl ExecTester {
             pending_open_position_qty,
             buy_stop_cancel_replace_attempted: false,
             sell_stop_cancel_replace_attempted: false,
+            buy_stop_replacement: None,
+            sell_stop_replacement: None,
             buy_limit_maintenance_state,
             sell_limit_maintenance_state,
         }
@@ -1279,6 +1298,12 @@ impl ExecTester {
             None
         };
 
+        if let Some(replacement) = &mut self.buy_stop_replacement {
+            replacement.trigger_price = trigger_price;
+            replacement.limit_price = limit_price;
+            return;
+        }
+
         let needs_new_order = match &self.buy_stop_order {
             None => true,
             Some(order) => !Self::is_order_active(order) && !self.stop_order_is_one_shot(),
@@ -1304,19 +1329,13 @@ impl ExecTester {
                 } else if self.config.cancel_replace_stop_orders_to_maintain_offset
                     && !self.buy_stop_cancel_replace_attempted
                 {
-                    self.buy_stop_cancel_replace_attempted = true;
-                    let order_clone = order.clone();
-                    let _ = self.cancel_order(
-                        order_clone.client_order_id(),
-                        self.config.client_id,
-                        None,
+                    let client_order_id = order.client_order_id();
+                    self.start_stop_order_cancel_replace(
+                        OrderSide::Buy,
+                        client_order_id,
+                        trigger_price,
+                        limit_price,
                     );
-
-                    if let Err(e) =
-                        self.submit_stop_order(OrderSide::Buy, trigger_price, limit_price)
-                    {
-                        log::error!("Failed to submit replacement buy stop order: {e}");
-                    }
                 }
             }
         }
@@ -1376,6 +1395,12 @@ impl ExecTester {
             None
         };
 
+        if let Some(replacement) = &mut self.sell_stop_replacement {
+            replacement.trigger_price = trigger_price;
+            replacement.limit_price = limit_price;
+            return;
+        }
+
         let needs_new_order = match &self.sell_stop_order {
             None => true,
             Some(order) => !Self::is_order_active(order) && !self.stop_order_is_one_shot(),
@@ -1401,20 +1426,95 @@ impl ExecTester {
                 } else if self.config.cancel_replace_stop_orders_to_maintain_offset
                     && !self.sell_stop_cancel_replace_attempted
                 {
-                    self.sell_stop_cancel_replace_attempted = true;
-                    let order_clone = order.clone();
-                    let _ = self.cancel_order(
-                        order_clone.client_order_id(),
-                        self.config.client_id,
-                        None,
+                    let client_order_id = order.client_order_id();
+                    self.start_stop_order_cancel_replace(
+                        OrderSide::Sell,
+                        client_order_id,
+                        trigger_price,
+                        limit_price,
                     );
-
-                    if let Err(e) =
-                        self.submit_stop_order(OrderSide::Sell, trigger_price, limit_price)
-                    {
-                        log::error!("Failed to submit replacement sell stop order: {e}");
-                    }
                 }
+            }
+        }
+    }
+
+    fn start_stop_order_cancel_replace(
+        &mut self,
+        side: OrderSide,
+        client_order_id: ClientOrderId,
+        trigger_price: Price,
+        limit_price: Option<Price>,
+    ) {
+        let replacement = Some(StopOrderReplacement {
+            client_order_id,
+            trigger_price,
+            limit_price,
+        });
+
+        match side {
+            OrderSide::Buy => {
+                self.buy_stop_cancel_replace_attempted = true;
+                self.buy_stop_replacement = replacement;
+            }
+            OrderSide::Sell => {
+                self.sell_stop_cancel_replace_attempted = true;
+                self.sell_stop_replacement = replacement;
+            }
+        }
+
+        if let Err(e) = self.cancel_order(client_order_id, self.config.client_id, None) {
+            self.clear_stop_order_replacement(client_order_id);
+            log::error!("Failed to cancel {side} stop order for replacement: {e}");
+        }
+    }
+
+    fn handle_stop_order_canceled(&mut self, event: &OrderCanceled) {
+        let client_order_id = event.client_order_id;
+
+        let replacement = [
+            (OrderSide::Buy, &mut self.buy_stop_replacement),
+            (OrderSide::Sell, &mut self.sell_stop_replacement),
+        ]
+        .into_iter()
+        .find_map(|(side, pending)| {
+            if pending
+                .as_ref()
+                .is_some_and(|replacement| replacement.client_order_id == client_order_id)
+            {
+                if event.reconciliation {
+                    log::error!(
+                        "Cannot complete {side} stop cancel-replace from a reconciliation event for {client_order_id}, replacement remains pending"
+                    );
+                    return None;
+                }
+
+                pending.take().map(|replacement| (side, replacement))
+            } else {
+                None
+            }
+        });
+
+        let Some((side, replacement)) = replacement else {
+            return;
+        };
+
+        if let Err(e) =
+            self.submit_stop_order(side, replacement.trigger_price, replacement.limit_price)
+        {
+            log::error!("Failed to submit replacement {side} stop order: {e}");
+        }
+    }
+
+    fn clear_stop_order_replacement(&mut self, client_order_id: ClientOrderId) {
+        for pending in [
+            &mut self.buy_stop_replacement,
+            &mut self.sell_stop_replacement,
+        ] {
+            if pending
+                .as_ref()
+                .is_some_and(|replacement| replacement.client_order_id == client_order_id)
+            {
+                *pending = None;
             }
         }
     }
@@ -1727,6 +1827,10 @@ impl ExecTester {
     /// # Errors
     ///
     /// Returns an error if order creation or submission fails.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "bracket validation and linked entry, stop-loss, and take-profit construction stay together"
+    )]
     pub(super) fn submit_bracket_order(
         &mut self,
         order_side: OrderSide,
@@ -1748,12 +1852,39 @@ impl ExecTester {
             );
         }
 
+        anyhow::ensure!(
+            matches!(
+                self.config.bracket_contingency_type,
+                ContingencyType::Oco | ContingencyType::Ouo
+            ),
+            "Bracket exits require OCO or OUO contingency, was {:?}",
+            self.config.bracket_contingency_type
+        );
+        anyhow::ensure!(
+            matches!(
+                self.config.bracket_tp_order_type,
+                OrderType::Limit | OrderType::MarketIfTouched | OrderType::LimitIfTouched
+            ),
+            "Bracket take-profit requires LIMIT, MARKET_IF_TOUCHED, or LIMIT_IF_TOUCHED, was {:?}",
+            self.config.bracket_tp_order_type
+        );
+
         if order_side == OrderSide::Buy && !self.config.enable_limit_buys {
             log_warn!("BUY orders not enabled, skipping bracket");
             return Ok(());
         } else if order_side == OrderSide::Sell && !self.config.enable_limit_sells {
             log_warn!("SELL orders not enabled, skipping bracket");
             return Ok(());
+        }
+
+        if matches!(
+            (
+                self.config.limit_time_in_force,
+                self.config.order_expire_time_delta_mins
+            ),
+            (Some(TimeInForce::Gtd), _) | (None, Some(_))
+        ) {
+            anyhow::bail!("GTD time in force not supported for bracket take-profit legs");
         }
 
         let (time_in_force, expire_time) =
@@ -1789,6 +1920,8 @@ impl ExecTester {
         let quote_quantity = self.config.use_quote_quantity;
         let emulation_trigger = self.config.emulation_trigger;
         let stop_trigger_type = self.config.stop_trigger_type;
+        let contingency_type = self.config.bracket_contingency_type;
+        let tp_order_type = self.config.bracket_tp_order_type;
         let orders = self
             .order_factory()
             .bracket()
@@ -1796,13 +1929,16 @@ impl ExecTester {
             .order_side(order_side)
             .quantity(quantity)
             .quote_quantity(quote_quantity)
+            .contingency_type(contingency_type)
             .entry_order_type(OrderType::Limit)
             .entry_price(entry_price)
             .time_in_force(time_in_force)
             .entry_post_only(entry_post_only)
             .maybe_emulation_trigger(emulation_trigger)
             .maybe_expire_time(expire_time)
+            .tp_order_type(tp_order_type)
             .tp_price(tp_price)
+            .tp_trigger_price(tp_price)
             .tp_post_only(entry_post_only)
             .tp_time_in_force(time_in_force)
             .sl_trigger_price(sl_trigger_price)
@@ -1810,14 +1946,14 @@ impl ExecTester {
             .sl_time_in_force(sl_time_in_force)
             .call();
 
-        if let Some(entry_order) = orders.first() {
-            if order_side == OrderSide::Buy {
-                self.buy_order = Some(entry_order.clone());
-            } else {
-                self.sell_order = Some(entry_order.clone());
-            }
-            self.arm_limit_order_maintenance(order_side, entry_order.client_order_id());
+        let entry_order = &orders[0];
+        if order_side == OrderSide::Buy {
+            self.buy_order = Some(entry_order.clone());
+        } else {
+            self.sell_order = Some(entry_order.clone());
         }
+
+        self.arm_limit_order_maintenance(order_side, entry_order.client_order_id());
 
         let client_id = self.config.client_id;
         if let Some(params) = &self.config.order_params {
@@ -2172,4 +2308,11 @@ fn clamp_price_to_range(price: Price, instrument: &InstrumentAny, enabled: bool)
     }
 
     clamped
+}
+
+#[derive(Debug)]
+struct StopOrderReplacement {
+    client_order_id: ClientOrderId,
+    trigger_price: Price,
+    limit_price: Option<Price>,
 }

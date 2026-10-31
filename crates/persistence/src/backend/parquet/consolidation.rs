@@ -17,16 +17,19 @@
 
 #![expect(
     clippy::missing_errors_doc,
-    clippy::missing_panics_doc,
     reason = "consolidation operations forward catalog/storage errors and operate on validated batches"
 )]
 
-use nautilus_core::UnixNanos;
+use ahash::AHashSet;
+use arrow::record_batch::RecordBatch;
+use nautilus_core::{ClosedInterval, UnixNanos, string::conversions::to_snake_case};
 use nautilus_model::data::{
     Bar, CustomData, Data, HasTsInit, IndexPriceUpdate, MarkPriceUpdate, NautilusDataType,
     OrderBookDelta, OrderBookDepth, QuoteTick, TradeTick, close::InstrumentClose,
 };
-use nautilus_serialization::arrow::{DecodeTypedFromRecordBatch, EncodeToRecordBatch};
+use nautilus_serialization::arrow::{
+    DecodeTypedFromRecordBatch, EncodeToRecordBatch, catalog_identifier_from_metadata,
+};
 use object_store::path::Path as ObjectPath;
 
 use crate::{
@@ -35,25 +38,25 @@ use crate::{
         intervals::{are_intervals_contiguous, are_intervals_disjoint},
         io::combine_parquet_files_from_object_store,
         paths::{
-            extract_path_components, make_object_store_path, parse_filename_timestamps,
-            timestamps_to_filename,
+            extract_path_components, make_object_store_path, normalize_path_separators,
+            parse_filename_timestamps, timestamps_to_filename,
         },
     },
     catalog::types::{
         CatalogDataType, HasCatalogDataType, parquet_catalog_data_type_path_prefixes,
         parquet_data_path_prefix,
     },
-    common::custom::group_custom_data_by_type,
+    common::coverage::merge_closed_intervals,
 };
 
 /// Information about a consolidation query to be executed.
 #[derive(Debug, Clone)]
 pub struct ConsolidationQuery {
-    /// Start timestamp for the query range (inclusive, in nanoseconds)
+    /// Start timestamp for the query range (inclusive, in nanoseconds).
     pub query_start: u64,
-    /// End timestamp for the query range (inclusive, in nanoseconds)
+    /// End timestamp for the query range (inclusive, in nanoseconds).
     pub query_end: u64,
-    /// Whether to use period boundaries for file naming (true) or actual data timestamps (false)
+    /// Whether to use period boundaries for file naming (true) or actual data timestamps (false).
     pub use_period_boundaries: bool,
 }
 
@@ -322,64 +325,54 @@ impl ParquetDataCatalog {
         }
 
         let mut files_to_consolidate = Vec::new();
-        let mut intervals = Vec::new();
         let start = start.map(|t| t.as_u64());
         let end = end.map(|t| t.as_u64());
 
         for file in parquet_files {
-            if let Some(interval) = parse_filename_timestamps(&file) {
-                let (interval_start, interval_end) = interval;
-                let include_file = match (start, end) {
-                    (Some(s), Some(e)) => interval_start >= s && interval_end <= e,
-                    (Some(s), None) => interval_start >= s,
-                    (None, Some(e)) => interval_end <= e,
-                    (None, None) => true,
-                };
+            let Some(interval) = parse_filename_timestamps(&file) else {
+                continue;
+            };
 
-                if include_file {
-                    files_to_consolidate.push(file);
-                    intervals.push(interval);
-                }
+            if start.is_none_or(|s| interval.0 >= s) && end.is_none_or(|e| interval.1 <= e) {
+                files_to_consolidate.push((file, interval));
             }
         }
 
-        intervals.sort_by_key(|&(start, _)| start);
-        files_to_consolidate.sort_by_key(|file| {
-            parse_filename_timestamps(file).map_or(u64::MAX, |(start, _)| start)
-        });
+        files_to_consolidate.sort_by_key(|&(_, (interval_start, _))| interval_start);
+        let intervals: Vec<(u64, u64)> = files_to_consolidate
+            .iter()
+            .map(|&(_, interval)| interval)
+            .collect();
 
         // Validate disjointness before merging so source files are left untouched on failure
         if ensure_contiguous_files.unwrap_or(true) && !are_intervals_disjoint(&intervals) {
             anyhow::bail!("Intervals are not disjoint before consolidating a directory");
         }
 
-        if !intervals.is_empty() {
-            let file_name = timestamps_to_filename(
-                UnixNanos::from(intervals[0].0),
-                UnixNanos::from(intervals.iter().map(|i| i.1).max().unwrap()),
-            );
-            let path = make_object_store_path(directory, [&file_name]);
+        let Some(last_end) = intervals.iter().map(|interval| interval.1).max() else {
+            return Ok(());
+        };
 
-            // Convert string paths to ObjectPath for the function call
-            let object_paths: Vec<ObjectPath> = files_to_consolidate
-                .iter()
-                .map(|path| ObjectPath::from(path.as_str()))
-                .collect();
+        let file_name =
+            timestamps_to_filename(UnixNanos::from(intervals[0].0), UnixNanos::from(last_end));
+        let path = make_object_store_path(directory, [&file_name]);
 
-            self.execute_async(|| async {
-                combine_parquet_files_from_object_store(
-                    self.object_store.clone(),
-                    object_paths,
-                    &ObjectPath::from(path),
-                    Some(self.compression),
-                    Some(self.max_row_group_size),
-                    deduplicate,
-                )
-                .await
-            })?;
-        }
+        let object_paths = files_to_consolidate
+            .iter()
+            .map(|(path, _)| self.to_object_path_parsed(path))
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
-        Ok(())
+        self.execute_async(|| async {
+            combine_parquet_files_from_object_store(
+                self.object_store.clone(),
+                object_paths,
+                &ObjectPath::from(path),
+                Some(self.compression),
+                Some(self.max_row_group_size),
+                deduplicate,
+            )
+            .await
+        })
     }
 
     /// Consolidates all data files in the catalog by splitting them into fixed time periods.
@@ -399,7 +392,7 @@ impl ParquetDataCatalog {
     /// - `end`: Optional end timestamp for the consolidation range. Only files with timestamps
     ///   less than or equal to this value will be consolidated. If None, all files
     ///   up to the end of time will be considered.
-    /// - `ensure_contiguous_files`: If true, uses period boundaries for file naming.
+    /// - `ensure_contiguous_files`: If true, uses period boundaries clipped to `start` and `end` for file naming.
     ///   If false, uses actual data timestamps for file naming.
     ///
     /// # Returns
@@ -409,6 +402,7 @@ impl ParquetDataCatalog {
     /// # Errors
     ///
     /// Returns an error if:
+    /// - `period_nanos` is zero and a directory holds data to consolidate.
     /// - Directory listing fails.
     /// - Data type extraction from path fails.
     /// - Period-based consolidation operations fail.
@@ -465,23 +459,22 @@ impl ParquetDataCatalog {
         let leaf_directories = self.find_leaf_data_directories()?;
 
         for directory in leaf_directories {
-            let (data_cls, identifier) =
-                self.extract_data_cls_and_identifier_from_path(&directory)?;
+            let (Some(data_cls_name), identifier) =
+                self.extract_data_cls_and_identifier_from_path(&directory)?
+            else {
+                continue;
+            };
 
-            if let Some(data_cls_name) = data_cls {
-                let identifier_ref = identifier.as_deref();
-
-                if !self.dispatch_consolidate_data_by_period(
-                    &data_cls_name,
-                    identifier_ref,
-                    period_nanos,
-                    start,
-                    end,
-                    ensure_contiguous_files,
-                )? {
-                    // Skip unknown data types
-                    log::warn!("Unknown data type for consolidation: {data_cls_name}");
-                }
+            if !self.dispatch_consolidate_data_by_period(
+                &data_cls_name,
+                identifier.as_deref(),
+                period_nanos,
+                start,
+                end,
+                ensure_contiguous_files,
+            )? {
+                // Skip unknown data types
+                log::warn!("Unknown data type for consolidation: {data_cls_name}");
             }
         }
 
@@ -505,8 +498,9 @@ impl ParquetDataCatalog {
         &self,
         path: &str,
     ) -> anyhow::Result<(Option<String>, Option<String>)> {
-        // Use cross-platform path parsing
-        let path_components = extract_path_components(path);
+        // Parse from the catalog root so a base path containing a `data` segment is skipped
+        let path = self.path_without_local_base(&normalize_path_separators(path));
+        let path_components = extract_path_components(&path);
 
         // Find the "data" directory in the path
         if let Some(data_index) = path_components.iter().position(|part| part == "data")
@@ -518,17 +512,14 @@ impl ParquetDataCatalog {
                 let Some(type_name) = path_components.get(data_index + 2) else {
                     return Ok((None, None));
                 };
+
                 let identifier = (path_components.len() > data_index + 3)
                     .then(|| path_components[data_index + 3..].join("/"));
                 return Ok((Some(format!("custom/{type_name}")), identifier));
             }
 
             let data_cls = second.clone();
-            let identifier = if data_index + 2 < path_components.len() {
-                Some(path_components[data_index + 2].clone())
-            } else {
-                None
-            };
+            let identifier = path_components.get(data_index + 2).cloned();
 
             return Ok((Some(data_cls), identifier));
         }
@@ -555,7 +546,7 @@ impl ParquetDataCatalog {
     /// - `end`: Optional end timestamp for consolidation range. If None, uses latest available data.
     ///   If specified and intersects existing files, those files will be split to preserve
     ///   data outside the consolidation range.
-    /// - `ensure_contiguous_files`: If true, uses period boundaries for file naming.
+    /// - `ensure_contiguous_files`: If true, uses period boundaries clipped to `start` and `end` for file naming.
     ///   If false, uses actual data timestamps for file naming.
     ///
     /// # Returns
@@ -565,6 +556,8 @@ impl ParquetDataCatalog {
     /// # Errors
     ///
     /// Returns an error if:
+    /// - `period_nanos` is zero and the directory holds data to consolidate.
+    /// - `start` exceeds `end` and the directory holds data to consolidate.
     /// - `data_type` is a record family or an instrument selector, which have no
     ///   period-typed rewrite; use [`Self::consolidate_data`] for those.
     /// - The directory path cannot be constructed.
@@ -576,10 +569,11 @@ impl ParquetDataCatalog {
     /// - Uses two-phase approach: first determines all queries, then executes them.
     /// - Groups intervals into contiguous groups to preserve holes between groups.
     /// - Allows consolidation across multiple files within each contiguous group.
-    /// - Skips queries if target files already exist for efficiency.
-    /// - Original files are removed immediately after querying each period.
+    /// - Validates existing targets before keeping them and removing their source fragments.
+    /// - Removes source files only after processing their entire time range.
     /// - When `ensure_contiguous_files=false`, file timestamps match actual data range.
-    /// - When `ensure_contiguous_files=true`, file timestamps use period boundaries.
+    /// - When `ensure_contiguous_files=true`, file timestamps use period boundaries clipped to `start` and `end`.
+    /// - Existing-target checks compare row values without counting identical copies.
     /// - Uses modulo arithmetic for efficient period boundary calculation.
     /// - Preserves holes in data by preventing queries from spanning across gaps.
     /// - Automatically splits files at start/end boundaries to preserve all data.
@@ -848,90 +842,60 @@ impl ParquetDataCatalog {
         let mut existing_files = self.list_parquet_files(&directory)?;
         existing_files.sort();
 
-        // Capture the overall window's left bound before the loop consumes queries_to_execute,
-        // a source file is only deleted when its interval is fully consumed by the consolidation.
-        let overall_query_start = queries_to_execute[0].query_start;
+        // Simulate source removals and target creation before mutating storage, so validation
+        // observes the same files as execution while holding only one period's rows.
+        let type_name = to_snake_case(std::any::type_name::<T>());
 
-        // Phase 2: Execute queries, write, and delete
-        let mut file_start_ns: Option<u64> = None; // Track contiguity across periods
+        for write_files in [false, true] {
+            let mut files = ConsolidationFiles::new(&existing_files, start, end);
+            let mut file_start_ns: Option<u64> = None;
 
-        for query_info in queries_to_execute {
-            // Query data for this period using query_typed_data
-            let instrument_ids = identifier.map(|id| vec![id.to_string()]);
+            for query_info in &queries_to_execute {
+                let period_data = self.query_period::<T>(identifier, query_info, &files.sources)?;
 
-            // Use optimize_file_loading=false to match Python behavior:
-            // During consolidation, we want to read only the specific files being consolidated,
-            // not the entire directory. This ensures precise file control during consolidation.
-            let period_data = self.query_typed_data::<T>(
-                instrument_ids,
-                Some(UnixNanos::from(query_info.query_start)),
-                Some(UnixNanos::from(query_info.query_end)),
-                None,
-                Some(existing_files.clone()),
-                false, // optimize_file_loading=false for precise file control during consolidation
-            )?;
+                let (Some(first), Some(last)) = (period_data.first(), period_data.last()) else {
+                    if query_info.use_period_boundaries {
+                        file_start_ns.get_or_insert(query_info.query_start);
+                    }
 
-            if period_data.is_empty() {
-                // Skip if no data found, but maintain contiguity by using query start
-                if file_start_ns.is_none() {
-                    file_start_ns = Some(query_info.query_start);
+                    files.complete(self, query_info, write_files)?;
+                    continue;
+                };
+
+                let (start_ts, end_ts) =
+                    query_info.file_range(&mut file_start_ns, first.ts_init(), last.ts_init());
+
+                Self::check_ascending_timestamps(&period_data, &type_name)?;
+                Self::check_chunk_identity(&period_data, &type_name)?;
+                let batches = self.data_to_record_batches(&period_data)?;
+                let metadata = T::chunk_metadata(&period_data);
+                let target_identifier = catalog_identifier_from_metadata(&metadata);
+                let target_directory =
+                    self.make_path(path_prefix.as_ref(), target_identifier.as_deref())?;
+                let target_filename = make_object_store_path(
+                    &target_directory,
+                    [timestamps_to_filename(start_ts, end_ts)],
+                );
+                let target = self.to_object_path(&target_filename)?.to_string();
+
+                if files.prepare_target(self, &target, &batches)? && write_files {
+                    self.write_parquet_file_checked(
+                        &target_directory,
+                        start_ts,
+                        end_ts,
+                        &batches,
+                        true,
+                        "File",
+                        Some(&format!("{type_name} data")),
+                        None,
+                    )?;
                 }
-                continue;
-            }
 
-            // Determine final file timestamps
-            let (final_start_ns, final_end_ns) = if query_info.use_period_boundaries {
-                // Use period boundaries for file naming, maintaining contiguity
-                if file_start_ns.is_none() {
-                    file_start_ns = Some(query_info.query_start);
-                }
-                let start = file_start_ns.unwrap();
-                (start, query_info.query_end)
-            } else {
-                // Use actual data timestamps for file naming
-                let first_ts = period_data.first().unwrap().ts_init().as_u64();
-                let last_ts = period_data.last().unwrap().ts_init().as_u64();
-                (first_ts, last_ts)
-            };
+                files.complete(self, query_info, write_files)?;
 
-            // Check again if target file exists (in case it was created during this process)
-            let target_filename = format!(
-                "{}/{}",
-                directory,
-                timestamps_to_filename(
-                    UnixNanos::from(final_start_ns),
-                    UnixNanos::from(final_end_ns)
-                )
-            );
-
-            if self.file_exists(&target_filename)? {
-                // This period is already consolidated; do not let a later cleanup delete it.
-                let target_object_path = self.to_object_path(&target_filename)?.to_string();
-                existing_files.retain(|f| f != &target_object_path);
-                // Reset so the next period starts a new segment after the existing file
+                // Reset so next period starts a new contiguous segment
                 file_start_ns = None;
-                continue;
             }
-
-            // Write consolidated data for this period using write_to_parquet
-            // Use skip_disjoint_check since we're managing file removal carefully
-            let start_ts = UnixNanos::from(final_start_ns);
-            let end_ts = UnixNanos::from(final_end_ns);
-            self.write_to_parquet(&period_data, Some(start_ts), Some(end_ts), Some(true))?;
-
-            // Delete files fully consumed by this period; keep straddlers so no data is lost
-            for file in existing_files.clone() {
-                if let Some(interval) = parse_filename_timestamps(&file)
-                    && interval.1 <= query_info.query_end
-                    && interval.0 >= overall_query_start
-                {
-                    existing_files.retain(|f| f != &file);
-                    self.delete_file(&file)?;
-                }
-            }
-
-            // Reset so next period starts a new contiguous segment
-            file_start_ns = None;
         }
 
         Ok(())
@@ -970,6 +934,7 @@ impl ParquetDataCatalog {
         let data_type = NautilusDataType::Custom {
             type_name: type_name.to_string(),
         };
+
         let path_prefix = parquet_data_path_prefix(&data_type);
         let intervals = self.get_intervals(&CatalogDataType::Data(data_type), identifier)?;
 
@@ -997,130 +962,155 @@ impl ParquetDataCatalog {
         let mut existing_files = self.list_parquet_files(&directory)?;
         existing_files.sort();
 
-        // Capture the overall window's left bound before the loop consumes queries_to_execute,
-        // a source file is only deleted when its interval is fully consumed by the consolidation.
-        let overall_query_start = queries_to_execute[0].query_start;
+        // Simulate source removals and target creation before mutating storage, so validation
+        // observes the same files as execution while holding only one period's rows.
+        for write_files in [false, true] {
+            let mut files = ConsolidationFiles::new(&existing_files, start, end);
+            let mut file_start_ns: Option<u64> = None;
 
-        // Phase 2: Execute queries, write, and delete
-        let mut file_start_ns: Option<u64> = None; // Track contiguity across periods
+            for query_info in &queries_to_execute {
+                let custom_items =
+                    self.query_custom_period(type_name, identifier, query_info, &files.sources)?;
 
-        for query_info in queries_to_execute {
-            // Query custom data for this period using query_custom_data_dynamic
-            let instrument_ids = identifier.map(|id| vec![id.to_string()]);
+                let (Some(first), Some(last)) = (custom_items.first(), custom_items.last()) else {
+                    if query_info.use_period_boundaries {
+                        file_start_ns.get_or_insert(query_info.query_start);
+                    }
 
-            let period_data = self.query_custom_data_dynamic(
-                type_name,
-                instrument_ids.as_deref(),
-                Some(UnixNanos::from(query_info.query_start)),
-                Some(UnixNanos::from(query_info.query_end)),
-                None,
-                Some(existing_files.clone()),
-                false, // optimize_file_loading=false for precise file control during consolidation
-            )?;
+                    files.complete(self, query_info, write_files)?;
+                    continue;
+                };
 
-            if period_data.is_empty() {
-                // Skip if no data found, but maintain contiguity by using query start
-                if file_start_ns.is_none() {
-                    file_start_ns = Some(query_info.query_start);
-                }
-                continue;
-            }
+                let (start_ts, end_ts) = query_info.file_range(
+                    &mut file_start_ns,
+                    first.data.ts_init(),
+                    last.data.ts_init(),
+                );
 
-            // Determine final file timestamps
-            let (final_start_ns, final_end_ns) = if query_info.use_period_boundaries {
-                // Use period boundaries for file naming, maintaining contiguity
-                if file_start_ns.is_none() {
-                    file_start_ns = Some(query_info.query_start);
-                }
-                let start = file_start_ns.unwrap();
-                (start, query_info.query_end)
-            } else {
-                // Use actual data timestamps for file naming
-                let first_ts = period_data.first().unwrap().ts_init().as_u64();
-                let last_ts = period_data.last().unwrap().ts_init().as_u64();
-                (first_ts, last_ts)
-            };
-
-            // Check again if target file exists (in case it was created during this process)
-            let target_filename = format!(
-                "{}/{}",
-                directory,
-                timestamps_to_filename(
-                    UnixNanos::from(final_start_ns),
-                    UnixNanos::from(final_end_ns)
-                )
-            );
-
-            if self.file_exists(&target_filename)? {
-                // This period is already consolidated; do not let a later cleanup delete it.
-                let target_object_path = self.to_object_path(&target_filename)?.to_string();
-                existing_files.retain(|f| f != &target_object_path);
-                // Reset so the next period starts a new segment after the existing file
-                file_start_ns = None;
-                continue;
-            }
-
-            let custom_items: Vec<CustomData> = period_data
-                .into_iter()
-                .filter_map(|data| match data {
-                    Data::Custom(c) => Some(c),
-                    _ => None,
-                })
-                .collect();
-
-            // Write consolidated data for each type
-            let start_ts = UnixNanos::from(final_start_ns);
-            let end_ts = UnixNanos::from(final_end_ns);
-
-            for items in group_custom_data_by_type(custom_items.iter()) {
-                self.write_custom_data_refs_batch(
-                    &items,
-                    Some(start_ts),
-                    Some(end_ts),
-                    Some(true),
+                self.consolidate_custom_period(
+                    &mut files,
+                    &custom_items,
+                    start_ts,
+                    end_ts,
+                    write_files,
                 )?;
-            }
+                files.complete(self, query_info, write_files)?;
 
-            // Delete files fully consumed by this period; keep straddlers so no data is lost
-            for file in existing_files.clone() {
-                if let Some(interval) = parse_filename_timestamps(&file)
-                    && interval.1 <= query_info.query_end
-                    && interval.0 >= overall_query_start
-                {
-                    existing_files.retain(|f| f != &file);
-                    self.delete_file(&file)?;
-                }
+                // Reset so next period starts a new contiguous segment
+                file_start_ns = None;
             }
-
-            // Reset so next period starts a new contiguous segment
-            file_start_ns = None;
         }
 
         Ok(())
     }
 
+    fn consolidate_custom_period(
+        &self,
+        files: &mut ConsolidationFiles,
+        rows: &[CustomData],
+        start: UnixNanos,
+        end: UnixNanos,
+        write_files: bool,
+    ) -> anyhow::Result<()> {
+        let writes = self.prepare_custom_data_groups(rows, Some(start), Some(end), Some(true))?;
+
+        for write in &writes {
+            let target = self
+                .to_object_path(&write.path().to_string_lossy())?
+                .to_string();
+
+            if files.prepare_target(self, &target, &write.batches)? && write_files {
+                self.write_custom_data_prepared(write, Some(true))?;
+            }
+        }
+
+        Ok(())
+    }
+
+    // Queries the data of one consolidation period from `files` only.
+    fn query_period<T>(
+        &mut self,
+        identifier: Option<&str>,
+        query_info: &ConsolidationQuery,
+        files: &[String],
+    ) -> anyhow::Result<Vec<T>>
+    where
+        T: DecodeTypedFromRecordBatch + HasCatalogDataType + HasTsInit,
+    {
+        let instrument_ids = identifier.map(|id| vec![id.to_string()]);
+
+        // Use optimize_file_loading=false to match Python behavior:
+        // During consolidation, we want to read only the specific files being consolidated,
+        // not the entire directory. This ensures precise file control during consolidation.
+        self.query::<T>(
+            instrument_ids,
+            Some(UnixNanos::from(query_info.query_start)),
+            Some(UnixNanos::from(query_info.query_end)),
+            None,
+            Some(files.to_vec()),
+            false, // optimize_file_loading=false for precise file control during consolidation
+        )
+    }
+
+    // Queries the custom data of one consolidation period from `files` only.
+    fn query_custom_period(
+        &mut self,
+        type_name: &str,
+        identifier: Option<&str>,
+        query_info: &ConsolidationQuery,
+        files: &[String],
+    ) -> anyhow::Result<Vec<CustomData>> {
+        let instrument_ids = identifier.map(|id| vec![id.to_string()]);
+        let period_data = self.query_custom_data_dynamic(
+            type_name,
+            instrument_ids.as_deref(),
+            Some(UnixNanos::from(query_info.query_start)),
+            Some(UnixNanos::from(query_info.query_end)),
+            None,
+            Some(files.to_vec()),
+            false, // optimize_file_loading=false for precise file control during consolidation
+        )?;
+
+        Ok(period_data
+            .into_iter()
+            .filter_map(|data| match data {
+                Data::Custom(c) => Some(c),
+                _ => None,
+            })
+            .collect())
+    }
+
     /// Prepares all queries for consolidation by filtering, grouping, and handling splits.
     ///
-    /// This auxiliary function handles all the preparation logic for consolidation:
-    /// 1. Filters intervals by time range.
-    /// 2. Groups intervals into contiguous groups.
-    /// 3. Identifies and creates split operations for data preservation.
-    /// 4. Generates period-based consolidation queries.
-    /// 5. Checks for existing target files.
+    /// Includes every period and the segments outside the requested bounds. Existing targets
+    /// remain in the plan so execution can verify their rows before removing source files.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - `period_nanos` is zero.
+    /// - `start` exceeds `end`.
+    /// - The intervals are not contiguous when `ensure_contiguous_files` is true.
     #[expect(
         clippy::too_many_arguments,
         reason = "Consolidation keeps its window and policy arguments explicit"
     )]
     pub fn prepare_consolidation_queries(
         &self,
-        type_name: &str,
-        identifier: Option<&str>,
+        _type_name: &str,
+        _identifier: Option<&str>,
         intervals: &[(u64, u64)],
         period_nanos: u64,
         start: Option<UnixNanos>,
         end: Option<UnixNanos>,
         ensure_contiguous_files: bool,
     ) -> anyhow::Result<Vec<ConsolidationQuery>> {
+        anyhow::ensure!(period_nanos > 0, "period_nanos must be positive");
+
+        if let (Some(start), Some(end)) = (start, end) {
+            anyhow::ensure!(start <= end, "consolidation start must not exceed end");
+        }
+
         // Filter intervals by time range if specified
         let used_start = start.map(|s| s.as_u64());
         let used_end = end.map(|e| e.as_u64());
@@ -1129,9 +1119,7 @@ impl ParquetDataCatalog {
 
         for &(interval_start, interval_end) in intervals {
             // Check if interval overlaps with the specified range
-            if used_start.is_none_or(|start| start <= interval_end)
-                && used_end.is_none_or(|end| interval_start <= end)
-            {
+            if interval_intersects_range((interval_start, interval_end), start, end) {
                 filtered_intervals.push((interval_start, interval_end));
             }
         }
@@ -1169,12 +1157,16 @@ impl ParquetDataCatalog {
             }
 
             if let Some(end_ts) = used_end {
-                let last_interval = filtered_intervals[filtered_intervals.len() - 1];
-                if last_interval.0 <= end_ts && end_ts < last_interval.1 {
+                let last_end = filtered_intervals
+                    .iter()
+                    .map(|interval| interval.1)
+                    .max()
+                    .unwrap_or(end_ts);
+                if end_ts < last_end {
                     // Split after end: preserve data from end+1 to interval_end
                     queries_to_execute.push(ConsolidationQuery {
                         query_start: end_ts + 1,
-                        query_end: last_interval.1,
+                        query_end: last_end,
                         use_period_boundaries: false,
                     });
                 }
@@ -1184,7 +1176,9 @@ impl ParquetDataCatalog {
         // Generate period-based consolidation queries for each contiguous group
         for group in contiguous_groups {
             let group_start = group[0].0;
-            let group_end = group[group.len() - 1].1;
+            let group_end = group
+                .iter()
+                .fold(group[0].1, |end, interval| end.max(interval.1));
 
             // Apply start/end filtering to the group
             let effective_start = used_start.map_or(group_start, |s| s.max(group_start));
@@ -1197,56 +1191,26 @@ impl ParquetDataCatalog {
             // Generate period-based queries within this contiguous group
             let mut current_start_ns = (effective_start / period_nanos) * period_nanos;
 
-            // Add safety check to prevent infinite loops (match Python logic)
-            let max_iterations = 10000;
-            let mut iteration_count = 0;
+            loop {
+                let current_end_ns = current_start_ns
+                    .saturating_add(period_nanos - 1)
+                    .min(effective_end);
 
-            while current_start_ns <= effective_end {
-                iteration_count += 1;
-                if iteration_count > max_iterations {
-                    // Safety break to prevent infinite loops
-                    break;
-                }
-                let current_end_ns = (current_start_ns + period_nanos - 1).min(effective_end);
-
-                // Check if target file already exists (only when ensure_contiguous_files is true)
-                if ensure_contiguous_files {
-                    let directory = self.make_path(type_name, identifier)?;
-                    let target_filename = format!(
-                        "{}/{}",
-                        directory,
-                        timestamps_to_filename(
-                            UnixNanos::from(current_start_ns),
-                            UnixNanos::from(current_end_ns)
-                        )
-                    );
-
-                    if self.file_exists(&target_filename)? {
-                        // Skip if target file already exists
-                        current_start_ns += period_nanos;
-                        continue;
-                    }
-                }
-
-                // Add query to execution list
                 queries_to_execute.push(ConsolidationQuery {
-                    query_start: current_start_ns,
+                    query_start: current_start_ns.max(used_start.unwrap_or(current_start_ns)),
                     query_end: current_end_ns,
                     use_period_boundaries: ensure_contiguous_files,
                 });
 
-                // Move to next period
-                current_start_ns += period_nanos;
-
-                if current_start_ns > effective_end {
-                    break;
+                match current_start_ns.checked_add(period_nanos) {
+                    Some(next_start_ns) if next_start_ns <= effective_end => {
+                        current_start_ns = next_start_ns;
+                    }
+                    _ => break,
                 }
             }
         }
 
-        // Sort queries by start date to enable efficient file removal
-        // Files can be removed when interval[1] <= query_info["query_end"]
-        // and processing in chronological order ensures optimal cleanup
         queries_to_execute.sort_by_key(|q| q.query_start);
 
         Ok(queries_to_execute)
@@ -1292,16 +1256,15 @@ impl ParquetDataCatalog {
         // catalogs (gap ~bar interval) without inferring spacing from the data.
         let mut contiguous_groups = Vec::new();
         let mut current_group = vec![intervals[0]];
-
-        for i in 1..intervals.len() {
-            let prev_end = intervals[i - 1].1;
-            let curr_start = intervals[i].0;
-
-            if curr_start.saturating_sub(prev_end) > period_nanos {
+        let mut current_end = intervals[0].1;
+        for &(curr_start, curr_end) in intervals.iter().skip(1) {
+            if curr_start.saturating_sub(current_end) > period_nanos {
                 contiguous_groups.push(current_group);
-                current_group = vec![intervals[i]];
+                current_group = vec![(curr_start, curr_end)];
+                current_end = curr_end;
             } else {
-                current_group.push(intervals[i]);
+                current_group.push((curr_start, curr_end));
+                current_end = current_end.max(curr_end);
             }
         }
 
@@ -1309,6 +1272,104 @@ impl ParquetDataCatalog {
 
         contiguous_groups
     }
+}
+
+impl ConsolidationQuery {
+    fn file_range(
+        &self,
+        start_ns: &mut Option<u64>,
+        first: UnixNanos,
+        last: UnixNanos,
+    ) -> (UnixNanos, UnixNanos) {
+        if self.use_period_boundaries {
+            let start = *start_ns.get_or_insert(self.query_start);
+            (UnixNanos::from(start), UnixNanos::from(self.query_end))
+        } else {
+            (first, last)
+        }
+    }
+}
+
+struct ConsolidationFiles {
+    sources: Vec<String>,
+    paths: AHashSet<String>,
+    completed: Vec<ClosedInterval>,
+}
+
+impl ConsolidationFiles {
+    fn new(files: &[String], start: Option<UnixNanos>, end: Option<UnixNanos>) -> Self {
+        Self {
+            sources: files
+                .iter()
+                .filter(|file| {
+                    parse_filename_timestamps(file)
+                        .is_some_and(|interval| interval_intersects_range(interval, start, end))
+                })
+                .cloned()
+                .collect(),
+            paths: files.iter().cloned().collect(),
+            completed: Vec::new(),
+        }
+    }
+
+    fn prepare_target(
+        &mut self,
+        catalog: &ParquetDataCatalog,
+        target: &str,
+        batches: &[RecordBatch],
+    ) -> anyhow::Result<bool> {
+        if !self.paths.contains(target) {
+            self.paths.insert(target.to_string());
+            return Ok(true);
+        }
+
+        anyhow::ensure!(
+            catalog.target_holds_rows(target, batches)?,
+            "Cannot consolidate into existing target {target}: it does not hold every source row",
+        );
+        self.sources.retain(|file| file != target);
+        Ok(false)
+    }
+
+    fn complete(
+        &mut self,
+        catalog: &ParquetDataCatalog,
+        query: &ConsolidationQuery,
+        write_files: bool,
+    ) -> anyhow::Result<()> {
+        self.completed.push(ClosedInterval {
+            start: query.query_start,
+            end: query.query_end,
+        });
+
+        self.completed = merge_closed_intervals(&self.completed);
+
+        for file in self.sources.clone() {
+            if let Some((start, end)) = parse_filename_timestamps(&file)
+                && self
+                    .completed
+                    .iter()
+                    .any(|covered| covered.start <= start && end <= covered.end)
+            {
+                self.sources.retain(|source| source != &file);
+                self.paths.remove(&file);
+                if write_files {
+                    catalog.delete_file(&file)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn interval_intersects_range(
+    (interval_start, interval_end): (u64, u64),
+    start: Option<UnixNanos>,
+    end: Option<UnixNanos>,
+) -> bool {
+    start.is_none_or(|start| start.as_u64() <= interval_end)
+        && end.is_none_or(|end| interval_start <= end.as_u64())
 }
 
 fn can_rewrite_consolidation_by_period(type_name: &str) -> bool {

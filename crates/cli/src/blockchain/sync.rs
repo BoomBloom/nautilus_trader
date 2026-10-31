@@ -105,7 +105,7 @@ pub(crate) async fn run_sync_dex(
         .postgres_cache_database_config(postgres_connect_options)
         .build();
     let cancellation_token = tokio_util::sync::CancellationToken::new();
-    let mut data_client = BlockchainDataClientCore::new(config, None, None, cancellation_token);
+    let mut data_client = BlockchainDataClientCore::new(config, None, None, cancellation_token)?;
     data_client.initialize_cache_database().await;
 
     data_client.cache.initialize_chain().await;
@@ -141,13 +141,13 @@ pub(crate) async fn run_sync_blocks(
         database.database,
     );
     let config = BlockchainDataClientConfig::builder()
-        .chain(chain.clone())
+        .chain(Arc::clone(&chain))
         .http_rpc_url(String::new().into()) // we dont need to http rpc url for block syncing
         .use_hypersync_for_live_data(true)
         .postgres_cache_database_config(postgres_connect_options)
         .build();
     let cancellation_token = tokio_util::sync::CancellationToken::new();
-    let mut data_client = BlockchainDataClientCore::new(config, None, None, cancellation_token);
+    let mut data_client = BlockchainDataClientCore::new(config, None, None, cancellation_token)?;
     data_client.initialize_cache_database().await;
 
     data_client.cache.initialize_chain().await;

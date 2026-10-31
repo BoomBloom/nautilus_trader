@@ -19,7 +19,7 @@ use ahash::AHashMap;
 use nautilus_common::{cache::Cache, clock::Clock, messages::execution::SubmitOrder};
 use nautilus_core::UUID4;
 use nautilus_model::{
-    enums::ContingencyType,
+    enums::{ContingencyType, OrderStatus},
     events::{
         OrderCanceled, OrderEventAny, OrderExpired, OrderFilled, OrderRejected, OrderUpdated,
     },
@@ -194,6 +194,21 @@ impl OrderManager {
     /// like `OrderSubmitted`, `OrderAccepted`, etc. are no-ops for the order manager.
     pub fn handle_event(&mut self, event: &OrderEventAny) -> Vec<OrderManagerAction> {
         match event {
+            OrderEventAny::Denied(event) => {
+                self.submit_order_commands.remove(&event.client_order_id);
+                self.oto_target_quantities.remove(&event.client_order_id);
+                let order = self.cache.borrow().order_owned(&event.client_order_id);
+
+                match order {
+                    Some(order)
+                        if order.previous_status() == Some(OrderStatus::Released)
+                            && order.contingency_type().is_some() =>
+                    {
+                        self.handle_contingencies(&order)
+                    }
+                    _ => Vec::new(),
+                }
+            }
             OrderEventAny::Rejected(event) => self.handle_order_rejected(*event),
             OrderEventAny::Canceled(event) => self.handle_order_canceled(*event),
             OrderEventAny::Expired(event) => self.handle_order_expired(*event),
@@ -585,6 +600,8 @@ impl OrderManager {
             return actions;
         }
 
+        let leaves_qty = self.ouo_leaves_qty(order);
+
         let oto_filled_qty = if contingency_type == Some(ContingencyType::Oto) {
             Some(match order.exec_spawn_id() {
                 Some(exec_spawn_id) => {
@@ -656,10 +673,15 @@ impl OrderManager {
 
                     actions.extend(self.sync_oto_quantity(&contingent_order, child_quantity));
                 }
+                // Siblings already tracking the same remaining quantity need no action, which also
+                // ends the reciprocal update a resize triggers.
+                Some(ContingencyType::Ouo) if leaves_qty == contingent_order.leaves_qty() => {}
                 Some(ContingencyType::Ouo) if contingent_order.filled_qty() >= quantity => {
                     actions.extend(self.cancel_order(&contingent_order));
                 }
-                Some(ContingencyType::Ouo) if quantity != contingent_order.quantity() => {
+                Some(ContingencyType::Ouo) => {
+                    // The modify sets the sibling's total quantity, so add back its own fills
+                    let quantity = contingent_order.filled_qty() + leaves_qty;
                     actions.extend(self.modify_order_quantity(&contingent_order, quantity));
                 }
                 _ => {}
@@ -667,6 +689,18 @@ impl OrderManager {
         }
 
         actions
+    }
+
+    // OUO siblings track the remaining quantity, as when a leg fills
+    fn ouo_leaves_qty(&self, order: &OrderAny) -> Quantity {
+        match order.exec_spawn_id() {
+            Some(exec_spawn_id) => self
+                .cache
+                .borrow()
+                .exec_spawn_total_leaves_qty(&exec_spawn_id, true)
+                .unwrap_or_else(|| Quantity::zero(order.quantity().precision)),
+            None => order.leaves_qty(),
+        }
     }
 
     fn oto_parent_position_id(&self, order: &OrderAny) -> Option<PositionId> {
@@ -736,31 +770,33 @@ impl OrderManager {
                 return None;
             };
 
-            let position_cap = child_filled_qty.saturating_add(position.quantity);
+            let precision = child_filled_qty.precision.max(position.quantity.precision);
+
+            let (Some(child_filled_qty), Some(position_qty)) = (
+                child_filled_qty.checked_rescale(precision),
+                position.quantity.checked_rescale(precision),
+            ) else {
+                log::error!("Cannot size OTO orders: position quantity scale alignment overflow");
+                return None;
+            };
+
+            let position_cap = child_filled_qty.saturating_add(position_qty);
             filled_qty.min(position_cap)
         };
 
-        let target_raw = capped.raw() - capped.raw() % increment.raw();
-
-        let target_raw = if child_instrument
-            .min_quantity()
-            .is_some_and(|min_quantity| target_raw < min_quantity.raw())
-        {
-            0
-        } else {
-            target_raw
+        let Some(target) = capped.checked_floor_to_increment(increment) else {
+            log::error!("Cannot size OTO orders: quantity scale alignment overflow");
+            return None;
         };
 
-        match Quantity::from_raw_checked(target_raw, child_instrument.size_precision()) {
-            Ok(quantity) => Some(quantity),
-            Err(e) => {
-                log::error!(
-                    "Cannot size OTO orders for {} from raw quantity {target_raw}: {e}",
-                    child_order.instrument_id()
-                );
-                None
-            }
+        if child_instrument
+            .min_quantity()
+            .is_some_and(|min_quantity| target < min_quantity)
+        {
+            return Some(Quantity::zero(child_instrument.size_precision()));
         }
+
+        Some(target)
     }
 
     fn sync_oto_quantity(
@@ -810,9 +846,9 @@ mod tests {
     use nautilus_model::{
         enums::{ContingencyType, OmsType, OrderSide, OrderStatus, OrderType, TriggerType},
         events::order::spec::{
-            OrderAcceptedSpec, OrderCanceledSpec, OrderEmulatedSpec, OrderExpiredSpec,
-            OrderModifyRejectedSpec, OrderPendingUpdateSpec, OrderRejectedSpec, OrderSubmittedSpec,
-            OrderUpdatedSpec,
+            OrderAcceptedSpec, OrderCanceledSpec, OrderDeniedSpec, OrderEmulatedSpec,
+            OrderExpiredSpec, OrderModifyRejectedSpec, OrderPendingUpdateSpec, OrderRejectedSpec,
+            OrderReleasedSpec, OrderSubmittedSpec, OrderUpdatedSpec,
         },
         identifiers::{
             AccountId, ClientOrderId, ExecAlgorithmId, InstrumentId, StrategyId, TradeId, TraderId,
@@ -873,6 +909,78 @@ mod tests {
             OrderEventAny::Updated(_) => panic!("Should not match"),
             OrderEventAny::Filled(_) => panic!("Should not match"),
             _ => {}
+        }
+    }
+
+    #[rstest]
+    #[case(None)]
+    #[case(Some(ContingencyType::Oto))]
+    #[case(Some(ContingencyType::Oco))]
+    #[case(Some(ContingencyType::Ouo))]
+    fn test_denied_release_clears_pending_state_and_manages_contingencies(
+        #[case] contingency: Option<ContingencyType>,
+    ) {
+        let (clock, cache) = create_test_components();
+        let mut manager = OrderManager::new(clock, cache.clone(), true);
+        let mut builder = OrderTestBuilder::new(OrderType::Market);
+        builder
+            .instrument_id(audusd_sim().id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(100_000))
+            .linked_order_ids(vec![ClientOrderId::from("O-SIBLING")]);
+
+        if let Some(contingency) = contingency {
+            builder.contingency_type(contingency);
+        }
+
+        let order = builder.build();
+        let sibling = OrderTestBuilder::new(OrderType::StopMarket)
+            .instrument_id(order.instrument_id())
+            .client_order_id(ClientOrderId::from("O-SIBLING"))
+            .side(OrderSide::Sell)
+            .trigger_price(Price::from("0.99900"))
+            .quantity(Quantity::from(100_000))
+            .emulation_trigger(TriggerType::BidAsk)
+            .build();
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, None, false)
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_order(sibling.clone(), None, None, false)
+            .unwrap();
+        cache
+            .borrow_mut()
+            .update_order(&OrderEventAny::Released(
+                OrderReleasedSpec::builder()
+                    .client_order_id(order.client_order_id())
+                    .build(),
+            ))
+            .unwrap();
+        let denied = OrderEventAny::Denied(
+            OrderDeniedSpec::builder()
+                .client_order_id(order.client_order_id())
+                .reason("TRADING_HALTED".into())
+                .build(),
+        );
+        cache.borrow_mut().update_order(&denied).unwrap();
+        manager.cache_submit_order_command(make_submit_command(&order));
+        manager
+            .oto_target_quantities
+            .insert(order.client_order_id(), Quantity::from(40_000));
+
+        let actions = manager.handle_event(&denied);
+
+        assert!(manager.submit_order_commands.is_empty());
+        assert!(manager.oto_target_quantities.is_empty());
+
+        if contingency.is_some() {
+            assert!(
+                matches!(actions.as_slice(), [OrderManagerAction::CancelLocal(order)] if order == &sibling)
+            );
+        } else {
+            assert!(actions.is_empty());
         }
     }
 
@@ -1847,6 +1955,281 @@ mod tests {
             actions.as_slice(),
             [OrderManagerAction::CancelLocal(order)]
                 if order.client_order_id() == child.client_order_id()
+        ));
+    }
+
+    #[rstest]
+    #[case::unchanged_leaves(Quantity::from(100_000), None)]
+    #[case::reduced_leaves(Quantity::from(80_000), Some(Quantity::from(55_000)))]
+    fn test_handle_contingencies_update_syncs_ouo_sibling_to_leaves_after_partial_fill(
+        #[case] parent_quantity: Quantity,
+        #[case] expected_sibling_quantity: Option<Quantity>,
+    ) {
+        let (clock, cache) = create_test_components();
+        let mut manager = OrderManager::new(clock, cache.clone(), false);
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+        let parent_id = ClientOrderId::from("O-PARENT");
+        let sibling_id = ClientOrderId::from("O-SIBLING");
+        let parent = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .client_order_id(parent_id)
+            .side(OrderSide::Buy)
+            .price(Price::from("1.00000"))
+            .quantity(parent_quantity)
+            .contingency_type(ContingencyType::Ouo)
+            .linked_order_ids(vec![parent_id, sibling_id])
+            .submit(true)
+            .build();
+
+        // The sibling already tracks the remaining 75,000 after the earlier partial fill
+        let sibling = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .client_order_id(sibling_id)
+            .side(OrderSide::Sell)
+            .price(Price::from("1.00100"))
+            .quantity(Quantity::from(75_000))
+            .submit(true)
+            .build();
+        cache
+            .borrow_mut()
+            .add_order(parent.clone(), None, None, false)
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_order(sibling, None, None, false)
+            .unwrap();
+        apply_fill(
+            &cache,
+            &parent,
+            &instrument,
+            "T-OUO",
+            Quantity::from(25_000),
+        );
+        let parent = cache.borrow().order_owned(&parent_id).unwrap();
+
+        let actions = manager.handle_contingencies_update(&parent);
+
+        let sibling_quantity = match actions.as_slice() {
+            [] => None,
+            [OrderManagerAction::ModifyLocalQuantity { order, quantity }]
+                if order.client_order_id() == sibling_id =>
+            {
+                Some(*quantity)
+            }
+            other => panic!("Unexpected actions {other:?}"),
+        };
+
+        assert_eq!(sibling_quantity, expected_sibling_quantity);
+    }
+
+    #[rstest]
+    #[case::sibling_filled_below_leg_leaves(60_000, 0, 25_000, 85_000)]
+    #[case::sibling_filled_past_leg_leaves(60_000, 40_000, 25_000, 45_000)]
+    fn test_handle_contingencies_update_keeps_ouo_sibling_fills(
+        #[case] leg_quantity: u64,
+        #[case] leg_filled: u64,
+        #[case] sibling_filled: u64,
+        #[case] expected_sibling_quantity: u64,
+    ) {
+        let (clock, cache) = create_test_components();
+        let mut manager = OrderManager::new(clock, cache.clone(), false);
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+        let leg_id = ClientOrderId::from("O-LEG");
+        let sibling_id = ClientOrderId::from("O-SIBLING");
+        let leg = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .client_order_id(leg_id)
+            .side(OrderSide::Sell)
+            .price(Price::from("1.00100"))
+            .quantity(Quantity::from(leg_quantity))
+            .contingency_type(ContingencyType::Ouo)
+            .linked_order_ids(vec![sibling_id])
+            .submit(true)
+            .build();
+        let sibling = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .client_order_id(sibling_id)
+            .side(OrderSide::Sell)
+            .price(Price::from("1.00200"))
+            .quantity(Quantity::from(100_000))
+            .submit(true)
+            .build();
+        cache
+            .borrow_mut()
+            .add_order(leg.clone(), None, None, false)
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_order(sibling.clone(), None, None, false)
+            .unwrap();
+        apply_accepted(&cache, &leg, "V-LEG");
+        apply_accepted(&cache, &sibling, "V-SIBLING");
+        let leg = cache.borrow().order_owned(&leg_id).unwrap();
+        let sibling = cache.borrow().order_owned(&sibling_id).unwrap();
+
+        if leg_filled > 0 {
+            apply_fill(
+                &cache,
+                &leg,
+                &instrument,
+                "T-LEG",
+                Quantity::from(leg_filled),
+            );
+        }
+
+        apply_fill(
+            &cache,
+            &sibling,
+            &instrument,
+            "T-SIBLING",
+            Quantity::from(sibling_filled),
+        );
+        let leg = cache.borrow().order_owned(&leg_id).unwrap();
+
+        let actions = manager.handle_contingencies_update(&leg);
+
+        // The sibling keeps its own fills and tracks the leg's remaining quantity
+        assert!(matches!(
+            actions.as_slice(),
+            [OrderManagerAction::ModifyLocalQuantity { order, quantity }]
+                if order.client_order_id() == sibling_id
+                    && *quantity == Quantity::from(expected_sibling_quantity)
+        ));
+    }
+
+    #[rstest]
+    fn test_handle_contingencies_update_reciprocal_ouo_resize_keeps_both_legs() {
+        let (clock, cache) = create_test_components();
+        let mut manager = OrderManager::new(clock, cache.clone(), false);
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+        let leg_id = ClientOrderId::from("O-LEG");
+        let sibling_id = ClientOrderId::from("O-SIBLING");
+        let leg = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .client_order_id(leg_id)
+            .side(OrderSide::Sell)
+            .price(Price::from("1.00100"))
+            .quantity(Quantity::from(100_000))
+            .contingency_type(ContingencyType::Ouo)
+            .linked_order_ids(vec![sibling_id])
+            .submit(true)
+            .build();
+        let sibling = OrderTestBuilder::new(OrderType::StopMarket)
+            .instrument_id(instrument.id())
+            .client_order_id(sibling_id)
+            .side(OrderSide::Sell)
+            .trigger_price(Price::from("0.99000"))
+            .quantity(Quantity::from(75_000))
+            .contingency_type(ContingencyType::Ouo)
+            .linked_order_ids(vec![leg_id])
+            .submit(true)
+            .build();
+        cache
+            .borrow_mut()
+            .add_order(leg.clone(), None, None, false)
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_order(sibling.clone(), None, None, false)
+            .unwrap();
+        apply_accepted(&cache, &leg, "V-LEG");
+        apply_accepted(&cache, &sibling, "V-SIBLING");
+        let leg = cache.borrow().order_owned(&leg_id).unwrap();
+        apply_fill(&cache, &leg, &instrument, "T-LEG", Quantity::from(25_000));
+
+        let resize = |order_id: &ClientOrderId, quantity: u64| {
+            let order = cache.borrow().order_owned(order_id).unwrap();
+            let event = OrderEventAny::Updated(
+                OrderUpdatedSpec::builder()
+                    .trader_id(order.trader_id())
+                    .strategy_id(order.strategy_id())
+                    .instrument_id(order.instrument_id())
+                    .client_order_id(order.client_order_id())
+                    .quantity(Quantity::from(quantity))
+                    .venue_order_id(order.venue_order_id().unwrap())
+                    .account_id(AccountId::from("ACCOUNT-001"))
+                    .build(),
+            );
+            cache.borrow_mut().update_order(&event).unwrap();
+            cache.borrow().order_owned(order_id).unwrap()
+        };
+
+        // Reducing the leg to 40,000 leaves 15,000 remaining after its 25,000 fill
+        let leg = resize(&leg_id, 40_000);
+        let leg_actions = manager.handle_contingencies_update(&leg);
+        let sibling = resize(&sibling_id, 15_000);
+        let sibling_actions = manager.handle_contingencies_update(&sibling);
+
+        assert!(matches!(
+            leg_actions.as_slice(),
+            [OrderManagerAction::ModifyLocalQuantity { order, quantity }]
+                if order.client_order_id() == sibling_id
+                    && *quantity == Quantity::from(15_000)
+        ));
+        assert!(sibling_actions.is_empty());
+    }
+
+    #[rstest]
+    fn test_handle_contingencies_update_syncs_ouo_sibling_to_spawn_leaves() {
+        let (clock, cache) = create_test_components();
+        let mut manager = OrderManager::new(clock, cache.clone(), false);
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+        let spawn_id = ClientOrderId::from("O-SPAWN");
+        let first_id = ClientOrderId::from("O-SPAWN-1");
+        let second_id = ClientOrderId::from("O-SPAWN-2");
+        let sibling_id = ClientOrderId::from("O-SIBLING");
+        let exec_algorithm_id = ExecAlgorithmId::from("TWAP");
+
+        let spawned_leg = |client_order_id: ClientOrderId, quantity: u64| {
+            OrderTestBuilder::new(OrderType::Limit)
+                .instrument_id(instrument.id())
+                .client_order_id(client_order_id)
+                .side(OrderSide::Buy)
+                .price(Price::from("1.00000"))
+                .quantity(Quantity::from(quantity))
+                .contingency_type(ContingencyType::Ouo)
+                .linked_order_ids(vec![sibling_id])
+                .exec_algorithm_id(exec_algorithm_id)
+                .exec_spawn_id(spawn_id)
+                .submit(true)
+                .build()
+        };
+
+        let first = spawned_leg(first_id, 30_000);
+        let second = spawned_leg(second_id, 70_000);
+        let sibling = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .client_order_id(sibling_id)
+            .side(OrderSide::Sell)
+            .price(Price::from("1.00100"))
+            .quantity(Quantity::from(100_000))
+            .submit(true)
+            .build();
+
+        for order in [&first, &second, &sibling] {
+            cache
+                .borrow_mut()
+                .add_order(order.clone(), None, None, false)
+                .unwrap();
+        }
+
+        apply_fill(
+            &cache,
+            &first,
+            &instrument,
+            "T-SPAWN-1",
+            Quantity::from(10_000),
+        );
+        let first = cache.borrow().order_owned(&first_id).unwrap();
+
+        let actions = manager.handle_contingencies_update(&first);
+
+        // Both spawned legs remain open, so the sibling tracks their combined 90,000 leaves
+        assert!(matches!(
+            actions.as_slice(),
+            [OrderManagerAction::ModifyLocalQuantity { order, quantity }]
+                if order.client_order_id() == sibling_id
+                    && *quantity == Quantity::from(90_000)
         ));
     }
 

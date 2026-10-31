@@ -15,7 +15,9 @@
 
 //! Data transfer objects for deserializing Bybit HTTP API payloads.
 
-use nautilus_core::string::secret::SecretString;
+use nautilus_core::{
+    serialization::deserialize_empty_string_as_none, string::secret::SecretString,
+};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
@@ -28,6 +30,7 @@ use crate::common::{
         BybitPositionIdx, BybitPositionSide, BybitPositionStatus, BybitProductType,
         BybitRepayStatus, BybitSmpType, BybitStopOrderType, BybitSymbolType, BybitTimeInForce,
         BybitTpSlMode, BybitTriggerDirection, BybitTriggerType, BybitUnifiedMarginStatus,
+        BybitWithdrawStatus, BybitWithdrawType,
     },
     models::{
         BybitCursorList, BybitCursorListResponse, BybitListResponse, BybitResponse, LeverageFilter,
@@ -36,7 +39,8 @@ use crate::common::{
     },
     parse::{
         bool_or_int, deserialize_decimal_or_zero, deserialize_i32_or_string,
-        deserialize_optional_decimal_or_zero, deserialize_string_to_u8, masked_secret, on_off_bool,
+        deserialize_optional_decimal_or_zero, deserialize_optional_symbol_type,
+        deserialize_string_to_u8, masked_secret, on_off_bool,
     },
 };
 
@@ -607,7 +611,7 @@ pub struct BybitInstrumentSpot {
     pub price_filter: SpotPriceFilter,
     #[serde(default)]
     pub symbol_id: Option<i64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_symbol_type")]
     pub symbol_type: Option<BybitSymbolType>,
     #[serde(default)]
     pub xstock_multiplier: Option<String>,
@@ -637,8 +641,17 @@ pub struct BybitInstrumentLinear {
     pub settle_coin: Ustr,
     #[serde(default)]
     pub symbol_id: Option<i64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_symbol_type")]
     pub symbol_type: Option<BybitSymbolType>,
+    /// Ticker of the underlying in its native market (TradFi only).
+    #[serde(default, deserialize_with = "deserialize_empty_string_as_none")]
+    pub underlying_ticker: Option<String>,
+    /// Full name of the underlying asset.
+    #[serde(default, deserialize_with = "deserialize_empty_string_as_none")]
+    pub full_name: Option<String>,
+    /// Market region of the underlying, which sets its trading calendar (TradFi only).
+    #[serde(default, deserialize_with = "deserialize_empty_string_as_none")]
+    pub market_region: Option<String>,
 }
 
 /// Instrument definition for inverse contracts.
@@ -665,7 +678,7 @@ pub struct BybitInstrumentInverse {
     pub settle_coin: Ustr,
     #[serde(default)]
     pub symbol_id: Option<i64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_symbol_type")]
     pub symbol_type: Option<BybitSymbolType>,
 }
 
@@ -916,7 +929,9 @@ pub struct BybitOrder {
     pub smp_group: i32,
     pub smp_order_id: Ustr,
     pub tpsl_mode: Option<BybitTpSlMode>,
+    #[serde(default)]
     pub tp_limit_price: String,
+    #[serde(default)]
     pub sl_limit_price: String,
     pub place_type: Ustr,
     pub created_time: String,
@@ -1432,6 +1447,82 @@ pub struct BybitRepayResult {
 /// - <https://bybit-exchange.github.io/docs/v5/account/repay>
 pub type BybitRepayResponse = BybitResponse<BybitRepayResult>;
 
+/// Result from a withdrawal request.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BybitWithdrawResult {
+    pub id: String,
+}
+
+/// Response alias for withdrawal requests.
+///
+/// # References
+///
+/// - <https://bybit-exchange.github.io/docs/v5/asset/withdraw>
+pub type BybitWithdrawResponse = BybitResponse<BybitWithdrawResult>;
+
+/// A single withdrawal record.
+///
+/// # References
+///
+/// - <https://bybit-exchange.github.io/docs/v5/asset/withdraw/withdraw-record>
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BybitWithdrawalRecord {
+    pub withdraw_id: String,
+    #[serde(rename = "txID")]
+    pub tx_id: String,
+    pub coin: Ustr,
+    pub chain: String,
+    #[serde(deserialize_with = "deserialize_decimal_or_zero")]
+    pub amount: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_or_zero")]
+    pub withdraw_fee: Decimal,
+    pub status: BybitWithdrawStatus,
+    pub to_address: String,
+    #[serde(default)]
+    pub tag: String,
+    pub withdraw_type: BybitWithdrawType,
+    pub create_time: String,
+    pub update_time: String,
+    #[serde(default)]
+    pub tax: String,
+    #[serde(default)]
+    pub tax_rate: String,
+    #[serde(default)]
+    pub tax_type: String,
+}
+
+/// Result payload for `GET /v5/asset/withdraw/query-record`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BybitWithdrawalRecordsResult {
+    #[serde(default)]
+    pub rows: Vec<BybitWithdrawalRecord>,
+    #[serde(default)]
+    pub next_page_cursor: Option<String>,
+}
+
+impl BybitWithdrawalRecordsResult {
+    /// Returns the cursor to use for the next page, or `None` when the final
+    /// page has been fetched.
+    ///
+    /// Treats both an empty and a missing cursor as end-of-pages.
+    #[must_use]
+    pub fn continuation_cursor(&self) -> Option<&str> {
+        match self.next_page_cursor.as_deref() {
+            None | Some("") => None,
+            Some(cursor) => Some(cursor),
+        }
+    }
+}
+
+/// Response alias for withdrawal records queries.
+///
+/// # References
+///
+/// - <https://bybit-exchange.github.io/docs/v5/asset/withdraw/withdraw-record>
+pub type BybitWithdrawalRecordsResponse = BybitResponse<BybitWithdrawalRecordsResult>;
+
 /// API key permissions.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(
@@ -1913,6 +2004,31 @@ mod tests {
 
         assert_eq!(instrument.symbol_id, Some(7));
         assert_eq!(instrument.symbol_type, Some(BybitSymbolType::Stock));
+        assert_eq!(instrument.underlying_ticker.as_deref(), Some("AMD"));
+        assert_eq!(
+            instrument.full_name.as_deref(),
+            Some("Advanced Micro Devices")
+        );
+        assert_eq!(instrument.market_region.as_deref(), Some("US"));
+    }
+
+    #[rstest]
+    fn deserialize_linear_instrument_maps_empty_strings_to_none() {
+        let json = load_test_json("http_get_instruments_linear_symbol_type.json")
+            .replace(r#""symbolType": "stock""#, r#""symbolType": """#)
+            .replace(r#""underlyingTicker": "AMD""#, r#""underlyingTicker": """#)
+            .replace(
+                r#""fullName": "Advanced Micro Devices""#,
+                r#""fullName": """#,
+            )
+            .replace(r#""marketRegion": "US""#, r#""marketRegion": """#);
+        let response: BybitInstrumentLinearResponse = serde_json::from_str(&json).unwrap();
+        let instrument = &response.result.list[0];
+
+        assert_eq!(instrument.symbol_type, None);
+        assert_eq!(instrument.underlying_ticker, None);
+        assert_eq!(instrument.full_name, None);
+        assert_eq!(instrument.market_region, None);
     }
 
     #[derive(Deserialize)]
@@ -2001,6 +2117,45 @@ mod tests {
         assert_eq!(order.order_type, BybitOrderType::Limit);
         assert_eq!(order.smp_type, BybitSmpType::None);
         assert_eq!(order.smp_group, 0);
+    }
+
+    #[rstest]
+    #[case::both_missing(true, true)]
+    #[case::tp_missing(true, false)]
+    #[case::sl_missing(false, true)]
+    fn deserialize_option_order_response_without_tp_sl_limit_prices(
+        #[case] omit_tp_limit_price: bool,
+        #[case] omit_sl_limit_price: bool,
+    ) {
+        let mut json: serde_json::Value =
+            serde_json::from_str(&load_test_json("http_get_orders_history.json")).unwrap();
+        let order = json["result"]["list"][0].as_object_mut().unwrap();
+        order.insert(
+            "symbol".to_string(),
+            serde_json::json!("BTC-25SEP26-86500-C-USDT"),
+        );
+        order.insert("orderIv".to_string(), serde_json::json!("0.45"));
+        order.insert("tpLimitPrice".to_string(), serde_json::json!("31000"));
+        order.insert("slLimitPrice".to_string(), serde_json::json!("29000"));
+        if omit_tp_limit_price {
+            order.remove("tpLimitPrice");
+        }
+
+        if omit_sl_limit_price {
+            order.remove("slLimitPrice");
+        }
+
+        let mut expected = serde_json::Value::Object(order.clone());
+        expected["tpLimitPrice"] =
+            serde_json::json!(if omit_tp_limit_price { "" } else { "31000" });
+        expected["slLimitPrice"] =
+            serde_json::json!(if omit_sl_limit_price { "" } else { "29000" });
+
+        let response: BybitOrderHistoryResponse = serde_json::from_value(json).unwrap();
+        let actual = serde_json::to_value(&response.result.list[0]).unwrap();
+
+        assert_eq!(response.result.list.len(), 1);
+        assert_eq!(actual, expected);
     }
 
     #[rstest]

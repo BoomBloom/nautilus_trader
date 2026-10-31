@@ -21,12 +21,13 @@ use std::{
     fmt::Display,
 };
 
-use nautilus_core::{Params, UnixNanos, string::conversions::to_snake_case};
+use nautilus_core::{Params, UnixNanos};
 use nautilus_model::{
     data::{
         Bar, FundingRateUpdate, HasTsInit, IndexPriceUpdate, InstrumentClose, InstrumentStatus,
         MarkPriceUpdate, NautilusDataType, NautilusRecordType, OptionGreeks, OrderBookDelta,
         OrderBookDepth, QuoteTick, TradeTick,
+        greeks::{GreeksData, PortfolioGreeks},
     },
     events::{
         AccountState, OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied,
@@ -348,6 +349,9 @@ macro_rules! data_path_prefix_match {
             NautilusDataType::Custom { type_name } => Cow::Owned(format!("custom/{type_name}")),
             #[cfg(feature = "defi")]
             NautilusDataType::Defi => Cow::Borrowed("defi"),
+            #[cfg(not(feature = "defi"))]
+            #[allow(unreachable_patterns, reason = "DeFi variants can exist without this crate's defi feature")]
+            _ => Cow::Borrowed("defi"),
         }
     };
 }
@@ -376,10 +380,6 @@ pub fn data_type_from_data_path_prefix(type_name: &str) -> anyhow::Result<Nautil
 
     if matches!(type_name, "custom" | "CustomData") {
         anyhow::bail!("custom data queries require custom/<type_name> or Custom:<type_name>");
-    }
-
-    if type_name == "order_book_depth10" {
-        return Ok(NautilusDataType::OrderBookDepth);
     }
 
     type_name.parse()
@@ -488,8 +488,87 @@ pub fn record_path_prefix(record_type: &NautilusRecordType) -> Cow<'static, str>
         NautilusRecordType::FillReport => Cow::Borrowed("fill_report"),
         NautilusRecordType::PositionStatusReport => Cow::Borrowed("position_status_report"),
         NautilusRecordType::ExecutionMassStatus => Cow::Borrowed("execution_mass_status"),
+        NautilusRecordType::GreeksData => Cow::Borrowed("greeks_data"),
+        NautilusRecordType::PortfolioGreeks => Cow::Borrowed("portfolio_greeks"),
+
         #[cfg(feature = "defi")]
         NautilusRecordType::Defi => Cow::Borrowed("defi"),
+        #[cfg(not(feature = "defi"))]
+        #[allow(
+            unreachable_patterns,
+            reason = "DeFi variants can exist without this crate's defi feature"
+        )]
+        _ => Cow::Borrowed("defi"),
+    }
+}
+
+/// Parses a stored catalog type path back into its catalog type.
+///
+/// Accepts the shared-table `record/<type>` and `instrument/<class>` paths, `custom/<type>` data
+/// paths, and the flat Parquet data, record, and instrument class directories.
+///
+/// # Errors
+///
+/// Returns an error if `path` names no catalog type.
+pub fn catalog_data_type_from_path(path: &str) -> anyhow::Result<CatalogDataType> {
+    if let Some(record_type) = path.strip_prefix("record/") {
+        return Ok(CatalogDataType::Record(record_type.parse()?));
+    }
+
+    if let Some(instrument_type) = path.strip_prefix("instrument/") {
+        return Ok(CatalogDataType::Instrument(instrument_type.parse()?));
+    }
+
+    if let Ok(data_type) = data_type_from_data_path_prefix(path) {
+        return Ok(CatalogDataType::Data(data_type));
+    }
+
+    if let Ok(record_type) = path.parse::<NautilusRecordType>() {
+        return Ok(CatalogDataType::Record(record_type));
+    }
+
+    path.parse::<NautilusInstrumentType>()
+        .map(CatalogDataType::Instrument)
+        .map_err(|_| anyhow::anyhow!("Unknown catalog type path '{path}'"))
+}
+
+/// Returns the shared-table catalog prefix for a record type.
+///
+/// Shared-table backends store records under `record/<type>` and instrument classes under
+/// `instrument/<class>`, where Parquet keeps the flat [`record_path_prefix`] directory.
+#[must_use]
+pub fn record_table_path_prefix(record_type: &NautilusRecordType) -> Cow<'static, str> {
+    Cow::Owned(format!("record/{}", record_path_prefix(record_type)))
+}
+
+/// Returns the shared-table catalog prefix for an instrument class.
+#[must_use]
+pub fn instrument_table_path_prefix(instrument_type: &NautilusInstrumentType) -> Cow<'static, str> {
+    Cow::Owned(format!(
+        "instrument/{}",
+        instrument_path_prefix(instrument_type)
+    ))
+}
+
+/// Returns the shared-table catalog prefix for a catalog type.
+#[must_use]
+pub fn catalog_data_type_path_prefix(catalog_type: &CatalogDataType) -> Cow<'static, str> {
+    match catalog_type {
+        CatalogDataType::Data(data_type) => {
+            let prefix = data_path_prefix(data_type);
+
+            // A data prefix the flat record parser also claims, such as DeFi's `defi`, uses the
+            // type name so it parses back as data
+            if prefix.parse::<NautilusRecordType>().is_ok() {
+                Cow::Owned(data_type.to_string())
+            } else {
+                prefix
+            }
+        }
+        CatalogDataType::Record(record_type) => record_table_path_prefix(record_type),
+        CatalogDataType::Instrument(instrument_type) => {
+            instrument_table_path_prefix(instrument_type)
+        }
     }
 }
 
@@ -531,32 +610,16 @@ pub fn parquet_catalog_data_type_path_prefixes(
     }
 }
 
-/// Returns the custom type name when the catalog type is custom data.
-#[must_use]
-pub fn custom_type_name(data_type: &CatalogDataType) -> Option<&str> {
-    match data_type {
-        CatalogDataType::Data(NautilusDataType::Custom { type_name }) => Some(type_name),
-        _ => None,
-    }
-}
-
-/// Returns the Parquet directory prefixes a custom type covers for reads.
-///
-/// Reads fan out across the current `custom/{TypeName}` layout and the legacy Python-written
-/// `custom_<snake_case>` layout (e.g. `custom_binance_bar`). Maintenance operations that map
-/// intervals back to filenames (`delete_data_range`, period consolidation) stay on the canonical
-/// prefix only; migrate legacy layouts with `migrate-parquet` for full maintenance support.
-#[must_use]
-pub fn custom_data_read_prefixes(type_name: &str) -> [Cow<'static, str>; 2] {
-    [
-        Cow::Owned(format!("custom/{type_name}")),
-        Cow::Owned(format!("custom_{}", to_snake_case(type_name))),
-    ]
-}
-
 /// Maps a Rust built-in data type to its semantic catalog data type.
 pub trait HasCatalogDataType {
     fn catalog_data_type() -> NautilusDataType;
+}
+
+/// Maps a Rust type a streaming writer stages to its catalog data or record family.
+///
+/// Every instrument class belongs to the aggregate instrument family.
+pub trait CatalogFamily {
+    fn catalog_family() -> CatalogDataType;
 }
 
 macro_rules! impl_catalog_data_families {
@@ -571,6 +634,12 @@ macro_rules! impl_catalog_data_families {
             impl CatalogPathPrefix for $type {
                 fn path_prefix() -> &'static str {
                     $prefix
+                }
+            }
+
+            impl CatalogFamily for $type {
+                fn catalog_family() -> CatalogDataType {
+                    CatalogDataType::Data(NautilusDataType::$variant)
                 }
             }
         )+
@@ -589,36 +658,50 @@ macro_rules! impl_catalog_path_prefix {
     };
 }
 
-impl_catalog_path_prefix!(AccountState, "account_state");
-impl_catalog_path_prefix!(OrderInitialized, "order_initialized");
-impl_catalog_path_prefix!(OrderDenied, "order_denied");
-impl_catalog_path_prefix!(OrderEmulated, "order_emulated");
-impl_catalog_path_prefix!(OrderSubmitted, "order_submitted");
-impl_catalog_path_prefix!(OrderAccepted, "order_accepted");
-impl_catalog_path_prefix!(OrderRejected, "order_rejected");
-impl_catalog_path_prefix!(OrderPendingCancel, "order_pending_cancel");
-impl_catalog_path_prefix!(OrderCanceled, "order_canceled");
-impl_catalog_path_prefix!(OrderCancelRejected, "order_cancel_rejected");
-impl_catalog_path_prefix!(OrderExpired, "order_expired");
-impl_catalog_path_prefix!(OrderTriggered, "order_triggered");
-impl_catalog_path_prefix!(OrderPendingUpdate, "order_pending_update");
-impl_catalog_path_prefix!(OrderReleased, "order_released");
-impl_catalog_path_prefix!(OrderModifyRejected, "order_modify_rejected");
-impl_catalog_path_prefix!(OrderUpdated, "order_updated");
-impl_catalog_path_prefix!(OrderFilled, "order_filled");
-impl_catalog_path_prefix!(OrderFillVoided, "order_fill_voided");
-impl_catalog_path_prefix!(PositionOpened, "position_opened");
-impl_catalog_path_prefix!(PositionChanged, "position_changed");
-impl_catalog_path_prefix!(PositionClosed, "position_closed");
-impl_catalog_path_prefix!(PositionAdjusted, "position_adjusted");
-impl_catalog_path_prefix!(OrderSnapshot, "order_snapshot");
-impl_catalog_path_prefix!(PositionSnapshot, "position_snapshot");
+macro_rules! impl_catalog_record_family {
+    ($type:ident, $path:expr) => {
+        impl_catalog_path_prefix!($type, $path);
+
+        impl CatalogFamily for $type {
+            fn catalog_family() -> CatalogDataType {
+                CatalogDataType::Record(NautilusRecordType::$type)
+            }
+        }
+    };
+}
+
+impl_catalog_record_family!(AccountState, "account_state");
+impl_catalog_record_family!(OrderInitialized, "order_initialized");
+impl_catalog_record_family!(OrderDenied, "order_denied");
+impl_catalog_record_family!(OrderEmulated, "order_emulated");
+impl_catalog_record_family!(OrderSubmitted, "order_submitted");
+impl_catalog_record_family!(OrderAccepted, "order_accepted");
+impl_catalog_record_family!(OrderRejected, "order_rejected");
+impl_catalog_record_family!(OrderPendingCancel, "order_pending_cancel");
+impl_catalog_record_family!(OrderCanceled, "order_canceled");
+impl_catalog_record_family!(OrderCancelRejected, "order_cancel_rejected");
+impl_catalog_record_family!(OrderExpired, "order_expired");
+impl_catalog_record_family!(OrderTriggered, "order_triggered");
+impl_catalog_record_family!(OrderPendingUpdate, "order_pending_update");
+impl_catalog_record_family!(OrderReleased, "order_released");
+impl_catalog_record_family!(OrderModifyRejected, "order_modify_rejected");
+impl_catalog_record_family!(OrderUpdated, "order_updated");
+impl_catalog_record_family!(OrderFilled, "order_filled");
+impl_catalog_record_family!(OrderFillVoided, "order_fill_voided");
+impl_catalog_record_family!(PositionOpened, "position_opened");
+impl_catalog_record_family!(PositionChanged, "position_changed");
+impl_catalog_record_family!(PositionClosed, "position_closed");
+impl_catalog_record_family!(PositionAdjusted, "position_adjusted");
+impl_catalog_record_family!(OrderSnapshot, "order_snapshot");
+impl_catalog_record_family!(PositionSnapshot, "position_snapshot");
 impl_catalog_path_prefix!(PortfolioSnapshot, "portfolio_snapshot");
 
-impl_catalog_path_prefix!(FillReport, "fill_report");
-impl_catalog_path_prefix!(OrderStatusReport, "order_status_report");
-impl_catalog_path_prefix!(PositionStatusReport, "position_status_report");
-impl_catalog_path_prefix!(ExecutionMassStatus, "execution_mass_status");
+impl_catalog_record_family!(FillReport, "fill_report");
+impl_catalog_record_family!(OrderStatusReport, "order_status_report");
+impl_catalog_record_family!(PositionStatusReport, "position_status_report");
+impl_catalog_record_family!(ExecutionMassStatus, "execution_mass_status");
+impl_catalog_record_family!(GreeksData, "greeks_data");
+impl_catalog_record_family!(PortfolioGreeks, "portfolio_greeks");
 
 impl NautilusDataTypePrefix for NautilusDataType {
     fn path_prefix(&self) -> Cow<'static, str> {
@@ -633,12 +716,11 @@ impl NautilusRecordTypePrefix for NautilusRecordType {
 }
 
 pub(crate) fn filter_instruments_for_request_range(
-    instruments: Vec<InstrumentAny>,
+    mut instruments: Vec<InstrumentAny>,
     start: Option<UnixNanos>,
     end: Option<UnixNanos>,
 ) -> Vec<InstrumentAny> {
     if start.is_none() && end.is_none() {
-        let mut instruments = instruments;
         instruments.sort_by_key(HasTsInit::ts_init);
         return instruments;
     }
@@ -658,14 +740,11 @@ pub(crate) fn filter_instruments_for_request_range(
         } else if let Some(start) = start
             && ts_init < start
             && end.is_none_or(|value| ts_init <= value)
+            && latest_before_start
+                .get(&instrument_id)
+                .is_none_or(|existing| HasTsInit::ts_init(existing).as_u64() < ts_init)
         {
-            match latest_before_start.get(&instrument_id) {
-                Some(existing)
-                    if HasTsInit::ts_init(existing) >= HasTsInit::ts_init(&instrument) => {}
-                _ => {
-                    latest_before_start.insert(instrument_id, instrument);
-                }
-            }
+            latest_before_start.insert(instrument_id, instrument);
         }
     }
 
@@ -695,6 +774,7 @@ pub(crate) fn filter_instrument_query_result(
 
 #[cfg(test)]
 mod tests {
+    use nautilus_model::instruments::stubs::{audusd_sim, crypto_perpetual_ethusdt, equity_aapl};
     use rstest::rstest;
     use strum::IntoEnumIterator;
 
@@ -722,15 +802,8 @@ mod tests {
     }
 
     #[rstest]
-    fn catalog_path_prefix_maps_legacy_depth_directory() {
-        assert_eq!(
-            data_type_from_data_path_prefix("order_book_depth10").unwrap(),
-            NautilusDataType::OrderBookDepth
-        );
-        assert_eq!(
-            data_path_prefix(&NautilusDataType::OrderBookDepth).as_ref(),
-            "order_book_depths"
-        );
+    fn data_path_prefix_rejects_legacy_depth_directory() {
+        assert!(data_type_from_data_path_prefix("order_book_depth10").is_err());
     }
 
     #[rstest]
@@ -758,6 +831,69 @@ mod tests {
         assert_eq!(
             CatalogDataType::from(NautilusInstrumentType::Equity),
             CatalogDataType::Instrument(NautilusInstrumentType::Equity)
+        );
+    }
+
+    #[rstest]
+    #[case::data(CatalogDataType::Data(NautilusDataType::QuoteTick), "quotes")]
+    #[case::custom(
+        CatalogDataType::Data(NautilusDataType::Custom {
+            type_name: "Signal".to_string(),
+        }),
+        "custom/Signal",
+    )]
+    #[case::record(
+        CatalogDataType::Record(NautilusRecordType::AccountState),
+        "record/account_state"
+    )]
+    #[case::instrument(
+        CatalogDataType::Instrument(NautilusInstrumentType::CurrencyPair),
+        "instrument/currency_pair"
+    )]
+    fn catalog_data_type_path_prefix_round_trips(
+        #[case] catalog_type: CatalogDataType,
+        #[case] prefix: &str,
+    ) {
+        assert_eq!(catalog_data_type_path_prefix(&catalog_type), prefix);
+        assert_eq!(catalog_data_type_from_path(prefix).unwrap(), catalog_type);
+    }
+
+    #[rstest]
+    fn catalog_data_type_path_prefix_round_trips_every_family() {
+        let mut catalog_types = NautilusRecordType::iter()
+            .map(CatalogDataType::Record)
+            .chain(NautilusInstrumentType::iter().map(CatalogDataType::Instrument))
+            .collect::<Vec<_>>();
+
+        macro_rules! push_data_types {
+            ($(($variant:ident, $type:ident, $data:ident, $batch:ident, $prefix:literal)),+ $(,)?) => {
+                $(catalog_types.push(CatalogDataType::Data(NautilusDataType::$variant));)+
+            };
+        }
+        nautilus_model::for_each_data_type!(push_data_types);
+
+        // DeFi data exists whenever the model enables DeFi, even without this crate's feature
+        if let Ok(defi) = "Defi".parse::<NautilusDataType>() {
+            catalog_types.push(CatalogDataType::Data(defi));
+        }
+
+        for catalog_type in catalog_types {
+            let prefix = catalog_data_type_path_prefix(&catalog_type);
+            assert_eq!(
+                catalog_data_type_from_path(&prefix).unwrap(),
+                catalog_type,
+                "{prefix}"
+            );
+        }
+    }
+
+    #[rstest]
+    fn catalog_data_type_from_path_rejects_unknown_shared_table_record() {
+        let error = catalog_data_type_from_path("record/not_a_type").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Invalid `NautilusRecordType`: 'not_a_type'"
         );
     }
 
@@ -801,19 +937,256 @@ mod tests {
         assert_eq!(prefixes, INSTRUMENT_PATH_PREFIXES);
     }
 
+    macro_rules! assert_data_type_path_prefixes_match_writer {
+        ($(($variant:ident, $type:ident, $data:ident, $batch:ident, $prefix:literal)),+ $(,)?) => {
+            $(
+                assert_eq!(
+                    NautilusDataType::$variant.path_prefix(),
+                    <$type as CatalogPathPrefix>::path_prefix(),
+                );
+            )+
+        };
+    }
+
+    macro_rules! assert_record_type_path_prefixes_match_writer {
+        ($($variant:ident),+ $(,)?) => {
+            $(
+                assert_eq!(
+                    NautilusRecordType::$variant.path_prefix(),
+                    <$variant as CatalogPathPrefix>::path_prefix(),
+                );
+            )+
+
+            let checked = vec![$(NautilusRecordType::$variant),+];
+            #[cfg(feature = "defi")]
+            let expected = NautilusRecordType::iter()
+                .filter(|record_type| *record_type != NautilusRecordType::Defi)
+                .collect::<Vec<_>>();
+            #[cfg(not(feature = "defi"))]
+            let expected = NautilusRecordType::iter().collect::<Vec<_>>();
+            assert_eq!(checked, expected);
+        };
+    }
+
     #[rstest]
-    fn custom_data_read_prefixes_cover_canonical_and_legacy_layouts() {
+    fn data_type_path_prefixes_match_writer_prefixes() {
+        nautilus_model::for_each_data_type!(assert_data_type_path_prefixes_match_writer);
+    }
+
+    #[rstest]
+    fn record_type_path_prefixes_match_writer_prefixes() {
+        assert_record_type_path_prefixes_match_writer!(
+            AccountState,
+            OrderInitialized,
+            OrderDenied,
+            OrderEmulated,
+            OrderSubmitted,
+            OrderAccepted,
+            OrderRejected,
+            OrderPendingCancel,
+            OrderCanceled,
+            OrderCancelRejected,
+            OrderExpired,
+            OrderTriggered,
+            OrderPendingUpdate,
+            OrderReleased,
+            OrderModifyRejected,
+            OrderUpdated,
+            OrderFilled,
+            OrderFillVoided,
+            PositionOpened,
+            PositionChanged,
+            PositionClosed,
+            PositionAdjusted,
+            OrderSnapshot,
+            PositionSnapshot,
+            OrderStatusReport,
+            FillReport,
+            PositionStatusReport,
+            ExecutionMassStatus,
+            GreeksData,
+            PortfolioGreeks,
+        );
+    }
+
+    #[rstest]
+    #[case(CatalogDataType::Data(NautilusDataType::Instrument), "instruments")]
+    #[case(CatalogDataType::Data(NautilusDataType::QuoteTick), "quotes")]
+    #[case(CatalogDataType::Record(NautilusRecordType::FillReport), "fill_report")]
+    #[case(CatalogDataType::Instrument(NautilusInstrumentType::Equity), "equity")]
+    fn parquet_table_stems_name_each_catalog_type(
+        #[case] data_type: CatalogDataType,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(parquet_catalog_data_type_table_stem(&data_type), expected);
+    }
+
+    #[rstest]
+    fn data_type_from_data_path_prefix_parses_custom_prefix() {
         assert_eq!(
-            custom_data_read_prefixes("BinanceBar").as_slice(),
-            [
-                Cow::Owned::<str>("custom/BinanceBar".to_string()),
-                Cow::Owned::<str>("custom_binance_bar".to_string()),
-            ]
-            .as_slice(),
+            data_type_from_data_path_prefix("custom/SensorReading").unwrap(),
+            NautilusDataType::Custom {
+                type_name: "SensorReading".to_string(),
+            },
+        );
+    }
+
+    #[rstest]
+    #[case("custom")]
+    #[case("CustomData")]
+    fn data_type_from_data_path_prefix_rejects_custom_without_type_name(#[case] type_name: &str) {
+        let error = data_type_from_data_path_prefix(type_name).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "custom data queries require custom/<type_name> or Custom:<type_name>",
+        );
+    }
+
+    #[rstest]
+    fn instrument_and_record_query_builders_set_every_field() {
+        let params = Params::new([("only_last".to_string(), false.into())].into());
+
+        let instrument_query = CatalogInstrumentQuery::new()
+            .with_instrument_ids(Some(vec!["AUD/USD.SIM".to_string()]))
+            .with_range(Some(UnixNanos::from(1)), Some(UnixNanos::from(2)))
+            .with_where_clause(Some("venue = 'SIM'".to_string()))
+            .with_instrument_type(Some(NautilusInstrumentType::CurrencyPair));
+        let record_query = CatalogRecordQuery::new(NautilusRecordType::FillReport)
+            .with_identifier(Some("O-1".to_string()))
+            .with_range(Some(UnixNanos::from(3)), Some(UnixNanos::from(4)))
+            .with_where_clause(Some("trade_id = 'T-1'".to_string()))
+            .with_params(Some(params.clone()))
+            .with_as_of(CatalogAsOf::Version(7));
+
+        assert_eq!(
+            instrument_query,
+            CatalogInstrumentQuery {
+                instrument_ids: Some(vec!["AUD/USD.SIM".to_string()]),
+                start: Some(UnixNanos::from(1)),
+                end: Some(UnixNanos::from(2)),
+                where_clause: Some("venue = 'SIM'".to_string()),
+                instrument_type: Some(NautilusInstrumentType::CurrencyPair),
+            },
         );
         assert_eq!(
-            custom_data_read_prefixes("RustTestCustomData")[1].as_ref(),
-            "custom_rust_test_custom_data",
+            record_query,
+            CatalogRecordQuery {
+                record_type: NautilusRecordType::FillReport,
+                identifier: Some("O-1".to_string()),
+                start: Some(UnixNanos::from(3)),
+                end: Some(UnixNanos::from(4)),
+                where_clause: Some("trade_id = 'T-1'".to_string()),
+                params: Some(params),
+                as_of: CatalogAsOf::Version(7),
+            },
         );
+    }
+
+    fn ethusdt_at(ts: u64) -> InstrumentAny {
+        let mut instrument = crypto_perpetual_ethusdt();
+        instrument.ts_event = UnixNanos::from(ts);
+        instrument.ts_init = UnixNanos::from(ts);
+        InstrumentAny::CryptoPerpetual(instrument)
+    }
+
+    fn audusd_at(ts: u64) -> InstrumentAny {
+        let mut instrument = audusd_sim();
+        instrument.ts_event = UnixNanos::from(ts);
+        instrument.ts_init = UnixNanos::from(ts);
+        InstrumentAny::CurrencyPair(instrument)
+    }
+
+    fn aapl_at(ts: u64) -> InstrumentAny {
+        let mut instrument = equity_aapl();
+        instrument.ts_event = UnixNanos::from(ts);
+        instrument.ts_init = UnixNanos::from(ts);
+        InstrumentAny::Equity(instrument)
+    }
+
+    fn instrument_versions(instruments: &[InstrumentAny]) -> Vec<(String, u64)> {
+        instruments
+            .iter()
+            .map(|instrument| {
+                (
+                    instrument.id().to_string(),
+                    HasTsInit::ts_init(instrument).as_u64(),
+                )
+            })
+            .collect()
+    }
+
+    #[rstest]
+    #[case::latest_before_start_listed_last(
+        vec![ethusdt_at(1), ethusdt_at(3), audusd_at(2), audusd_at(6), aapl_at(12)],
+        Some(5),
+        Some(10),
+        &[("ETHUSDT-PERP.BINANCE", 3), ("AUD/USD.SIM", 6)],
+    )]
+    #[case::latest_before_start_listed_first(
+        vec![ethusdt_at(3), ethusdt_at(1), audusd_at(6), audusd_at(2), aapl_at(12)],
+        Some(5),
+        Some(10),
+        &[("ETHUSDT-PERP.BINANCE", 3), ("AUD/USD.SIM", 6)],
+    )]
+    #[case::end_only(
+        vec![ethusdt_at(3), audusd_at(6), aapl_at(12), ethusdt_at(1)],
+        None,
+        Some(10),
+        &[("ETHUSDT-PERP.BINANCE", 1), ("ETHUSDT-PERP.BINANCE", 3), ("AUD/USD.SIM", 6)],
+    )]
+    #[case::start_only(
+        vec![ethusdt_at(1), ethusdt_at(3), audusd_at(6), aapl_at(12)],
+        Some(5),
+        None,
+        &[("ETHUSDT-PERP.BINANCE", 3), ("AUD/USD.SIM", 6), ("AAPL.XNAS", 12)],
+    )]
+    #[case::unbounded(
+        vec![aapl_at(12), ethusdt_at(3), audusd_at(6)],
+        None,
+        None,
+        &[("ETHUSDT-PERP.BINANCE", 3), ("AUD/USD.SIM", 6), ("AAPL.XNAS", 12)],
+    )]
+    fn filter_instruments_for_request_range_selects_versions(
+        #[case] instruments: Vec<InstrumentAny>,
+        #[case] start: Option<u64>,
+        #[case] end: Option<u64>,
+        #[case] expected: &[(&str, u64)],
+    ) {
+        let filtered = filter_instruments_for_request_range(
+            instruments,
+            start.map(UnixNanos::from),
+            end.map(UnixNanos::from),
+        );
+
+        let expected = expected
+            .iter()
+            .map(|&(id, ts)| (id.to_string(), ts))
+            .collect::<Vec<_>>();
+        assert_eq!(instrument_versions(&filtered), expected);
+    }
+
+    #[rstest]
+    #[case::only_last_absent(None, &[("ETHUSDT-PERP.BINANCE", 3), ("AUD/USD.SIM", 6)])]
+    #[case::only_last_true(Some(true), &[("ETHUSDT-PERP.BINANCE", 3), ("AUD/USD.SIM", 6)])]
+    #[case::only_last_false(Some(false), &[("AUD/USD.SIM", 6)])]
+    fn filter_instrument_query_result_drops_pre_start_versions_only_when_requested(
+        #[case] only_last: Option<bool>,
+        #[case] expected: &[(&str, u64)],
+    ) {
+        let params = only_last
+            .map(|only_last| Params::new([("only_last".to_string(), only_last.into())].into()));
+
+        let filtered = filter_instrument_query_result(
+            vec![ethusdt_at(3), audusd_at(6)],
+            Some(UnixNanos::from(5)),
+            params.as_ref(),
+        );
+
+        let expected = expected
+            .iter()
+            .map(|&(id, ts)| (id.to_string(), ts))
+            .collect::<Vec<_>>();
+        assert_eq!(instrument_versions(&filtered), expected);
     }
 }

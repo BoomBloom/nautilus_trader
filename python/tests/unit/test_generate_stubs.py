@@ -1804,19 +1804,19 @@ def test_elide_forward_class_defaults_in_signatures_keeps_earlier_local_defaults
     Test elide forward class defaults in signatures keeps earlier local defaults.
     """
     content = """
-class BitmexEnvironment(Enum):
+class ExampleEnvironment(Enum):
     MAINNET = ...
 
 class Client:
     def __init__(
         self,
-        environment: BitmexEnvironment = BitmexEnvironment.MAINNET,
+        environment: ExampleEnvironment = ExampleEnvironment.MAINNET,
     ) -> None: ...
 """.strip()
 
     updated = generate_stubs.elide_forward_class_defaults_in_signatures(content)
 
-    assert "environment: BitmexEnvironment = BitmexEnvironment.MAINNET" in updated
+    assert "environment: ExampleEnvironment = ExampleEnvironment.MAINNET" in updated
 
 
 STUB_ROOT = WORKSPACE_ROOT / "python" / "nautilus_trader"
@@ -1850,16 +1850,6 @@ RUST_FUNCTION_RE = re.compile(
 PYO3_SIGNATURE_RE = re.compile(r"#\[pyo3\(signature\s*=\s*\((.*?)\)\)\]", re.DOTALL)
 
 CONFIG_READBACK_REPLACEMENTS = {
-    (
-        "nautilus_trader.backtest",
-        "BacktestDataConfig",
-        "catalog_fs_storage_options",
-    ): "catalog_fs_storage_option_keys",
-    (
-        "nautilus_trader.backtest",
-        "BacktestDataConfig",
-        "catalog_fs_rust_storage_options",
-    ): "catalog_fs_rust_storage_option_keys",
     (
         "nautilus_trader.persistence",
         "DataCatalogConfig",
@@ -2074,7 +2064,6 @@ def test_live_stub_exposes_builder_engine_config_methods() -> None:
         ("nautilus_trader.infrastructure", "RedisCacheConfig"),
         ("nautilus_trader.infrastructure", "RedisMessageBusConfig"),
         ("nautilus_trader.infrastructure", "RedisMessageBusFactory"),
-        ("nautilus_trader.persistence", "DataBackendSession"),
         ("nautilus_trader.persistence", "ParquetDataCatalog"),
         ("nautilus_trader.persistence", "StreamingFeatherWriter"),
     ],
@@ -2649,6 +2638,22 @@ def _concrete_stub_defaults(method: ast.FunctionDef | ast.AsyncFunctionDef) -> o
     return defaults
 
 
+def test_infrastructure_stub_exposes_configs_and_factories() -> None:
+    """
+    Keep generated bindings limited to configuration and factory entry points.
+    """
+    stub = ast.parse((STUB_ROOT / "infrastructure" / "__init__.pyi").read_text(encoding="utf-8"))
+    classes = {node.name for node in stub.body if isinstance(node, ast.ClassDef)}
+
+    assert classes == {
+        "PostgresCacheConfig",
+        "PostgresConnectOptions",
+        "RedisCacheConfig",
+        "RedisMessageBusConfig",
+        "RedisMessageBusFactory",
+    }
+
+
 def test_generated_config_stubs_include_signature_defaults() -> None:
     """
     Test generated config stubs include signature defaults.
@@ -2736,11 +2741,9 @@ def test_adapter_config_readback_returns_constructor_values(tmp_path: Path) -> N
     from nautilus_trader.adapters.architect_ax import AxDataClientConfig
     from nautilus_trader.adapters.betfair import BetfairDataClientConfig
     from nautilus_trader.adapters.betfair import BetfairExecutionClientConfig
-    from nautilus_trader.adapters.bitmex import BitmexExecutionClientConfig
     from nautilus_trader.adapters.bybit import BybitDataClientConfig
     from nautilus_trader.adapters.databento import DatabentoDataClientConfig
     from nautilus_trader.adapters.interactive_brokers import DockerizedIBGatewayConfig
-    from nautilus_trader.model import AccountId
 
     ax_config = AxDataClientConfig(
         base_url_http="https://ax.example.test",
@@ -2754,15 +2757,13 @@ def test_adapter_config_readback_returns_constructor_values(tmp_path: Path) -> N
         proxy_url="http://user:password@proxy.example.test",
         event_type_ids=[7, 9],
         stream_heartbeat_secs=43,
+        book_snapshot_timeout_secs=0,
     )
     betfair_exec_config = BetfairExecutionClientConfig(username="exec-readback-user")
-    bitmex_config = BitmexExecutionClientConfig(
-        account_id=AccountId("BITMEX-001"),
-        submitter_proxy_urls=["http://submitter.example.test"],
-        canceller_proxy_urls=["http://canceller.example.test"],
-        deadmans_switch_timeout_secs=45,
+    bybit_config = BybitDataClientConfig(
+        instrument_status_poll_secs=23,
+        book_snapshot_timeout_secs=0,
     )
-    bybit_config = BybitDataClientConfig(instrument_status_poll_secs=23)
     databento_config = DatabentoDataClientConfig(
         api_key="readback-api-key",
         publishers_filepath=tmp_path / "publishers.json",
@@ -2780,15 +2781,13 @@ def test_adapter_config_readback_returns_constructor_values(tmp_path: Path) -> N
     assert betfair_config.event_type_ids == ["7", "9"]
     assert betfair_config.stream_heartbeat_secs == 43
     assert betfair_config.has_proxy_url is True
-    assert bitmex_config.deadmans_switch_timeout_secs == 45
-    assert bitmex_config.has_submitter_proxy_urls is True
-    assert bitmex_config.has_canceller_proxy_urls is True
+    assert betfair_config.book_snapshot_timeout_secs == 0
     assert bybit_config.instrument_status_poll_secs == 23
+    assert bybit_config.book_snapshot_timeout_secs == 0
     assert databento_config.publishers_filepath == tmp_path / "publishers.json"
     assert databento_config.use_exchange_as_venue is True
     assert databento_config.bars_timestamp_on_close is False
     assert databento_config.venue_dataset_map == {"XNAS": "XNAS.ITCH"}
-    assert bitmex_config.account_id == AccountId("BITMEX-001")
     assert ib_gateway_config.username == "ib-readback-user"
 
 
@@ -2917,7 +2916,6 @@ def test_adapter_config_sensitive_readback_values_are_not_represented() -> None:
     """
     from nautilus_trader.adapters.betfair import BetfairDataClientConfig
     from nautilus_trader.adapters.betfair import BetfairExecutionClientConfig
-    from nautilus_trader.adapters.bitmex import BitmexExecutionClientConfig
     from nautilus_trader.adapters.blockchain import BlockchainDataClientConfig
     from nautilus_trader.adapters.derive import DeriveDataClientConfig
     from nautilus_trader.adapters.dydx import DydxDataClientConfig
@@ -2930,10 +2928,6 @@ def test_adapter_config_sensitive_readback_values_are_not_represented() -> None:
     configs = [
         BetfairDataClientConfig(username=sentinel),
         BetfairExecutionClientConfig(username=sentinel),
-        BitmexExecutionClientConfig(
-            submitter_proxy_urls=[f"http://{sentinel}@submitter.example.test"],
-            canceller_proxy_urls=[f"http://{sentinel}@canceller.example.test"],
-        ),
         BlockchainDataClientConfig(
             chain=Chain.ARBITRUM(),
             dex_ids=[DexType.UNISWAP_V3],
@@ -3579,3 +3573,40 @@ def _module_name_from_stub_path(relative_package: Path) -> str:
         return "nautilus_trader"
 
     return f"nautilus_trader.{'.'.join(relative_package.parts)}"
+
+
+def test_injected_model_constant_imports_its_annotation_namespace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Keep constant annotations resolvable when no class imports the model module.
+    """
+    stub = tmp_path / "adapters" / "finfeed" / "__init__.pyi"
+    stub.parent.mkdir(parents=True)
+    stub.write_text(
+        '__all__ = ["FinFeedDataClientFactory"]\nclass FinFeedDataClientFactory: ...\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        generate_stubs,
+        "collect_module_constants",
+        lambda _: {
+            "adapters.finfeed": [
+                generate_stubs.ModuleConstant("FINFEED_CLIENT_ID", "model.ClientId"),
+            ],
+        },
+    )
+
+    generate_stubs.inject_module_constants(tmp_path, tmp_path)
+    content = stub.read_text(encoding="utf-8")
+    tree = ast.parse(content)
+    imports = [node for node in tree.body if isinstance(node, ast.ImportFrom)]
+    assert [
+        (node.module, [(name.name, name.asname) for name in node.names]) for node in imports
+    ] == [
+        ("nautilus_trader", [("model", None)]),
+    ]
+    assert "FINFEED_CLIENT_ID: model.ClientId" in content
+    generate_stubs.inject_module_constants(tmp_path, tmp_path)
+    assert stub.read_text(encoding="utf-8") == content

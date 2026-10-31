@@ -29,7 +29,7 @@ use nautilus_model::{
 };
 
 use super::primitives::{
-    decode_price_or_undef, decode_quantity, parse_aggressor_side, parse_book_action,
+    decode_price_field, decode_quantity, parse_aggressor_side, parse_book_action,
     parse_optional_bool, parse_order_side, parse_status_reason, parse_status_trading_event,
 };
 
@@ -155,7 +155,7 @@ pub fn decode_mbo_msg(
     let side = parse_order_side(msg.side);
     if is_trade_msg(msg.action) {
         if include_trades && msg.size > 0 {
-            let price = decode_price_or_undef(msg.price, price_precision);
+            let price = decode_price_field(msg.price, price_precision, instrument_id, "price")?;
             let size = decode_quantity(msg.size as u64);
             let aggressor_side = parse_aggressor_side(msg.side);
             let trade_id = TradeId::new(msg.sequence.format_into(&mut NumBuffer::new()));
@@ -189,7 +189,7 @@ pub fn decode_mbo_msg(
     }
 
     let action = parse_book_action(msg.action)?;
-    let price = decode_price_or_undef(msg.price, price_precision);
+    let price = decode_price_field(msg.price, price_precision, instrument_id, "price")?;
     let size = decode_quantity(msg.size as u64);
     let order = BookOrder::new(side, price, size, msg.order_id);
 
@@ -321,7 +321,7 @@ pub fn decode_trade_msg(
 
     let trade = TradeTick::new(
         instrument_id,
-        decode_price_or_undef(msg.price, price_precision),
+        decode_price_field(msg.price, price_precision, instrument_id, "price")?,
         decode_quantity(msg.size as u64),
         parse_aggressor_side(msg.side),
         TradeId::new(msg.sequence.format_into(&mut NumBuffer::new())),
@@ -353,8 +353,8 @@ pub fn decode_tbbo_msg(
     let maybe_quote = if has_valid_bid_ask(top_level.bid_px, top_level.ask_px) {
         Some(QuoteTick::new(
             instrument_id,
-            decode_price_or_undef(top_level.bid_px, price_precision),
-            decode_price_or_undef(top_level.ask_px, price_precision),
+            decode_price_field(top_level.bid_px, price_precision, instrument_id, "bid_px")?,
+            decode_price_field(top_level.ask_px, price_precision, instrument_id, "ask_px")?,
             decode_quantity(top_level.bid_sz as u64),
             decode_quantity(top_level.ask_sz as u64),
             ts_event,
@@ -366,7 +366,7 @@ pub fn decode_tbbo_msg(
 
     let trade = TradeTick::new(
         instrument_id,
-        decode_price_or_undef(msg.price, price_precision),
+        decode_price_field(msg.price, price_precision, instrument_id, "price")?,
         decode_quantity(msg.size as u64),
         parse_aggressor_side(msg.side),
         TradeId::new(msg.sequence.format_into(&mut NumBuffer::new())),
@@ -398,8 +398,8 @@ pub fn decode_mbp1_msg(
     let maybe_quote = if has_valid_bid_ask(top_level.bid_px, top_level.ask_px) {
         Some(QuoteTick::new(
             instrument_id,
-            decode_price_or_undef(top_level.bid_px, price_precision),
-            decode_price_or_undef(top_level.ask_px, price_precision),
+            decode_price_field(top_level.bid_px, price_precision, instrument_id, "bid_px")?,
+            decode_price_field(top_level.ask_px, price_precision, instrument_id, "ask_px")?,
             decode_quantity(top_level.bid_sz as u64),
             decode_quantity(top_level.ask_sz as u64),
             ts_event,
@@ -412,7 +412,7 @@ pub fn decode_mbp1_msg(
     let maybe_trade = if include_trades && is_trade_msg(msg.action) {
         Some(TradeTick::new(
             instrument_id,
-            decode_price_or_undef(msg.price, price_precision),
+            decode_price_field(msg.price, price_precision, instrument_id, "price")?,
             decode_quantity(msg.size as u64),
             parse_aggressor_side(msg.side),
             TradeId::new(msg.sequence.format_into(&mut NumBuffer::new())),
@@ -449,8 +449,8 @@ pub fn decode_bbo_msg(
 
     let quote = QuoteTick::new(
         instrument_id,
-        decode_price_or_undef(top_level.bid_px, price_precision),
-        decode_price_or_undef(top_level.ask_px, price_precision),
+        decode_price_field(top_level.bid_px, price_precision, instrument_id, "bid_px")?,
+        decode_price_field(top_level.ask_px, price_precision, instrument_id, "ask_px")?,
         decode_quantity(top_level.bid_sz as u64),
         decode_quantity(top_level.ask_sz as u64),
         ts_event,
@@ -462,9 +462,11 @@ pub fn decode_bbo_msg(
 
 /// Decodes a Databento MBP10 (Market by Price 10 levels) message into an `OrderBookDepth`.
 ///
-/// # Errors
-///
-/// This function does not currently return an error; the result type matches the common decode API.
+/// This function does not return an error; the result type matches the common decode API.
+#[allow(
+    clippy::missing_errors_doc,
+    reason = "this decoder constructs the depth without fallible operations"
+)]
 pub fn decode_mbp10_msg(
     msg: &dbn::Mbp10Msg,
     instrument_id: InstrumentId,
@@ -482,7 +484,12 @@ pub fn decode_mbp10_msg(
         if level.bid_px != i64::MAX {
             bids[index] = BookOrder::new(
                 OrderSide::Buy,
-                decode_price_or_undef(level.bid_px, price_precision),
+                decode_price_field(
+                    level.bid_px,
+                    price_precision,
+                    instrument_id,
+                    "levels.bid_px",
+                )?,
                 decode_quantity(level.bid_sz as u64),
                 0,
             );
@@ -491,7 +498,12 @@ pub fn decode_mbp10_msg(
         if level.ask_px != i64::MAX {
             asks[index] = BookOrder::new(
                 OrderSide::Sell,
-                decode_price_or_undef(level.ask_px, price_precision),
+                decode_price_field(
+                    level.ask_px,
+                    price_precision,
+                    instrument_id,
+                    "levels.ask_px",
+                )?,
                 decode_quantity(level.ask_sz as u64),
                 0,
             );
@@ -541,8 +553,8 @@ pub fn decode_cmbp1_msg(
     let maybe_quote = if has_valid_bid_ask(top_level.bid_px, top_level.ask_px) {
         Some(QuoteTick::new(
             instrument_id,
-            decode_price_or_undef(top_level.bid_px, price_precision),
-            decode_price_or_undef(top_level.ask_px, price_precision),
+            decode_price_field(top_level.bid_px, price_precision, instrument_id, "bid_px")?,
+            decode_price_field(top_level.ask_px, price_precision, instrument_id, "ask_px")?,
             decode_quantity(top_level.bid_sz as u64),
             decode_quantity(top_level.ask_sz as u64),
             ts_event,
@@ -564,7 +576,7 @@ pub fn decode_cmbp1_msg(
         );
         Some(TradeTick::new(
             instrument_id,
-            decode_price_or_undef(msg.price, price_precision),
+            decode_price_field(msg.price, price_precision, instrument_id, "price")?,
             decode_quantity(msg.size as u64),
             parse_aggressor_side(msg.side),
             trade_id,
@@ -601,8 +613,8 @@ pub fn decode_cbbo_msg(
 
     let quote = QuoteTick::new(
         instrument_id,
-        decode_price_or_undef(top_level.bid_px, price_precision),
-        decode_price_or_undef(top_level.ask_px, price_precision),
+        decode_price_field(top_level.bid_px, price_precision, instrument_id, "bid_px")?,
+        decode_price_field(top_level.ask_px, price_precision, instrument_id, "ask_px")?,
         decode_quantity(top_level.bid_sz as u64),
         decode_quantity(top_level.ask_sz as u64),
         ts_event,
@@ -730,10 +742,10 @@ pub fn decode_ohlcv_msg(
 
     let bar = Bar::new(
         bar_type,
-        decode_price_or_undef(msg.open, price_precision),
-        decode_price_or_undef(msg.high, price_precision),
-        decode_price_or_undef(msg.low, price_precision),
-        decode_price_or_undef(msg.close, price_precision),
+        decode_price_field(msg.open, price_precision, instrument_id, "open")?,
+        decode_price_field(msg.high, price_precision, instrument_id, "high")?,
+        decode_price_field(msg.low, price_precision, instrument_id, "low")?,
+        decode_price_field(msg.close, price_precision, instrument_id, "close")?,
         decode_quantity(msg.volume),
         ts_event,
         ts_init,

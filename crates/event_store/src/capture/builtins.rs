@@ -39,8 +39,9 @@ use nautilus_common::{
     messages::{
         data::{
             BarsResponse, BookDeltasResponse, BookDepthResponse, BookResponse, CustomDataResponse,
-            DataCommand, DataResponse, FundingRatesResponse, InstrumentResponse,
-            InstrumentsResponse, OptionChainReferencePriceResponse, QuotesResponse, TradesResponse,
+            DataCommand, DataResponse, DataResponseEnvelope, FundingRatesResponse,
+            InstrumentResponse, InstrumentsResponse, OptionChainReferencePriceResponse,
+            QuotesResponse, TradesResponse,
         },
         execution::{
             BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ExecutionReport,
@@ -51,7 +52,7 @@ use nautilus_common::{
 };
 use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_model::{
-    data::DataType,
+    data::{DataType, InstrumentClose},
     events::{
         AccountState, OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied,
         OrderEmulated, OrderEventAny, OrderExpired, OrderFillVoided, OrderFilled, OrderInitialized,
@@ -148,6 +149,8 @@ pub const PAYLOAD_TYPE_POSITION_CLOSED: &str = "PositionClosed";
 pub const PAYLOAD_TYPE_POSITION_ADJUSTED: &str = "PositionAdjusted";
 /// The canonical `payload_type` tag for [`AccountState`].
 pub const PAYLOAD_TYPE_ACCOUNT_STATE: &str = "AccountState";
+/// The canonical `payload_type` tag for [`InstrumentClose`].
+pub const PAYLOAD_TYPE_INSTRUMENT_CLOSE: &str = "InstrumentClose";
 /// The canonical `payload_type` tag for [`TimeEvent`].
 pub const PAYLOAD_TYPE_TIME_EVENT: &str = "TimeEvent";
 
@@ -190,6 +193,8 @@ pub const PAYLOAD_TYPE_OPTION_CHAIN_REFERENCE_PRICE_RESPONSE: &str =
     "OptionChainReferencePriceResponse";
 /// The canonical `payload_type` tag for [`BarsResponse`].
 pub const PAYLOAD_TYPE_BARS_RESPONSE: &str = "BarsResponse";
+/// The canonical `payload_type` tag for [`DataResponseEnvelope`].
+pub const PAYLOAD_TYPE_DATA_RESPONSE_ENVELOPE: &str = "DataResponseEnvelope";
 
 // Wrapper-level fallback tag reached only when a dispatcher returns an
 // `EncodedPayload` without an override. Every current variant stamps its own
@@ -245,6 +250,7 @@ pub(crate) const DEFAULT_CAPTURE_PAYLOAD_TYPES: &[&str] = &[
     PAYLOAD_TYPE_POSITION_CLOSED,
     PAYLOAD_TYPE_POSITION_ADJUSTED,
     PAYLOAD_TYPE_ACCOUNT_STATE,
+    PAYLOAD_TYPE_INSTRUMENT_CLOSE,
     PAYLOAD_TYPE_TIME_EVENT,
     PAYLOAD_TYPE_REQUEST_COMMAND,
     PAYLOAD_TYPE_SUBSCRIBE_COMMAND,
@@ -266,6 +272,7 @@ pub(crate) const DEFAULT_CAPTURE_PAYLOAD_TYPES: &[&str] = &[
     PAYLOAD_TYPE_FUNDING_RATES_RESPONSE,
     PAYLOAD_TYPE_OPTION_CHAIN_REFERENCE_PRICE_RESPONSE,
     PAYLOAD_TYPE_BARS_RESPONSE,
+    PAYLOAD_TYPE_DATA_RESPONSE_ENVELOPE,
 ];
 
 /// Returns an [`EncoderRegistry`] preloaded with the default encoders.
@@ -333,6 +340,10 @@ pub fn register_default(registry: &mut EncoderRegistry) {
         payload_type(PAYLOAD_TYPE_ACCOUNT_STATE),
         encode_account_state,
     );
+    registry.register::<InstrumentClose, _>(
+        payload_type(PAYLOAD_TYPE_INSTRUMENT_CLOSE),
+        encode_instrument_close,
+    );
     registry.register::<TimeEvent, _>(payload_type(PAYLOAD_TYPE_TIME_EVENT), encode_time_event);
     registry
         .register::<DataCommand, _>(payload_type(PAYLOAD_TYPE_DATA_COMMAND), encode_data_command);
@@ -341,17 +352,14 @@ pub fn register_default(registry: &mut EncoderRegistry) {
         encode_data_response,
     );
 
+    registry.register::<DataResponseEnvelope, _>(
+        payload_type(PAYLOAD_TYPE_DATA_RESPONSE_ENVELOPE),
+        encode_response_envelope,
+    );
     register_default_headers(registry);
     register_default_identities(registry);
 }
 
-/// Attaches header extractors for every type that carries `correlation_id` or
-/// `causation_id` today.
-///
-/// Header propagation lands incrementally per the SPEC's workstream A: extractors only
-/// exist for types whose underlying struct has grown the fields. Other types fall back to
-/// the registry's no-op extractor, which yields [`Headers::empty`]; capture still works
-/// for them, the entry just carries no correlation metadata until the field set arrives.
 fn register_default_headers(registry: &mut EncoderRegistry) {
     registry.register_headers::<SubmitOrder, _>(extract_submit_order_headers);
     registry.register_headers::<SubmitOrderList, _>(extract_submit_order_list_headers);
@@ -365,6 +373,9 @@ fn register_default_headers(registry: &mut EncoderRegistry) {
     registry.register_headers::<TradingCommand, _>(extract_trading_command_headers);
     registry.register_headers::<DataCommand, _>(extract_data_command_headers);
     registry.register_headers::<DataResponse, _>(extract_data_response_headers);
+    registry.register_headers::<DataResponseEnvelope, _>(|response| {
+        headers_from_fields(Some(*response.correlation_id()), None)
+    });
 }
 
 /// Attaches identity extractors for the types production dispatch pushes through more
@@ -534,9 +545,9 @@ fn encode_serde<T: Serialize>(value: &T) -> Result<Bytes, EncodeError> {
 ///
 /// # Errors
 ///
-/// Returns [`EncodeError::Serialize`] when MessagePack rejects the payload (a malformed
-/// value the type system should make unrepresentable; surfaced rather than swallowed
-/// because the audit contract refuses to drop captured commands).
+/// Returns an error if MessagePack rejects the payload (a malformed value the type system should
+/// make unrepresentable; surfaced rather than swallowed because the audit contract refuses to drop
+/// captured commands).
 pub fn encode_submit_order(message: &SubmitOrder) -> Result<EncodedPayload, EncodeError> {
     let payload = encode_serde(message)?;
     let index_keys = vec![IndexKey::new(
@@ -551,7 +562,7 @@ pub fn encode_submit_order(message: &SubmitOrder) -> Result<EncodedPayload, Enco
 ///
 /// # Errors
 ///
-/// Returns [`EncodeError::Serialize`] when MessagePack rejects the payload.
+/// Returns an error if MessagePack rejects the payload.
 pub fn encode_order_filled(message: &OrderFilled) -> Result<EncodedPayload, EncodeError> {
     let payload = encode_serde(message)?;
     let index_keys = vec![
@@ -573,9 +584,8 @@ pub fn encode_order_filled(message: &OrderFilled) -> Result<EncodedPayload, Enco
 ///
 /// # Errors
 ///
-/// Returns the inner encoder's [`EncodeError`] for the [`TradingCommand::SubmitOrder`]
-/// variant; other variants return [`EncodeError::Serialize`] when MessagePack rejects the
-/// inner payload.
+/// Returns an error if the inner encoder rejects the [`TradingCommand::SubmitOrder`] variant, or if
+/// MessagePack rejects the inner payload for another variant.
 pub fn encode_trading_command(command: &TradingCommand) -> Result<EncodedPayload, EncodeError> {
     match command {
         TradingCommand::SubmitOrder(cmd) => {
@@ -599,9 +609,8 @@ pub fn encode_trading_command(command: &TradingCommand) -> Result<EncodedPayload
 ///
 /// # Errors
 ///
-/// Returns the inner encoder's [`EncodeError`] for the [`OrderEventAny::Filled`] variant;
-/// other variants return [`EncodeError::Serialize`] when MessagePack rejects the inner
-/// payload.
+/// Returns an error if the inner encoder rejects the [`OrderEventAny::Filled`] variant, or if
+/// MessagePack rejects the inner payload for another variant.
 pub fn encode_order_event_any(event: &OrderEventAny) -> Result<EncodedPayload, EncodeError> {
     match event {
         OrderEventAny::Initialized(e) => encode_order_initialized(e),
@@ -638,8 +647,7 @@ pub fn encode_order_event_any(event: &OrderEventAny) -> Result<EncodedPayload, E
 ///
 /// # Errors
 ///
-/// Returns the inner encoder's [`EncodeError`] when MessagePack rejects the inner
-/// payload.
+/// Returns an error if MessagePack rejects the inner payload.
 pub fn encode_execution_report(report: &ExecutionReport) -> Result<EncodedPayload, EncodeError> {
     match report {
         ExecutionReport::Order(r) => Ok(retag(
@@ -658,7 +666,7 @@ pub fn encode_execution_report(report: &ExecutionReport) -> Result<EncodedPayloa
 ///
 /// # Errors
 ///
-/// Returns [`EncodeError::Serialize`] when MessagePack rejects the payload.
+/// Returns an error if MessagePack rejects the payload.
 pub fn encode_fill_report(report: &FillReport) -> Result<EncodedPayload, EncodeError> {
     let payload = encode_serde(report)?;
     let mut index_keys = Vec::with_capacity(2);
@@ -690,7 +698,7 @@ pub fn encode_fill_report(report: &FillReport) -> Result<EncodedPayload, EncodeE
 ///
 /// # Errors
 ///
-/// Returns [`EncodeError::Serialize`] when MessagePack rejects the payload.
+/// Returns an error if MessagePack rejects the payload.
 pub fn encode_position_status_report(
     report: &PositionStatusReport,
 ) -> Result<EncodedPayload, EncodeError> {
@@ -837,8 +845,7 @@ fn push_unique_index_key(
 ///
 /// # Errors
 ///
-/// Returns the inner encoder's [`EncodeError`] when MessagePack rejects the inner
-/// payload.
+/// Returns an error if MessagePack rejects the inner payload.
 pub fn encode_position_event(event: &PositionEvent) -> Result<EncodedPayload, EncodeError> {
     match event {
         PositionEvent::PositionOpened(e) => encode_position_opened(e),
@@ -1191,7 +1198,7 @@ fn retag(mut encoded: EncodedPayload, tag: &str) -> EncodedPayload {
 ///
 /// # Errors
 ///
-/// Returns [`EncodeError::Serialize`] when MessagePack rejects the payload.
+/// Returns an error if MessagePack rejects the payload.
 pub fn encode_order_status_report(
     message: &OrderStatusReport,
 ) -> Result<EncodedPayload, EncodeError> {
@@ -1220,8 +1227,21 @@ pub fn encode_order_status_report(
 ///
 /// # Errors
 ///
-/// Returns [`EncodeError::Serialize`] when MessagePack rejects the payload.
+/// Returns an error if MessagePack rejects the payload.
 pub fn encode_account_state(message: &AccountState) -> Result<EncodedPayload, EncodeError> {
+    let payload = encode_serde(message)?;
+    Ok(EncodedPayload::new(payload, Vec::new()))
+}
+
+/// Encodes an [`InstrumentClose`] into canonical bytes with no sidecar indices.
+///
+/// Cache replay applies a captured contract expiration through the same settlement as the live
+/// execution engine, so a restore keeps settled binary-option positions closed.
+///
+/// # Errors
+///
+/// Returns an error if MessagePack rejects the payload.
+pub fn encode_instrument_close(message: &InstrumentClose) -> Result<EncodedPayload, EncodeError> {
     let payload = encode_serde(message)?;
     Ok(EncodedPayload::new(payload, Vec::new()))
 }
@@ -1242,7 +1262,7 @@ struct TimeEventPayload<'a> {
 ///
 /// # Errors
 ///
-/// Returns [`EncodeError::Serialize`] when MessagePack rejects the payload.
+/// Returns an error if MessagePack rejects the payload.
 pub fn encode_time_event(event: &TimeEvent) -> Result<EncodedPayload, EncodeError> {
     let payload = TimeEventPayload {
         name: event.name.as_str(),
@@ -1267,8 +1287,8 @@ pub fn encode_time_event(event: &TimeEvent) -> Result<EncodedPayload, EncodeErro
 ///
 /// # Errors
 ///
-/// Returns [`EncodeError::Serialize`] when MessagePack rejects the inner payload, or
-/// when a future non-exhaustive [`DataCommand`] variant has no encoder yet.
+/// Returns an error if MessagePack rejects the inner payload, or when a future non-exhaustive
+/// [`DataCommand`] variant has no encoder yet.
 #[rustfmt::skip]
 pub fn encode_data_command(command: &DataCommand) -> Result<EncodedPayload, EncodeError> {
     match command {
@@ -1324,8 +1344,7 @@ fn encode_data_command_category<T: Serialize>(
 ///
 /// # Errors
 ///
-/// Returns the inner encoder's [`EncodeError`] when MessagePack rejects the inner
-/// payload.
+/// Returns an error if MessagePack rejects the inner payload.
 pub fn encode_data_response(response: &DataResponse) -> Result<EncodedPayload, EncodeError> {
     match response {
         DataResponse::Data(resp) => encode_custom_data_response(resp),
@@ -1342,6 +1361,33 @@ pub fn encode_data_response(response: &DataResponse) -> Result<EncodedPayload, E
         }
         DataResponse::Bars(resp) => encode_bars_response(resp),
     }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct ResponseEnvelopeCapture {
+    pub(crate) correlation_id: UUID4,
+    pub(crate) completed: bool,
+    pub(crate) sub_correlation_id: Option<UUID4>,
+    pub(crate) failure_reason: Option<String>,
+    pub(crate) payload_type: Option<PayloadType>,
+    pub(crate) payload: Option<Bytes>,
+}
+
+fn encode_response_envelope(
+    response: &DataResponseEnvelope,
+) -> Result<EncodedPayload, EncodeError> {
+    let payload = response.response().map(encode_data_response).transpose()?;
+
+    let capture = ResponseEnvelopeCapture {
+        correlation_id: *response.correlation_id(),
+        completed: response.completed(),
+        sub_correlation_id: response.sub_correlation_id(),
+        failure_reason: response.failure_reason().map(str::to_owned),
+        payload_type: payload.as_ref().and_then(|value| value.payload_type),
+        payload: payload.map(|value| value.payload),
+    };
+
+    Ok(EncodedPayload::without_indices(encode_serde(&capture)?))
 }
 
 fn encode_custom_data_response(
@@ -1520,8 +1566,8 @@ mod tests {
     use nautilus_model::{
         data::{Bar, BarType, stubs::stub_depth10},
         enums::{
-            AccountType, BookType, LiquiditySide, OrderSide, OrderStatus, OrderType,
-            PositionAdjustmentType, PositionSide, TimeInForce,
+            AccountType, BookType, InstrumentCloseType, LiquiditySide, OrderSide, OrderStatus,
+            OrderType, PositionAdjustmentType, PositionSide, TimeInForce,
         },
         events::{
             PositionAdjusted, PositionChanged, PositionClosed, PositionOpened,
@@ -1714,6 +1760,10 @@ mod tests {
                 registry.contains::<AccountState>(),
             ),
             (
+                "data.close.* publish_any / InstrumentClose",
+                registry.contains::<InstrumentClose>(),
+            ),
+            (
                 "time event handler firing / TimeEvent",
                 registry.contains::<TimeEvent>(),
             ),
@@ -1724,6 +1774,10 @@ mod tests {
             (
                 "send_data_response / DataResponse",
                 registry.contains::<DataResponse>(),
+            ),
+            (
+                "send_response_envelope / DataResponseEnvelope",
+                registry.contains::<DataResponseEnvelope>(),
             ),
         ];
         let missing: Vec<&str> = expected
@@ -2795,12 +2849,12 @@ mod tests {
             opening_order_id: opening_order_id(),
             entry: OrderSide::Buy,
             side: PositionSide::Long,
-            signed_qty: 1.0,
+            signed_qty: 1.into(),
             quantity: Quantity::from("1"),
             last_qty: Quantity::from("1"),
             last_px: Price::from("100.00"),
             currency: Currency::USDT(),
-            avg_px_open: 100.0,
+            avg_px_open: 100.into(),
             realized_pnl: Some(Money::new(-0.1, Currency::USDT())),
             event_id: UUID4::new(),
             ts_event: UnixNanos::from(70),
@@ -2818,13 +2872,13 @@ mod tests {
             opening_order_id: opening_order_id(),
             entry: OrderSide::Buy,
             side: PositionSide::Long,
-            signed_qty: 2.0,
+            signed_qty: 2.into(),
             quantity: Quantity::from("2"),
             peak_quantity: Quantity::from("2"),
             last_qty: Quantity::from("1"),
             last_px: Price::from("101.00"),
             currency: Currency::USDT(),
-            avg_px_open: 100.5,
+            avg_px_open: "100.5".parse().unwrap(),
             avg_px_close: None,
             realized_return: 0.0,
             realized_pnl: None,
@@ -2847,14 +2901,14 @@ mod tests {
             closing_order_id: Some(closing_order_id()),
             entry: OrderSide::Buy,
             side: PositionSide::Flat,
-            signed_qty: 0.0,
+            signed_qty: 0.into(),
             quantity: Quantity::from("0"),
             peak_quantity: Quantity::from("2"),
             last_qty: Quantity::from("2"),
             last_px: Price::from("102.00"),
             currency: Currency::USDT(),
-            avg_px_open: 100.5,
-            avg_px_close: Some(102.0),
+            avg_px_open: "100.5".parse().unwrap(),
+            avg_px_close: Some(102.into()),
             realized_return: 0.015,
             realized_pnl: Some(Money::new(3.0, Currency::USDT())),
             unrealized_pnl: Money::new(0.0, Currency::USDT()),
@@ -3089,6 +3143,29 @@ mod tests {
         assert!(encoded.index_keys.is_empty());
     }
 
+    #[rstest]
+    fn instrument_close_registered_under_canonical_payload_type() {
+        let registry = default_registry();
+
+        let close = InstrumentClose::new(
+            InstrumentId::from("TOKEN-YES.POLYMARKET"),
+            Price::from("1.000"),
+            InstrumentCloseType::ContractExpired,
+            UnixNanos::from(300),
+            UnixNanos::from(301),
+        );
+
+        let (tag, encoded) = registry
+            .encode(&close)
+            .expect("encode")
+            .expect("registered");
+        let decoded: InstrumentClose = rmp_serde::from_slice(&encoded.payload).expect("decode");
+
+        assert_eq!(tag.as_str(), PAYLOAD_TYPE_INSTRUMENT_CLOSE);
+        assert!(encoded.index_keys.is_empty());
+        assert_eq!(decoded, close);
+    }
+
     #[derive(Debug, Deserialize, PartialEq, Eq)]
     struct DecodedTimeEventPayload {
         name: String,
@@ -3158,7 +3235,7 @@ mod tests {
         match (decoded, request) {
             (RequestCommand::Quotes(decoded), RequestCommand::Quotes(expected)) => {
                 assert_eq!(decoded.request_id, expected.request_id);
-                assert_eq!(decoded.instrument_id, expected.instrument_id);
+                assert_eq!(decoded.instrument_ids, expected.instrument_ids);
             }
             other => panic!("expected RequestCommand::Quotes round trip, was {other:?}"),
         }
@@ -3180,7 +3257,7 @@ mod tests {
         match (decoded, subscribe) {
             (SubscribeCommand::Quotes(decoded), SubscribeCommand::Quotes(expected)) => {
                 assert_eq!(decoded.command_id, expected.command_id);
-                assert_eq!(decoded.instrument_id, expected.instrument_id);
+                assert_eq!(decoded.instrument_ids, expected.instrument_ids);
             }
             other => panic!("expected SubscribeCommand::Quotes round trip, was {other:?}"),
         }
@@ -3202,7 +3279,7 @@ mod tests {
         match (decoded, unsubscribe) {
             (UnsubscribeCommand::Quotes(decoded), UnsubscribeCommand::Quotes(expected)) => {
                 assert_eq!(decoded.command_id, expected.command_id);
-                assert_eq!(decoded.instrument_id, expected.instrument_id);
+                assert_eq!(decoded.instrument_ids, expected.instrument_ids);
             }
             other => panic!("expected UnsubscribeCommand::Quotes round trip, was {other:?}"),
         }
@@ -3518,7 +3595,7 @@ mod tests {
         OptionChainReferencePriceResponse::new(
             correlation_id(),
             client_id(),
-            OptionSeriesId::new(
+            OptionSeriesId::new_derived(
                 venue(),
                 Ustr::from("BTC"),
                 Ustr::from("BTC"),
@@ -3633,7 +3710,7 @@ mod tests {
         let decoded: BookDepthResponse = rmp_serde::from_slice(&encoded.payload).expect("decode");
         assert_eq!(decoded.correlation_id, response.correlation_id);
         assert_eq!(decoded.instrument_id, response.instrument_id);
-        assert_eq!(decoded.data, response.data);
+        assert_eq!(decoded.data.as_ref(), response.data.as_ref());
     }
 
     #[rstest]
@@ -3650,8 +3727,8 @@ mod tests {
 
         let decoded: QuotesResponse = rmp_serde::from_slice(&encoded.payload).expect("decode");
         assert_eq!(decoded.correlation_id, response.correlation_id);
-        assert_eq!(decoded.instrument_id, response.instrument_id);
-        assert_eq!(decoded.data, response.data);
+        assert_eq!(decoded.instrument_ids, response.instrument_ids);
+        assert_eq!(decoded.data.as_ref(), response.data.as_ref());
     }
 
     #[rstest]
@@ -4046,7 +4123,7 @@ mod tests {
 
     fn make_quotes_request() -> RequestQuotes {
         RequestQuotes {
-            instrument_id: InstrumentId::from("EUR/USD.SIM"),
+            instrument_ids: vec![InstrumentId::from("EUR/USD.SIM")],
             start: None,
             end: None,
             limit: None,

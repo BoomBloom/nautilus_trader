@@ -40,13 +40,13 @@ use serde_json::json;
 
 const TRADER_ID: &str = "TESTER-001";
 const NODE_NAME: &str = "DATABENTO-TESTER-001";
-const INSTRUMENT_ID: &str = "ESZ6.XCME";
+const INSTRUMENT_ID: &str = "ESZ26.XCME";
 const PRICE_PRECISION: Option<u8> = None;
 
 const PRICE_PRECISION_PARAM: &str = "price_precision";
 
 // Alternative instrument with a price-precision override:
-// const INSTRUMENT_ID: &str = "6EM6.XCME";
+// const INSTRUMENT_ID: &str = "6EM26.XCME";
 // const PRICE_PRECISION: Option<u8> = Some(5);
 
 #[tokio::main]
@@ -88,9 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Databento applies the price-precision override through subscription params.
     let subscribe_params = PRICE_PRECISION.map(|price_precision| {
-        let mut params = Params::new();
-        params.insert(PRICE_PRECISION_PARAM.to_string(), json!(price_precision));
-        params
+        Params::new([(PRICE_PRECISION_PARAM.to_string(), json!(price_precision))].into())
     });
 
     let tester_config = DataTesterConfig::builder()

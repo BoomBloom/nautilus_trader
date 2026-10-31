@@ -15,6 +15,7 @@ __all__ = [
     "FeeModel",
     "FillModel",
     "FixedFeeModel",
+    "LatencyModel",
     "LimitOrderPartialFillModel",
     "MakerTakerFeeModel",
     "MarketHoursFillModel",
@@ -41,9 +42,11 @@ class BestPriceFillModel:
 class CappedOptionFeeModel(FeeModel):
     def __new__(
         cls,
-        maker_rate: decimal.Decimal | None = None,
-        taker_rate: decimal.Decimal | None = None,
+        maker_rate: decimal.Decimal,
+        taker_rate: decimal.Decimal,
         cap_rate: decimal.Decimal | None = None,
+        overrides: typing.Mapping[model.InstrumentId, tuple[decimal.Decimal, decimal.Decimal]]
+        | None = None,
     ) -> typing.Self: ...
     def get_commission(
         self,
@@ -150,7 +153,7 @@ class FeeModel:
     ) -> model.Money: ...
 
 class FillModel:
-    def __init__(self) -> None: ...
+    def __new__(cls, *_args: typing.Any, **_kwargs: typing.Any) -> typing.Self: ...
     def is_limit_filled(self) -> bool: ...
     def is_slipped(self) -> bool: ...
     def fill_limit_inside_spread(self) -> bool: ...
@@ -158,8 +161,8 @@ class FillModel:
         self,
         _instrument: typing.Any,
         _order: typing.Any,
-        _best_bid: model.Price,
-        _best_ask: model.Price,
+        _best_bid: model.Price | None = ...,
+        _best_ask: model.Price | None = ...,
     ) -> model.OrderBook | None: ...
 
 @typing.final
@@ -178,6 +181,12 @@ class FixedFeeModel(FeeModel):
         instrument: typing.Any,
     ) -> model.Money: ...
 
+class LatencyModel:
+    def __new__(cls, *_args: typing.Any, **_kwargs: typing.Any) -> typing.Self: ...
+    def get_insert_latency(self, _command: typing.Any, _ts_now: int) -> int: ...
+    def get_update_latency(self, _command: typing.Any, _ts_now: int) -> int: ...
+    def get_delete_latency(self, _command: typing.Any, _ts_now: int) -> int: ...
+
 @typing.final
 class LimitOrderPartialFillModel:
     def __init__(
@@ -186,7 +195,13 @@ class LimitOrderPartialFillModel:
 
 @typing.final
 class MakerTakerFeeModel(FeeModel):
-    def __new__(cls) -> typing.Self: ...
+    def __new__(
+        cls,
+        maker_rate: decimal.Decimal,
+        taker_rate: decimal.Decimal,
+        overrides: typing.Mapping[model.InstrumentId, tuple[decimal.Decimal, decimal.Decimal]]
+        | None = None,
+    ) -> typing.Self: ...
     def get_commission(
         self,
         order: typing.Any,
@@ -232,7 +247,13 @@ class ProbabilisticFillModel:
 
 @typing.final
 class ProbabilityPriceFeeModel(FeeModel):
-    def __new__(cls) -> typing.Self: ...
+    def __new__(
+        cls,
+        maker_rate: decimal.Decimal,
+        taker_rate: decimal.Decimal,
+        overrides: typing.Mapping[model.InstrumentId, tuple[decimal.Decimal, decimal.Decimal]]
+        | None = None,
+    ) -> typing.Self: ...
     def get_commission(
         self,
         order: typing.Any,
@@ -266,7 +287,11 @@ class ThreeTierFillModel:
 @typing.final
 class TieredNotionalOptionFeeModel(FeeModel):
     def __new__(
-        cls, maker_rate: decimal.Decimal | None = None, taker_rate: decimal.Decimal | None = None
+        cls,
+        maker_rate: decimal.Decimal,
+        taker_rate: decimal.Decimal,
+        overrides: typing.Mapping[model.InstrumentId, tuple[decimal.Decimal, decimal.Decimal]]
+        | None = None,
     ) -> typing.Self: ...
     def get_commission(
         self,

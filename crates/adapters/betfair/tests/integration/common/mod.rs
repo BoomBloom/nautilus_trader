@@ -31,15 +31,15 @@ use axum::{
     Router,
     body::Bytes,
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use nautilus_betfair::{
     common::{
         consts::{
-            METHOD_CANCEL_ORDERS, METHOD_LIST_MARKET_CATALOGUE, METHOD_PLACE_ORDERS,
-            METHOD_REPLACE_ORDERS,
+            METHOD_CANCEL_ORDERS, METHOD_LIST_CURRENT_ORDERS, METHOD_LIST_EVENTS,
+            METHOD_LIST_MARKET_CATALOGUE, METHOD_PLACE_ORDERS, METHOD_REPLACE_ORDERS,
         },
         credential::BetfairCredential,
     },
@@ -157,6 +157,8 @@ pub(crate) struct MockState {
     pub keep_alive_count: Arc<AtomicUsize>,
     pub betting_request_count: Arc<AtomicUsize>,
     pub betting_overrides: Arc<Mutex<HashMap<String, Value>>>,
+    pub betting_current_orders: Arc<Mutex<Option<Vec<Value>>>>,
+    pub betting_current_orders_returned: Arc<AtomicUsize>,
     pub betting_response_sequences: Arc<Mutex<HashMap<String, VecDeque<Value>>>>,
     /// Forces the betting endpoint to return a complete JSON-RPC error response for a method.
     pub betting_error_overrides: Arc<Mutex<HashMap<String, Value>>>,
@@ -184,6 +186,8 @@ pub(crate) struct MockState {
     pub accounts_overrides: Arc<Mutex<HashMap<String, Value>>>,
     pub accounts_error_overrides: Arc<Mutex<HashMap<String, Value>>>,
     pub login_response_override: Arc<Mutex<Option<String>>>,
+    pub cert_login_requests: Arc<Mutex<Vec<(HeaderMap, Bytes)>>>,
+    pub identity_response_gate: Arc<Mutex<Option<MockResponseGate>>>,
     pub keep_alive_response_override: Arc<Mutex<Option<String>>>,
     pub keep_alive_status_override: Arc<Mutex<Option<u16>>>,
     state_tx: watch::Sender<u64>,
@@ -236,6 +240,8 @@ impl Default for MockState {
             keep_alive_count: Arc::default(),
             betting_request_count: Arc::default(),
             betting_overrides: Arc::default(),
+            betting_current_orders: Arc::default(),
+            betting_current_orders_returned: Arc::default(),
             betting_response_sequences: Arc::default(),
             betting_error_overrides: Arc::default(),
             betting_error_one_shot_overrides: Arc::default(),
@@ -251,6 +257,8 @@ impl Default for MockState {
             accounts_overrides: Arc::default(),
             accounts_error_overrides: Arc::default(),
             login_response_override: Arc::default(),
+            cert_login_requests: Arc::default(),
+            identity_response_gate: Arc::default(),
             keep_alive_response_override: Arc::default(),
             keep_alive_status_override: Arc::default(),
             state_tx,
@@ -309,6 +317,24 @@ async fn handle_login(State(state): State<MockState>) -> impl IntoResponse {
     )
 }
 
+async fn handle_cert_login(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    state.cert_login_requests.lock().push((headers, body));
+    let response = state
+        .login_response_override
+        .lock()
+        .clone()
+        .unwrap_or_else(|| load_fixture("rest/cert_login.json"));
+    wait_identity_response_gate(&state, "certlogin").await;
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        response,
+    )
+}
+
 async fn handle_keep_alive(State(state): State<MockState>) -> Response {
     state.keep_alive_count.fetch_add(1, Ordering::Relaxed);
     state.publish();
@@ -322,12 +348,24 @@ async fn handle_keep_alive(State(state): State<MockState>) -> Response {
         .lock()
         .map(|status| StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
         .unwrap_or(StatusCode::OK);
+    wait_identity_response_gate(&state, "keepAlive").await;
     (
         status,
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         body,
     )
         .into_response()
+}
+
+async fn wait_identity_response_gate(state: &MockState, method: &str) {
+    let gate = state.identity_response_gate.lock().clone();
+    if let Some(gate) = gate
+        && gate.method == method
+    {
+        gate.waiters.fetch_add(1, Ordering::Relaxed);
+        state.publish();
+        gate.semaphore.acquire().await.unwrap().forget();
+    }
 }
 
 async fn handle_navigation() -> impl IntoResponse {
@@ -429,14 +467,22 @@ async fn handle_betting(State(state): State<MockState>, body: Bytes) -> Response
     }
     let override_result = state.betting_overrides.lock().get(method).cloned();
 
-    let result = if let Some(value) = sequence_result.or(override_result) {
+    let override_result = sequence_result
+        .or(override_result)
+        .or_else(|| betting_order_discovery_result(&state, method, &params));
+
+    let result = if let Some(value) = override_result {
         value
     } else {
         match method {
+            METHOD_LIST_MARKET_CATALOGUE if params["filter"]["bspOnly"] == true => {
+                serde_json::json!([])
+            }
             METHOD_LIST_MARKET_CATALOGUE => {
                 let fixture = load_fixture("rest/betting_list_market_catalogue.json");
                 serde_json::from_str::<Value>(&fixture).unwrap()
             }
+            METHOD_LIST_EVENTS => serde_json::json!([]),
             METHOD_PLACE_ORDERS => {
                 let fixture = load_fixture("rest/betting_place_order_success.json");
                 let v: Value = serde_json::from_str(&fixture).unwrap();
@@ -462,6 +508,115 @@ async fn handle_betting(State(state): State<MockState>, body: Bytes) -> Response
         "result": result,
     });
     axum::Json(response).into_response()
+}
+
+fn betting_order_discovery_result(
+    state: &MockState,
+    method: &str,
+    params: &Value,
+) -> Option<Value> {
+    let orders = state.betting_current_orders.lock();
+    let orders = orders.as_ref()?;
+
+    match method {
+        METHOD_LIST_CURRENT_ORDERS => {
+            let result = list_current_orders_result(orders, params);
+            state.betting_current_orders_returned.fetch_add(
+                result["currentOrders"].as_array().unwrap().len(),
+                Ordering::Relaxed,
+            );
+            state.publish();
+            Some(result)
+        }
+        METHOD_LIST_MARKET_CATALOGUE if params["filter"]["bspOnly"] == true => {
+            Some(bsp_market_catalogues(orders, params))
+        }
+        METHOD_LIST_EVENTS => Some(
+            if bsp_market_catalogues(orders, params)
+                .as_array()
+                .is_some_and(|markets| !markets.is_empty())
+            {
+                serde_json::json!([{"event": {"id": "bsp-event"}}])
+            } else {
+                serde_json::json!([])
+            },
+        ),
+        _ => None,
+    }
+}
+
+fn bsp_market_catalogues(orders: &[Value], params: &Value) -> Value {
+    let filter = &params["filter"];
+    let mut market_ids = Vec::new();
+
+    for order in orders {
+        let is_bsp = matches!(
+            order["orderType"].as_str(),
+            Some("MARKET_ON_CLOSE" | "LIMIT_ON_CLOSE")
+        );
+
+        if !is_bsp
+            || filter["bspOnly"] != true
+            || filter["withOrders"]
+                .as_array()
+                .is_none_or(|statuses| !statuses.iter().any(|status| status == &order["status"]))
+            || filter["marketIds"]
+                .as_array()
+                .is_some_and(|ids| !ids.iter().any(|id| id == &order["marketId"]))
+            || filter["eventIds"]
+                .as_array()
+                .is_some_and(|ids| !ids.iter().any(|id| id == "bsp-event"))
+            || market_ids.contains(&order["marketId"])
+        {
+            continue;
+        }
+
+        market_ids.push(order["marketId"].clone());
+    }
+
+    market_ids.sort_by(|first, second| first.as_str().cmp(&second.as_str()));
+    let limit = params["maxResults"].as_u64().unwrap_or(u64::MAX) as usize;
+    Value::Array(
+        market_ids
+            .into_iter()
+            .take(limit)
+            .map(|market_id| serde_json::json!({"marketId": market_id, "marketName": "BSP market"}))
+            .collect(),
+    )
+}
+
+fn list_current_orders_result(orders: &[Value], params: &Value) -> Value {
+    let selected: Vec<_> = orders
+        .iter()
+        .filter(|order| {
+            params["orderProjection"] != "EXECUTABLE" || order["status"] == "EXECUTABLE"
+        })
+        .filter(|order| {
+            [
+                ("betIds", "betId"),
+                ("marketIds", "marketId"),
+                ("customerOrderRefs", "customerOrderRef"),
+            ]
+            .iter()
+            .all(|(parameter, field)| {
+                params[parameter]
+                    .as_array()
+                    .is_none_or(|values| values.contains(&order[field]))
+            })
+        })
+        .collect();
+
+    let from_record = params["fromRecord"].as_u64().unwrap_or(0) as usize;
+    let record_count = params["recordCount"].as_u64().unwrap_or(1000) as usize;
+    let page: Vec<_> = selected
+        .iter()
+        .skip(from_record)
+        .take(record_count)
+        .collect();
+    serde_json::json!({
+        "moreAvailable": from_record + page.len() < selected.len(),
+        "currentOrders": page,
+    })
 }
 
 async fn handle_accounts(State(state): State<MockState>, body: Bytes) -> impl IntoResponse {
@@ -624,6 +779,8 @@ pub(crate) async fn start_mock_http() -> (SocketAddr, MockState) {
 
     let router = Router::new()
         .route("/login", post(handle_login))
+        .route("/api/certlogin", post(handle_cert_login))
+        .route("/api/keepAlive", post(handle_keep_alive))
         .route("/keepAlive", post(handle_keep_alive))
         .route("/betting", post(handle_betting))
         .route("/accounts", post(handle_accounts))

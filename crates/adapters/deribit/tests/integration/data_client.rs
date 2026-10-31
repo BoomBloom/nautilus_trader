@@ -45,31 +45,23 @@ use nautilus_common::{
     messages::{
         DataEvent, DataResponse, SystemEvent,
         data::{
-            InstrumentResponse, RequestCustomData, RequestInstrument,
-            RequestOptionChainReferencePrice, SubscribeBars, SubscribeBookDeltas,
-            SubscribeBookDepth, SubscribeFundingRates, SubscribeIndexPrices, SubscribeMarkPrices,
-            SubscribeOptionGreeks, SubscribeQuotes, SubscribeTrades, UnsubscribeTrades,
+            InstrumentResponse, RequestBars, RequestBookSnapshot, RequestCustomData,
+            RequestInstrument, RequestOptionChainReferencePrice, RequestTrades, SubscribeBars,
+            SubscribeBookDeltas, SubscribeBookDepth, SubscribeFundingRates, SubscribeIndexPrices,
+            SubscribeMarkPrices, SubscribeOptionGreeks, SubscribeQuotes, SubscribeTrades,
+            SubscriptionError, UnsubscribeTrades,
         },
         system::SocketState,
     },
     testing::wait_until_async,
 };
 use nautilus_core::{Params, UUID4, UnixNanos, time::get_atomic_clock_realtime};
-use nautilus_deribit::{
-    common::{
-        consts::{DERIBIT_CLIENT_ID, DERIBIT_VENUE},
-        enums::DeribitEnvironment,
-    },
-    config::DeribitDataClientConfig,
-    data::DeribitDataClient,
-    data_types::DeribitBookSummary,
-    http::models::DeribitProductType,
-};
 use nautilus_live::{SocketReconnectRegistry, SocketReconnectRequestOutcome};
 use nautilus_model::{
     data::{BarType, CustomData, Data, DataType, TradeTick},
     enums::BookType,
     identifiers::{InstrumentId, OptionSeriesId},
+    instruments::{Instrument, InstrumentAny},
     types::Price,
 };
 use nautilus_network::http::HttpClient;
@@ -79,6 +71,17 @@ use rstest::rstest;
 use rust_decimal_macros::dec;
 use serde_json::{Value, json};
 use ustr::Ustr;
+
+use crate::{
+    common::{
+        consts::{DERIBIT_CLIENT_ID, DERIBIT_VENUE},
+        enums::DeribitEnvironment,
+    },
+    config::DeribitDataClientConfig,
+    data::DeribitDataClient,
+    data_types::DeribitBookSummary,
+    http::models::DeribitProductType,
+};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -151,6 +154,17 @@ fn instrument_response(events: &[DataEvent]) -> Option<&InstrumentResponse> {
     })
 }
 
+fn book_payload_for_channel(raw_snapshot: &Value, channel: &str) -> Value {
+    let mut payload = if channel.split('.').count() == 5 {
+        load_json("ws_book_grouped_snapshot.json")
+    } else {
+        raw_snapshot.clone()
+    };
+
+    payload["params"]["channel"] = json!(channel);
+    payload
+}
+
 fn trade_payload_for_channel(base_payload: &Value, channel: &str, has_combo_parent: bool) -> Value {
     let symbol = trade_symbol_from_channel(channel)
         .expect("trade channel must use trades.{instrument}.{interval} format");
@@ -197,6 +211,16 @@ struct TestServerState {
     get_instrument_request_count: Arc<AtomicUsize>,
     ticker_requests: Arc<tokio::sync::Mutex<Vec<String>>>,
     ticker_response: Arc<tokio::sync::Mutex<Option<Value>>>,
+    // When set, public/get_instruments responds with this body instead of the fixture.
+    instruments_response: Arc<tokio::sync::Mutex<Option<Value>>>,
+    // When set, public/get_instruments waits for a permit after counting the request.
+    instruments_gate: Arc<tokio::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>>,
+    get_instruments_request_count: Arc<AtomicUsize>,
+    // When true, public/get_combos responds with a JSON-RPC error.
+    fail_get_combos: Arc<AtomicBool>,
+    // When true, WebSocket upgrades are refused, holding the client in reconnect.
+    reject_ws_upgrades: Arc<AtomicBool>,
+    rejected_ws_upgrades: Arc<AtomicUsize>,
 }
 
 #[derive(Default)]
@@ -258,8 +282,13 @@ async fn handle_jsonrpc_request(
     let params = request.get("params").cloned();
 
     match method {
-        "public/get_instruments" => handle_get_instruments(id, params).await,
-        "public/get_combos" => handle_get_combos(id).await,
+        "public/get_instruments" => handle_get_instruments(&state, id, params).await,
+        "public/get_combos" => handle_get_combos(&state, id).await,
+        "public/get_order_book" => {
+            let mut data = load_json("http_get_order_book.json");
+            data["id"] = json!(id);
+            Json(data).into_response()
+        }
         "public/get_book_summary_by_currency" => {
             let mut data = load_json("http_get_book_summary_by_currency.json");
             data["id"] = json!(id);
@@ -310,6 +339,16 @@ async fn handle_jsonrpc_request(
             // payload rather than always receiving the BTC-PERPETUAL fixture
             if instrument_name == "BTC-COMBO-1" {
                 return handle_get_combo_instrument(id).await;
+            }
+
+            if instrument_name == "BTC_USDC" {
+                return Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": load_json("http_get_instrument_routed_spot.json"),
+                    "usOut": 1_787_011_200_000_000_u64,
+                }))
+                .into_response();
             }
 
             let fixture =
@@ -367,7 +406,17 @@ async fn handle_get_combo_instrument(id: u64) -> Response {
     .into_response()
 }
 
-async fn handle_get_combos(id: u64) -> Response {
+async fn handle_get_combos(state: &TestServerState, id: u64) -> Response {
+    if state.fail_get_combos.load(Ordering::Relaxed) {
+        return Json(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": 10000, "message": "temporary combos failure"},
+            "testnet": true
+        }))
+        .into_response();
+    }
+
     Json(json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -398,7 +447,43 @@ async fn handle_get_combos(id: u64) -> Response {
     .into_response()
 }
 
-async fn handle_get_instruments(id: u64, params: Option<Value>) -> Response {
+async fn handle_get_instruments(
+    state: &TestServerState,
+    id: u64,
+    params: Option<Value>,
+) -> Response {
+    let response = state.instruments_response.lock().await.clone();
+    let gate = state.instruments_gate.lock().await.clone();
+    state
+        .get_instruments_request_count
+        .fetch_add(1, Ordering::SeqCst);
+
+    if let Some(gate) = gate {
+        let _permit = gate.acquire().await.unwrap();
+    }
+
+    let kind = params
+        .as_ref()
+        .and_then(|p| p.get("kind"))
+        .and_then(Value::as_str);
+
+    let response = match (response, kind) {
+        (None, Some("spot")) => {
+            let routed = load_json("http_get_instrument_routed_spot.json");
+            let mut invalid = routed.clone();
+            invalid["instrument_name"] = json!("HBAR_USDC");
+            invalid["base_currency"] = json!("HBAR");
+            invalid["tick_size"] = json!("-0.5999");
+            Some(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": [invalid, routed],
+                "usOut": 1_787_011_200_000_000_u64,
+            }))
+        }
+        (response, _) => response,
+    };
+
     let currency = params
         .as_ref()
         .and_then(|p| p.get("currency"))
@@ -406,7 +491,7 @@ async fn handle_get_instruments(id: u64, params: Option<Value>) -> Response {
 
     match currency {
         Some("any" | "BTC") | None => {
-            let mut data = load_json("http_get_instruments.json");
+            let mut data = response.unwrap_or_else(|| load_json("http_get_instruments.json"));
             data["id"] = json!(id);
 
             if let Some(result) = data.get_mut("result")
@@ -421,10 +506,7 @@ async fn handle_get_instruments(id: u64, params: Option<Value>) -> Response {
                 }
             }
 
-            if let Some(kind) = params
-                .as_ref()
-                .and_then(|p| p.get("kind"))
-                .and_then(|k| k.as_str())
+            if let Some(kind) = kind
                 && let Some(result) = data.get_mut("result")
                 && let Some(instruments) = result.as_array_mut()
             {
@@ -448,6 +530,11 @@ async fn handle_get_instruments(id: u64, params: Option<Value>) -> Response {
 }
 
 async fn handle_ws_upgrade(ws: WebSocketUpgrade, State(state): State<TestServerState>) -> Response {
+    if state.reject_ws_upgrades.load(Ordering::Relaxed) {
+        state.rejected_ws_upgrades.fetch_add(1, Ordering::SeqCst);
+        return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
@@ -535,7 +622,7 @@ async fn handle_socket(mut socket: WebSocket, state: TestServerState) {
                                         has_combo_parent,
                                     ))
                                 } else if channel.starts_with("book.") {
-                                    Some(book_snapshot_payload.clone())
+                                    Some(book_payload_for_channel(&book_snapshot_payload, channel))
                                 } else if let Some(symbol) = channel.strip_prefix("quote.") {
                                     let mut p = quote_payload.clone();
                                     p["params"]["channel"] = json!(channel);
@@ -769,15 +856,15 @@ async fn test_option_chain_reference_price_response(
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
     replace_data_event_sender(tx);
     let client = DeribitDataClient::new(*DERIBIT_CLIENT_ID, create_test_config(addr)).unwrap();
-    let series_id = OptionSeriesId::new(
+    let series_id = OptionSeriesId::new_derived(
         *DERIBIT_VENUE,
         Ustr::from("BTC"),
         Ustr::from("BTC"),
         UnixNanos::from(1_743_120_000_000_000_000),
     );
     let instrument_id = InstrumentId::from("BTC-28MAR25-90000-C.DERIBIT");
-    let mut params = Params::new();
-    params.insert("venue-error".to_string(), json!(venue_error));
+    let params = Params::new([("venue-error".to_string(), json!(venue_error))].into());
+
     let request = RequestOptionChainReferencePrice::new(
         series_id,
         instrument_id,
@@ -930,9 +1017,90 @@ async fn test_data_client_connect_disconnect() {
     assert!(registry.handle(*DERIBIT_CLIENT_ID, endpoint).is_none());
 }
 
+#[tokio::test]
+async fn test_routed_spot_data_client_rejects_trades_and_charts_locally() {
+    let (addr, state) = start_test_server().await.unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+    let mut config = create_test_config(addr);
+    config.product_types = vec![DeribitProductType::Spot];
+    let mut client = DeribitDataClient::new(*DERIBIT_CLIENT_ID, config).unwrap();
+    client.connect().await.unwrap();
+    let instrument_id = InstrumentId::from("BTC_USDC.DERIBIT");
+
+    let trades_error =
+        dispatch_subscribe(&mut client, SubscribeKind::Trades, instrument_id).unwrap_err();
+    let bars_error =
+        dispatch_subscribe(&mut client, SubscribeKind::Bars, instrument_id).unwrap_err();
+    let trade_history_error = client
+        .request_trades(RequestTrades::new(
+            instrument_id,
+            None,
+            None,
+            None,
+            Some(*DERIBIT_CLIENT_ID),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        ))
+        .unwrap_err();
+    let bar_type = BarType::from("BTC_USDC.DERIBIT-1-MINUTE-LAST-EXTERNAL");
+    let bar_history_error = client
+        .request_bars(RequestBars::new(
+            bar_type,
+            None,
+            None,
+            None,
+            Some(*DERIBIT_CLIENT_ID),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        ))
+        .unwrap_err();
+    let book_channel = "book.BTC_USDC.none.10.100ms";
+    dispatch_subscribe(&mut client, SubscribeKind::BookDeltas, instrument_id).unwrap();
+    wait_until_async(
+        || async {
+            state
+                .subscription_events
+                .lock()
+                .await
+                .iter()
+                .any(|(channel, subscribe)| *subscribe && channel == book_channel)
+        },
+        TEST_TIMEOUT,
+    )
+    .await;
+
+    let channels = state.subscription_events.lock().await.clone();
+    client.disconnect().await.unwrap();
+
+    assert_eq!(
+        trades_error.to_string(),
+        "Deribit routed spot does not support public trades or charts for BTC_USDC.DERIBIT"
+    );
+    assert_eq!(bars_error.to_string(), trades_error.to_string());
+    assert_eq!(trade_history_error.to_string(), trades_error.to_string());
+    assert_eq!(bar_history_error.to_string(), trades_error.to_string());
+    assert_eq!(
+        channels
+            .iter()
+            .filter(|(channel, _)| channel.starts_with("trades.") || channel.starts_with("chart."))
+            .count(),
+        0
+    );
+    assert_eq!(
+        channels
+            .iter()
+            .filter(|(channel, subscribe)| *subscribe && channel == book_channel)
+            .count(),
+        1
+    );
+}
+
 #[rstest]
 #[tokio::test]
-async fn test_data_client_subscribe_trades() {
+async fn test_data_client_subscribe_trades(#[values(false, true)] batch: bool) {
     let (addr, state) = start_test_server().await.unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
     set_data_event_sender(tx);
@@ -950,8 +1118,13 @@ async fn test_data_client_subscribe_trades() {
     while rx.try_recv().is_ok() {}
 
     let instrument_id = InstrumentId::from("BTC-PERPETUAL.DERIBIT");
+
     let cmd = SubscribeTrades::new(
-        instrument_id,
+        if batch {
+            vec![InstrumentId::from("UNCACHED.DERIBIT"), instrument_id]
+        } else {
+            vec![instrument_id]
+        },
         Some(*DERIBIT_CLIENT_ID),
         None,
         UUID4::new(),
@@ -959,7 +1132,17 @@ async fn test_data_client_subscribe_trades() {
         None,
         None,
     );
-    client.subscribe_trades(cmd).unwrap();
+
+    let result = client.subscribe_trades(cmd);
+    if batch {
+        let error = result.unwrap_err();
+        let partial = error.downcast_ref::<SubscriptionError>().unwrap();
+        assert_eq!(partial.instrument_ids_accepted, vec![instrument_id]);
+        assert_eq!(partial.bar_types_accepted, Vec::<BarType>::new());
+        assert!(partial.source.to_string().contains("UNCACHED.DERIBIT"));
+    } else {
+        result.unwrap();
+    }
 
     wait_until_async(
         || async { !state.subscription_events.lock().await.is_empty() },
@@ -1001,8 +1184,7 @@ async fn test_data_client_subscribe_combo_legs_expands_trade_channels() {
     state.subscription_events.lock().await.clear();
 
     let instrument_id = InstrumentId::from("BTC-COMBO-1.DERIBIT");
-    let mut params = Params::new();
-    params.insert("subscribe_combo_legs".to_string(), json!(true));
+    let params = Params::new([("subscribe_combo_legs".to_string(), json!(true))].into());
 
     let subscribe = SubscribeTrades::new(
         instrument_id,
@@ -1069,8 +1251,7 @@ async fn test_data_client_subscribe_combo_legs_delivers_parent_and_leg_trades() 
     state.subscription_events.lock().await.clear();
 
     let instrument_id = InstrumentId::from("BTC-COMBO-1.DERIBIT");
-    let mut params = Params::new();
-    params.insert("subscribe_combo_legs".to_string(), json!(true));
+    let params = Params::new([("subscribe_combo_legs".to_string(), json!(true))].into());
 
     let subscribe = SubscribeTrades::new(
         instrument_id,
@@ -1162,8 +1343,7 @@ async fn test_data_client_subscribe_combo_legs_repeated_unsubscribes_last_refere
     state.subscription_events.lock().await.clear();
 
     let instrument_id = InstrumentId::from("BTC-COMBO-1.DERIBIT");
-    let mut params = Params::new();
-    params.insert("subscribe_combo_legs".to_string(), json!(true));
+    let params = Params::new([("subscribe_combo_legs".to_string(), json!(true))].into());
 
     let first_command_id = UUID4::new();
     let first_subscribe = SubscribeTrades::new(
@@ -1288,11 +1468,9 @@ async fn test_data_client_subscribe_combo_legs_requires_opt_in(#[case] opt_in: O
     state.subscription_events.lock().await.clear();
 
     let instrument_id = InstrumentId::from("BTC-COMBO-1.DERIBIT");
-    let params = opt_in.map(|value| {
-        let mut params = Params::new();
-        params.insert("subscribe_combo_legs".to_string(), json!(value));
-        params
-    });
+
+    let params = opt_in
+        .map(|value| Params::new([("subscribe_combo_legs".to_string(), json!(value))].into()));
 
     let command_id = UUID4::new();
     let subscribe = SubscribeTrades::new(
@@ -1360,8 +1538,7 @@ async fn test_data_client_subscribe_combo_legs_after_lazy_loading_combo() {
     state.subscription_events.lock().await.clear();
 
     let instrument_id = InstrumentId::from("BTC-COMBO-1.DERIBIT");
-    let mut params = Params::new();
-    params.insert("subscribe_combo_legs".to_string(), json!(true));
+    let params = Params::new([("subscribe_combo_legs".to_string(), json!(true))].into());
 
     let subscribe = SubscribeTrades::new(
         instrument_id,
@@ -1447,8 +1624,10 @@ async fn test_data_client_subscribe_quotes() {
 }
 
 #[rstest]
+#[case::deltas(SubscribeKind::BookDeltas)]
+#[case::depth(SubscribeKind::BookDepth)]
 #[tokio::test]
-async fn test_data_client_subscribe_book_deltas() {
+async fn test_data_client_subscribe_book(#[case] kind: SubscribeKind) {
     let (addr, state) = start_test_server().await.unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
     set_data_event_sender(tx);
@@ -1466,19 +1645,7 @@ async fn test_data_client_subscribe_book_deltas() {
     while rx.try_recv().is_ok() {}
 
     let instrument_id = InstrumentId::from("BTC-PERPETUAL.DERIBIT");
-    let cmd = SubscribeBookDeltas::new(
-        instrument_id,
-        BookType::L2_MBP,
-        Some(*DERIBIT_CLIENT_ID),
-        None,
-        UUID4::new(),
-        UnixNanos::default(),
-        None,
-        false,
-        None,
-        None,
-    );
-    client.subscribe_book_deltas(cmd).unwrap();
+    dispatch_subscribe(&mut client, kind, instrument_id).unwrap();
 
     wait_until_async(
         || async {
@@ -1498,10 +1665,57 @@ async fn test_data_client_subscribe_book_deltas() {
         .expect("timeout waiting for event")
         .expect("channel closed");
 
-    assert!(
-        matches!(event, DataEvent::Data(Data::BookDeltas(_))),
-        "Expected Deltas event, was: {event:?}"
-    );
+    match (kind, event) {
+        (SubscribeKind::BookDeltas, DataEvent::Data(Data::BookDeltas(deltas))) => {
+            assert_eq!(deltas.sequence, 136_725_664_747);
+            assert_eq!(deltas.deltas.len(), 21);
+        }
+        (SubscribeKind::BookDepth, DataEvent::Data(Data::BookDepth(depth))) => {
+            assert_eq!(depth.instrument_id, instrument_id);
+            assert_eq!(depth.sequence, 136_725_664_747);
+            assert_eq!(depth.bids.len(), 10);
+            assert_eq!(depth.asks.len(), 10);
+            assert_eq!(depth.bids[0].price.as_decimal(), dec!(89532.5));
+            assert_eq!(depth.bids[0].size.as_decimal(), dec!(254900));
+            assert_eq!(depth.asks[0].price.as_decimal(), dec!(89533));
+            assert_eq!(depth.asks[0].size.as_decimal(), dec!(91570));
+        }
+        (_, event) => panic!("unexpected book event: {event:?}"),
+    }
+
+    assert!(rx.try_recv().is_err());
+
+    client.disconnect().await.unwrap();
+    client.connect().await.unwrap();
+
+    while rx.try_recv().is_ok() {}
+
+    let kind_reconnected = if matches!(kind, SubscribeKind::BookDepth) {
+        SubscribeKind::BookDeltas
+    } else {
+        SubscribeKind::BookDepth
+    };
+
+    dispatch_subscribe(&mut client, kind_reconnected, instrument_id).unwrap();
+    let event = tokio::time::timeout(TEST_TIMEOUT, rx.recv())
+        .await
+        .expect("timeout waiting for book after reconnect")
+        .expect("channel closed");
+
+    match (kind_reconnected, event) {
+        (SubscribeKind::BookDeltas, DataEvent::Data(Data::BookDeltas(deltas))) => {
+            assert_eq!(deltas.instrument_id, instrument_id);
+            assert_eq!(deltas.sequence, 136_725_664_747);
+            assert_eq!(deltas.deltas.len(), 21);
+        }
+        (SubscribeKind::BookDepth, DataEvent::Data(Data::BookDepth(depth))) => {
+            assert_eq!(depth.instrument_id, instrument_id);
+            assert_eq!(depth.sequence, 136_725_664_747);
+            assert_eq!(depth.bids.len(), 10);
+            assert_eq!(depth.asks.len(), 10);
+        }
+        (_, event) => panic!("unexpected book event after reconnect: {event:?}"),
+    }
 
     client.disconnect().await.unwrap();
 }
@@ -1561,6 +1775,47 @@ async fn test_subscribe_quotes_uncached_instrument_fails_fast() {
     );
 
     client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[case(SubscribeKind::Trades, "trades")]
+#[case(SubscribeKind::Bars, "bars")]
+#[tokio::test]
+async fn test_routed_spot_lazy_load_rejects_public_trades(
+    #[case] kind: SubscribeKind,
+    #[case] description: &str,
+) {
+    let _capture_guard = lock_log_capture().await;
+    let logger = install_capturing_debug_logger();
+    let (addr, state) = start_test_server().await.unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+    let mut config = create_test_config(addr);
+    config.auto_load_missing_instruments = true;
+    let mut client = DeribitDataClient::new(*DERIBIT_CLIENT_ID, config).unwrap();
+    client.connect().await.unwrap();
+    let instrument_id = InstrumentId::from("BTC_USDC.DERIBIT");
+    let expected_error = format!(
+        "Failed to subscribe to {description} for {instrument_id}: Subscribe error: \
+         Deribit routed spot does not support public trades or charts for {instrument_id}"
+    );
+
+    dispatch_subscribe(&mut client, kind, instrument_id).unwrap();
+    wait_until_async(|| async { logger.contains(&expected_error) }, TEST_TIMEOUT).await;
+    let channels = state.subscription_events.lock().await.clone();
+    client.disconnect().await.unwrap();
+
+    assert_eq!(
+        state.get_instrument_request_count.load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        channels
+            .iter()
+            .filter(|(channel, _)| channel.starts_with("trades.") || channel.starts_with("chart."))
+            .count(),
+        0
+    );
 }
 
 #[rstest]
@@ -1715,6 +1970,7 @@ fn dispatch_subscribe(
     let client_id = Some(*DERIBIT_CLIENT_ID);
     let cmd_id = UUID4::new();
     let ts = UnixNanos::default();
+    let book_params = Params::new([("interval".to_string(), json!("100ms"))].into());
 
     match kind {
         SubscribeKind::Quotes => client.subscribe_quotes(SubscribeQuotes::new(
@@ -1745,7 +2001,7 @@ fn dispatch_subscribe(
             None,
             false,
             None,
-            None,
+            Some(book_params),
         )),
         SubscribeKind::BookDepth => client.subscribe_book_depth(SubscribeBookDepth::new(
             instrument_id,
@@ -1757,7 +2013,7 @@ fn dispatch_subscribe(
             None,
             false,
             None,
-            None,
+            Some(book_params),
         )),
         SubscribeKind::MarkPrices => client.subscribe_mark_prices(SubscribeMarkPrices::new(
             instrument_id,
@@ -1920,7 +2176,7 @@ async fn test_data_client_emits_instruments_on_connect() {
     wait_until_async(
         || {
             while let Ok(event) = rx.try_recv() {
-                if matches!(event, DataEvent::Instrument(_)) {
+                if matches!(event, DataEvent::Data(Data::Instrument(_))) {
                     counter.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -1940,14 +2196,18 @@ async fn test_data_client_emits_instruments_on_connect() {
 }
 
 fn book_summary_data_type(currency: &str, kind: &str) -> DataType {
-    let mut metadata = Params::new();
-    metadata.insert(
-        "currency".to_string(),
-        serde_json::Value::String(currency.to_string()),
-    );
-    metadata.insert(
-        "kind".to_string(),
-        serde_json::Value::String(kind.to_string()),
+    let metadata = Params::new(
+        [
+            (
+                "currency".to_string(),
+                serde_json::Value::String(currency.to_string()),
+            ),
+            (
+                "kind".to_string(),
+                serde_json::Value::String(kind.to_string()),
+            ),
+        ]
+        .into(),
     );
     DataType::new(
         "DeribitBookSummary",
@@ -2105,10 +2365,12 @@ async fn test_data_client_request_book_summaries_defaults_kind_and_uppercases_cu
     while rx.try_recv().is_ok() {}
 
     // Selector-only: lowercase currency, omit kind, no catalog identifier.
-    let mut metadata = Params::new();
-    metadata.insert(
-        "currency".to_string(),
-        serde_json::Value::String("eth".to_string()),
+    let metadata = Params::new(
+        [(
+            "currency".to_string(),
+            serde_json::Value::String("eth".to_string()),
+        )]
+        .into(),
     );
     let request_data_type = DataType::new("DeribitBookSummary", Some(metadata), None);
 
@@ -2200,4 +2462,593 @@ async fn test_data_client_request_data_ignores_unsupported_custom_type() {
     );
 
     client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_scheduled_instrument_refresh_publishes_and_caches_definitions(
+    #[values(false, true)] reconnect: bool,
+) {
+    let (addr, state) = start_test_server().await.unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+    let mut config = create_test_config(addr);
+    config.update_instruments_interval_mins = 1;
+    let mut client = DeribitDataClient::new(*DERIBIT_CLIENT_ID, config).unwrap();
+    connect_with_refresh(&mut client).await;
+    let mut started = tokio::time::Instant::now();
+
+    if reconnect {
+        client.disconnect().await.unwrap();
+        connect_with_refresh(&mut client).await;
+        started = tokio::time::Instant::now();
+    }
+
+    // A repeated connect while connected must not spawn a second refresh task
+    connect_with_refresh(&mut client).await;
+    let initial_calls = state.get_instruments_request_count.load(Ordering::SeqCst);
+    assert_eq!(initial_calls, if reconnect { 2 } else { 1 });
+
+    while rx.try_recv().is_ok() {}
+
+    let perp_id = InstrumentId::from("BTC-PERPETUAL.DERIBIT");
+    let listing_id = InstrumentId::from("BTC-27JUN25.DERIBIT");
+    assert!(
+        client
+            .subscribe_quotes(subscribe_quotes(listing_id))
+            .is_err()
+    );
+    client
+        .request_book_snapshot(book_snapshot(listing_id))
+        .unwrap();
+    wait_until_async(
+        || async { client.command_tasks.all_finished() },
+        TEST_TIMEOUT,
+    )
+    .await;
+    let mut rows = instrument_rows();
+    instrument_row_mut(&mut rows, "BTC-PERPETUAL")["tick_size"] = json!(1.0);
+    let mut listing = instrument_row_mut(&mut rows, "BTC-27DEC24").clone();
+    listing["instrument_name"] = json!("BTC-27JUN25");
+    listing["instrument_id"] = json!(345_678);
+    listing["expiration_timestamp"] = json!(1_751_011_200_000_i64);
+    rows.push(listing);
+    *state.instruments_response.lock().await = Some(instruments_body(&rows));
+
+    advance_refresh_clock(Duration::from_secs(59).saturating_sub(started.elapsed())).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        state.get_instruments_request_count.load(Ordering::SeqCst),
+        initial_calls
+    );
+    advance_refresh_clock(Duration::from_secs(60).saturating_sub(started.elapsed())).await;
+    let mut refreshed = AHashMap::new();
+    while refreshed.len() < 3 {
+        let instrument = recv_instrument(&mut rx, Duration::from_secs(15)).await;
+        refreshed.insert(instrument.id(), instrument);
+    }
+
+    assert_eq!(refreshed[&perp_id].price_increment().as_decimal(), dec!(1));
+    assert!(refreshed.contains_key(&listing_id));
+    assert_eq!(
+        state.get_instruments_request_count.load(Ordering::SeqCst),
+        initial_calls + 1
+    );
+
+    assert_eq!(
+        client
+            .http_client
+            .get_instrument(&listing_id.symbol.inner())
+            .unwrap()
+            .id(),
+        listing_id
+    );
+    assert_eq!(
+        client
+            .http_client
+            .get_instrument(&perp_id.symbol.inner())
+            .unwrap()
+            .price_increment()
+            .as_decimal(),
+        dec!(1),
+    );
+    client
+        .subscribe_quotes(subscribe_quotes(listing_id))
+        .unwrap();
+
+    let quote = tokio::time::timeout(TEST_TIMEOUT, async {
+        match rx.recv().await.unwrap() {
+            DataEvent::Data(Data::Quote(quote)) => quote,
+            event => panic!("expected refreshed quote, was {event:?}"),
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(quote.instrument_id, listing_id);
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_scheduled_instrument_refresh_during_reconnect_reaches_handler() {
+    let (addr, state) = start_test_server().await.unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+    let mut config = create_test_config(addr);
+    config.update_instruments_interval_mins = 1;
+    let mut client = DeribitDataClient::new(*DERIBIT_CLIENT_ID, config).unwrap();
+    connect_with_refresh(&mut client).await;
+
+    while rx.try_recv().is_ok() {}
+
+    let listing_id = InstrumentId::from("BTC-27JUN25.DERIBIT");
+    let mut rows = instrument_rows();
+    let mut listing = instrument_row_mut(&mut rows, "BTC-27DEC24").clone();
+    listing["instrument_name"] = json!("BTC-27JUN25");
+    listing["instrument_id"] = json!(345_678);
+    listing["expiration_timestamp"] = json!(1_751_011_200_000_i64);
+    rows.push(listing);
+    *state.instruments_response.lock().await = Some(instruments_body(&rows));
+
+    // Drop the socket and refuse upgrades so the refresh lands while reconnecting
+    state.reject_ws_upgrades.store(true, Ordering::SeqCst);
+    state.disconnect_trigger.store(true, Ordering::SeqCst);
+    client
+        .subscribe_quotes(subscribe_quotes(InstrumentId::from(
+            "BTC-PERPETUAL.DERIBIT",
+        )))
+        .unwrap();
+    wait_until_async(
+        || async { state.rejected_ws_upgrades.load(Ordering::SeqCst) > 0 },
+        TEST_TIMEOUT,
+    )
+    .await;
+
+    advance_refresh_clock(Duration::from_secs(60)).await;
+
+    loop {
+        let instrument = recv_instrument(&mut rx, TEST_TIMEOUT).await;
+        if instrument.id() == listing_id {
+            break;
+        }
+    }
+    assert_eq!(*state.connection_count.lock().await, 0);
+
+    state.disconnect_trigger.store(false, Ordering::SeqCst);
+    state.reject_ws_upgrades.store(false, Ordering::SeqCst);
+    wait_until_async(
+        || async { *state.connection_count.lock().await > 0 },
+        Duration::from_secs(45),
+    )
+    .await;
+
+    client
+        .subscribe_quotes(subscribe_quotes(listing_id))
+        .unwrap();
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        loop {
+            if let Some(DataEvent::Data(Data::Quote(quote))) = rx.recv().await
+                && quote.instrument_id == listing_id
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("handler did not parse quotes for the listing refreshed during reconnect");
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_scheduled_instrument_refresh_retries_after_failure() {
+    let _capture = lock_log_capture().await;
+    let logger = install_capturing_debug_logger();
+    let (addr, state) = start_test_server().await.unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+    let mut config = create_test_config(addr);
+    config.update_instruments_interval_mins = 1;
+    let mut client = DeribitDataClient::new(*DERIBIT_CLIENT_ID, config).unwrap();
+    connect_with_refresh(&mut client).await;
+    let initial_calls = state.get_instruments_request_count.load(Ordering::SeqCst);
+
+    while rx.try_recv().is_ok() {}
+
+    let perp_id = InstrumentId::from("BTC-PERPETUAL.DERIBIT");
+    *state.instruments_response.lock().await = Some(json!({
+        "jsonrpc": "2.0",
+        "id": 0,
+        "error": {"code": 10000, "message": "temporary refresh failure"},
+        "testnet": true
+    }));
+    advance_refresh_clock(Duration::from_secs(60)).await;
+    wait_until_async(
+        || async { logger.contains("Failed to refresh instruments for Future:") },
+        TEST_TIMEOUT,
+    )
+    .await;
+
+    let retry_started = tokio::time::Instant::now();
+    assert_eq!(
+        state.get_instruments_request_count.load(Ordering::SeqCst),
+        initial_calls + 1
+    );
+    assert!(rx.try_recv().is_err());
+    assert_eq!(
+        client
+            .http_client
+            .get_instrument(&perp_id.symbol.inner())
+            .unwrap()
+            .id(),
+        perp_id
+    );
+    assert!(client.is_connected());
+
+    let mut rows = instrument_rows();
+    instrument_row_mut(&mut rows, "BTC-PERPETUAL")["tick_size"] = json!(1.0);
+    *state.instruments_response.lock().await = Some(instruments_body(&rows));
+    advance_refresh_clock(Duration::from_secs(59).saturating_sub(retry_started.elapsed())).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        state.get_instruments_request_count.load(Ordering::SeqCst),
+        initial_calls + 1
+    );
+    advance_refresh_clock(Duration::from_secs(60).saturating_sub(retry_started.elapsed())).await;
+    let refreshed = recv_instrument(&mut rx, TEST_TIMEOUT).await;
+
+    assert_eq!(refreshed.id().venue, *DERIBIT_VENUE);
+    assert!(client.is_connected());
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_scheduled_instrument_refresh_preserves_combo_legs_when_combos_fail() {
+    let (addr, state) = start_test_server().await.unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+    let mut config = create_test_config(addr);
+    config.product_types = vec![DeribitProductType::Future, DeribitProductType::FutureCombo];
+    config.update_instruments_interval_mins = 1;
+    let mut client = DeribitDataClient::new(*DERIBIT_CLIENT_ID, config).unwrap();
+    connect_with_refresh(&mut client).await;
+
+    while rx.try_recv().is_ok() {}
+
+    state.fail_get_combos.store(true, Ordering::Relaxed);
+    let combo_id = InstrumentId::from("BTC-COMBO-1.DERIBIT");
+    advance_refresh_clock(Duration::from_secs(60)).await;
+
+    let refreshed = loop {
+        let instrument = recv_instrument(&mut rx, Duration::from_secs(15)).await;
+        if instrument.id() == combo_id {
+            break instrument;
+        }
+    };
+
+    let InstrumentAny::CryptoFuturesSpread(spread) = refreshed else {
+        panic!("expected futures spread, was {refreshed:?}");
+    };
+    let legs = spread
+        .info
+        .as_ref()
+        .and_then(|info| info.get("deribit_combo_legs"))
+        .and_then(Value::as_array)
+        .expect("combo legs missing after refresh");
+    assert_eq!(legs.len(), 2);
+
+    wait_until_async(
+        || async { *state.connection_count.lock().await > 0 },
+        TEST_TIMEOUT,
+    )
+    .await;
+    state.subscription_events.lock().await.clear();
+    let params = Params::new([("subscribe_combo_legs".to_string(), json!(true))].into());
+    client
+        .subscribe_trades(SubscribeTrades::new(
+            combo_id,
+            Some(*DERIBIT_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            Some(params),
+        ))
+        .unwrap();
+
+    wait_until_async(
+        || async {
+            subscription_event_trade_symbols(&state, true).await
+                == sorted_strings(&["BTC-27DEC24", "BTC-COMBO-1", "BTC-PERPETUAL"])
+        },
+        TEST_TIMEOUT,
+    )
+    .await;
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[case::disconnect("disconnect", false)]
+#[case::disconnect_in_flight("disconnect", true)]
+#[case::stop("stop", false)]
+#[case::stop_in_flight("stop", true)]
+#[case::reset("reset", false)]
+#[case::dispose("dispose", false)]
+#[tokio::test]
+async fn test_scheduled_instrument_refresh_shutdown(
+    #[case] shutdown: &str,
+    #[case] in_flight: bool,
+) {
+    let (addr, state) = start_test_server().await.unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+    let mut config = create_test_config(addr);
+    config.update_instruments_interval_mins = 1;
+    let mut client = DeribitDataClient::new(*DERIBIT_CLIENT_ID, config).unwrap();
+    connect_with_refresh(&mut client).await;
+    let initial_calls = state.get_instruments_request_count.load(Ordering::SeqCst);
+
+    while rx.try_recv().is_ok() {}
+
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+
+    if in_flight {
+        *state.instruments_gate.lock().await = Some(Arc::clone(&gate));
+        advance_refresh_clock(Duration::from_secs(60)).await;
+        wait_until_async(
+            || async { state.get_instruments_request_count.load(Ordering::SeqCst) > initial_calls },
+            Duration::from_secs(15),
+        )
+        .await;
+    }
+
+    match shutdown {
+        "stop" => client.stop().unwrap(),
+        "reset" => client.reset().unwrap(),
+        "dispose" => client.dispose().unwrap(),
+        "disconnect" => tokio::time::timeout(Duration::from_secs(5), client.disconnect())
+            .await
+            .unwrap()
+            .unwrap(),
+        _ => unreachable!(),
+    }
+
+    wait_until_async(
+        || async { client.session_tasks.all_finished() },
+        Duration::from_secs(5),
+    )
+    .await;
+    gate.add_permits(1);
+    let calls = state.get_instruments_request_count.load(Ordering::SeqCst);
+
+    assert!(!client.is_connected());
+    advance_refresh_clock(Duration::from_secs(61)).await;
+    assert!(rx.try_recv().is_err());
+    assert_eq!(
+        state.get_instruments_request_count.load(Ordering::SeqCst),
+        calls
+    );
+    assert_eq!(calls, initial_calls + usize::from(in_flight));
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_scheduled_instrument_refresh_disabled_when_interval_zero() {
+    let (addr, state) = start_test_server().await.unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+    let mut config = create_test_config(addr);
+    config.update_instruments_interval_mins = 0;
+    let mut client = DeribitDataClient::new(*DERIBIT_CLIENT_ID, config).unwrap();
+    connect_with_refresh(&mut client).await;
+    let initial_calls = state.get_instruments_request_count.load(Ordering::SeqCst);
+
+    while rx.try_recv().is_ok() {}
+
+    advance_refresh_clock(Duration::from_secs(61)).await;
+    assert!(rx.try_recv().is_err());
+    assert_eq!(
+        state.get_instruments_request_count.load(Ordering::SeqCst),
+        initial_calls
+    );
+    client.disconnect().await.unwrap();
+}
+
+fn instrument_rows() -> Vec<Value> {
+    load_json("http_get_instruments.json")["result"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+fn instrument_row_mut<'a>(rows: &'a mut [Value], name: &str) -> &'a mut Value {
+    rows.iter_mut()
+        .find(|row| row["instrument_name"] == name)
+        .unwrap()
+}
+
+fn instruments_body(rows: &[Value]) -> Value {
+    let mut body = load_json("http_get_instruments.json");
+    body["result"] = json!(rows);
+    body
+}
+
+fn subscribe_quotes(instrument_id: InstrumentId) -> SubscribeQuotes {
+    SubscribeQuotes::new(
+        instrument_id,
+        Some(*DERIBIT_CLIENT_ID),
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+    )
+}
+
+fn book_snapshot(instrument_id: InstrumentId) -> RequestBookSnapshot {
+    RequestBookSnapshot::new(
+        instrument_id,
+        None,
+        Some(*DERIBIT_CLIENT_ID),
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+    )
+}
+
+async fn recv_instrument(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+    within: Duration,
+) -> InstrumentAny {
+    let event = tokio::time::timeout(within, rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let DataEvent::Data(Data::Instrument(instrument)) = event else {
+        panic!("expected instrument event, was {event:?}");
+    };
+
+    *instrument
+}
+
+#[tokio::test]
+#[ignore = "requires Deribit mainnet public network access"]
+async fn test_scheduled_instrument_refresh_mainnet() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+    let config = DeribitDataClientConfig {
+        environment: DeribitEnvironment::Mainnet,
+        update_instruments_interval_mins: 1,
+        ..Default::default()
+    };
+    let mut client = DeribitDataClient::new(*DERIBIT_CLIENT_ID, config).unwrap();
+    let started = tokio::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(45), client.connect())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut initial = Vec::new();
+
+    while let Ok(event) = rx.try_recv() {
+        let DataEvent::Data(Data::Instrument(instrument)) = event else {
+            panic!("expected startup instrument, was {event:?}");
+        };
+
+        initial.push(*instrument);
+    }
+
+    let perp_id = InstrumentId::from("BTC-PERPETUAL.DERIBIT");
+    let initial_perp = initial
+        .iter()
+        .find(|instrument| instrument.id() == perp_id)
+        .unwrap()
+        .clone();
+    let mut refreshed_perp = None;
+
+    while refreshed_perp.is_none() {
+        let instrument = recv_instrument(&mut rx, Duration::from_secs(90)).await;
+
+        if instrument.id() == perp_id {
+            refreshed_perp = Some(instrument);
+        }
+    }
+
+    tokio::time::timeout(Duration::from_secs(5), client.disconnect())
+        .await
+        .unwrap()
+        .unwrap();
+    let refreshed_perp = refreshed_perp.unwrap();
+
+    assert!(started.elapsed() >= Duration::from_secs(60));
+    assert!(refreshed_perp.ts_init() > initial_perp.ts_init());
+    assert_eq!(
+        refreshed_perp.price_increment(),
+        initial_perp.price_increment()
+    );
+    assert!(!client.is_connected());
+    println!(
+        "Deribit mainnet: {} startup instruments; scheduled REST refresh published a fresh BTC-PERPETUAL definition after {:.1}s; disconnected",
+        initial.len(),
+        started.elapsed().as_secs_f64()
+    );
+}
+
+#[rstest]
+#[case::disabled(0)]
+#[case::enabled(1)]
+#[tokio::test]
+async fn test_connect_registers_one_instrument_refresh(#[case] minutes: u64) {
+    let (addr, _state) = start_test_server().await.unwrap();
+    let mut config = create_test_config(addr);
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+    config.update_instruments_interval_mins = minutes;
+    let mut client = DeribitDataClient::new(*DERIBIT_CLIENT_ID, config).unwrap();
+
+    client.connect().await.unwrap();
+    client.connect().await.unwrap();
+
+    assert_eq!(client.session_tasks.len(), 1 + usize::from(minutes != 0));
+    client.disconnect().await.unwrap();
+    assert!(client.session_tasks.is_empty());
+}
+
+async fn connect_with_refresh(client: &mut DeribitDataClient) {
+    if client.is_connected() {
+        client.connect().await.unwrap();
+        return;
+    }
+
+    // Keep the refresh timer on the test clock and retain session task ownership
+    let minutes = client.config.update_instruments_interval_mins;
+    client.config.update_instruments_interval_mins = 0;
+    client.connect().await.unwrap();
+    client.config.update_instruments_interval_mins = minutes;
+
+    if let Some(future) = client.instrument_refresh() {
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            let mut future = Box::pin(future);
+            let mut ready = Some(ready);
+            std::future::poll_fn(move |cx| {
+                let result = future.as_mut().poll(cx);
+
+                if let Some(ready) = ready.take() {
+                    let _ = ready.send(());
+                }
+
+                result
+            })
+            .await;
+        });
+
+        client
+            .session_tasks
+            .spawn(async move { tasks.join_next().await.unwrap().unwrap() })
+            .unwrap();
+        started.await.unwrap();
+    }
+}
+
+async fn advance_refresh_clock(duration: Duration) {
+    tokio::time::pause();
+    tokio::time::advance(duration).await;
+    tokio::time::resume();
+    tokio::task::yield_now().await;
 }

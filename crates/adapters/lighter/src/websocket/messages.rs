@@ -20,8 +20,8 @@ use ahash::AHashMap;
 use nautilus_core::string::secret::REDACTED;
 use nautilus_core::{
     serialization::{
-        deserialize_decimal, deserialize_decimal_from_str, deserialize_decimal_or_zero,
-        deserialize_optional_decimal,
+        deserialize_decimal, deserialize_decimal_from_str, deserialize_decimal_native,
+        deserialize_decimal_or_zero, deserialize_optional_decimal,
     },
     string::secret::SecretString,
 };
@@ -47,7 +47,7 @@ use crate::{
     http::models::{LighterOrder, LighterPriceLevel, LighterTrade},
 };
 
-pub(crate) const CANCEL_BATCH_ID_PREFIX: &str = "cancel-batch:";
+pub(crate) const TX_BATCH_ID_PREFIX: &str = "tx-batch:";
 
 /// Inbound message produced by the Lighter feed handler and consumed by the
 /// data and execution clients.
@@ -459,6 +459,8 @@ impl LighterMarketSelection {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum LighterWsFrame {
+    #[serde(rename = "shutdown")]
+    Shutdown { close_in_ms: u64 },
     #[serde(rename = "subscribed/order_book")]
     OrderBookSnapshot {
         channel: Ustr,
@@ -566,7 +568,9 @@ pub enum LighterWsFrame {
         positions: AHashMap<Ustr, LighterPosition>,
         #[serde(default)]
         shares: Vec<LighterPoolShares>,
+        #[serde(default, deserialize_with = "deserialize_optional_decimal_map")]
         last_funding_round: Option<AHashMap<Ustr, Decimal>>,
+        #[serde(default, deserialize_with = "deserialize_optional_decimal_map")]
         last_funding_discount: Option<AHashMap<Ustr, Decimal>>,
     },
     #[serde(rename = "update/account_all_positions")]
@@ -575,7 +579,9 @@ pub enum LighterWsFrame {
         positions: AHashMap<Ustr, LighterPosition>,
         #[serde(default)]
         shares: Vec<LighterPoolShares>,
+        #[serde(default, deserialize_with = "deserialize_optional_decimal_map")]
         last_funding_round: Option<AHashMap<Ustr, Decimal>>,
+        #[serde(default, deserialize_with = "deserialize_optional_decimal_map")]
         last_funding_discount: Option<AHashMap<Ustr, Decimal>>,
     },
     #[serde(
@@ -827,6 +833,21 @@ pub struct LighterAsset {
     pub margin_mode: Ustr,
 }
 
+#[derive(Deserialize)]
+struct JsonDecimal(#[serde(deserialize_with = "deserialize_decimal_native")] Decimal);
+
+fn deserialize_optional_decimal_map<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<AHashMap<Ustr, Decimal>>, D::Error> {
+    let values = Option::<AHashMap<Ustr, JsonDecimal>>::deserialize(deserializer)?;
+    Ok(values.map(|values| {
+        values
+            .into_iter()
+            .map(|(key, value)| (key, value.0))
+            .collect()
+    }))
+}
+
 fn deserialize_trade_vec<'de, D>(deserializer: D) -> Result<Vec<LighterTrade>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -919,6 +940,94 @@ mod tests {
     const WS_HEIGHT_UPDATE: &str = include_str!("../../test_data/ws_height_update.json");
     const WS_CANDLE_SUBSCRIBED: &str = include_str!("../../test_data/ws_candle_subscribed.json");
     const WS_CANDLE_UPDATE: &str = include_str!("../../test_data/ws_candle_update.json");
+
+    #[rstest]
+    #[case("subscribed/account_all_positions")]
+    #[case("update/account_all_positions")]
+    fn test_funding_decimal_maps(#[case] kind: &str) {
+        let value = serde_json::json!({
+            "type": kind,
+            "channel": "account_all_positions:7",
+            "positions": {},
+            "last_funding_round": {"1": 9007199254740993u64, "3": 1.25},
+            "last_funding_discount": {
+                "2": "0.1234567890123456789012345678",
+                "4": "0.12345678901234567890123456789"
+            }
+        });
+        let text = value.to_string();
+
+        for frame in [
+            serde_json::from_str::<LighterWsFrame>(&text).unwrap(),
+            serde_json::from_value(value).unwrap(),
+        ] {
+            let (round, discount) = funding_maps(frame);
+            assert_eq!(
+                round.unwrap(),
+                AHashMap::from_iter([
+                    (Ustr::from("1"), Decimal::from(9_007_199_254_740_993u64)),
+                    (Ustr::from("3"), Decimal::new(125, 2))
+                ])
+            );
+            assert_eq!(
+                discount.unwrap(),
+                AHashMap::from_iter([
+                    (
+                        Ustr::from("2"),
+                        Decimal::from_str_exact("0.1234567890123456789012345678").unwrap()
+                    ),
+                    (
+                        Ustr::from("4"),
+                        Decimal::from_str_exact("0.1234567890123456789012345679").unwrap()
+                    ),
+                ])
+            );
+        }
+    }
+
+    #[rstest]
+    fn test_funding_decimal_maps_absent(
+        #[values("subscribed/account_all_positions", "update/account_all_positions")] kind: &str,
+        #[values(false, true)] explicit_null: bool,
+    ) {
+        let mut value = serde_json::json!({
+            "type": kind,
+            "channel": "account_all_positions:7",
+            "positions": {},
+        });
+
+        if explicit_null {
+            value["last_funding_round"] = serde_json::Value::Null;
+            value["last_funding_discount"] = serde_json::Value::Null;
+        }
+
+        let text = value.to_string();
+
+        for frame in [
+            serde_json::from_str::<LighterWsFrame>(&text).unwrap(),
+            serde_json::from_value(value).unwrap(),
+        ] {
+            assert_eq!(funding_maps(frame), (None, None));
+        }
+    }
+
+    type FundingMap = Option<AHashMap<Ustr, Decimal>>;
+
+    fn funding_maps(frame: LighterWsFrame) -> (FundingMap, FundingMap) {
+        match frame {
+            LighterWsFrame::AccountAllPositionsSnapshot {
+                last_funding_round,
+                last_funding_discount,
+                ..
+            }
+            | LighterWsFrame::AccountAllPositions {
+                last_funding_round,
+                last_funding_discount,
+                ..
+            } => (last_funding_round, last_funding_discount),
+            _ => panic!("expected account positions"),
+        }
+    }
 
     #[rstest]
     fn test_subscription_request_serializes_public_channel() {
@@ -1721,13 +1830,22 @@ mod tests {
                 assert_eq!(candle.h, Decimal::from_str("2264.34").unwrap());
                 assert_eq!(candle.l, Decimal::from_str("2263.36").unwrap());
                 assert_eq!(candle.c, Decimal::from_str("2263.97").unwrap());
-                // f64 JSON numbers round-trip through `deserialize_decimal::visit_f64`
-                // which converts via `Decimal::try_from(f64)`; the resulting value is the
-                // nearest representable decimal to the float, not the JSON literal text.
-                assert_eq!(candle.v, Decimal::from_str("13.2237").unwrap());
+                let arbitrary_precision =
+                    serde_json::from_str::<serde_json::Number>("79228162514264337593543950335")
+                        .unwrap()
+                        .to_string()
+                        == "79228162514264337593543950335";
+
+                let (volume, quote_volume) = if arbitrary_precision {
+                    ("13.223699999999997", "29934.600011999984")
+                } else {
+                    ("13.2237", "29934.60001199998")
+                };
+
+                assert_eq!(candle.v, Decimal::from_str_exact(volume).unwrap());
                 assert_eq!(
                     candle.quote_volume,
-                    Decimal::from_str("29934.60001199998").unwrap(),
+                    Decimal::from_str_exact(quote_volume).unwrap()
                 );
                 assert_eq!(candle.i, 19_993_571_166);
             }
@@ -1753,5 +1871,31 @@ mod tests {
             }
             _ => panic!("expected candle update frame"),
         }
+    }
+
+    #[rstest]
+    #[case(0)]
+    #[case(7350)]
+    #[case(u64::MAX)]
+    fn shutdown_notification_parses_deadline(#[case] close_in_ms: u64) {
+        let frame: LighterWsFrame = serde_json::from_value(
+            serde_json::json!({"type":"shutdown", "close_in_ms":close_in_ms}),
+        )
+        .unwrap();
+
+        match frame {
+            LighterWsFrame::Shutdown {
+                close_in_ms: actual,
+            } => assert_eq!(actual, close_in_ms),
+            other => panic!("expected shutdown, was {other:?}"),
+        }
+    }
+
+    #[rstest]
+    #[case(serde_json::json!({"type":"shutdown"}))]
+    #[case(serde_json::json!({"type":"shutdown", "close_in_ms":-1}))]
+    #[case(serde_json::json!({"type":"shutdown", "close_in_ms":"7350"}))]
+    fn shutdown_notification_rejects_invalid_deadline(#[case] frame: serde_json::Value) {
+        assert!(serde_json::from_value::<LighterWsFrame>(frame).is_err());
     }
 }

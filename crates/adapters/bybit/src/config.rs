@@ -17,14 +17,17 @@
 
 use std::collections::HashMap;
 
+use nautilus_common::config::{ConfigResult, check_unique_values};
 #[cfg(test)]
 use nautilus_core::string::secret::REDACTED;
 use nautilus_core::string::secret::SecretString;
+use nautilus_live::book::DEFAULT_BOOK_SNAPSHOT_TIMEOUT_SECS;
 use nautilus_model::identifiers::AccountId;
 use nautilus_network::websocket::TransportBackend;
 use serde::{Deserialize, Serialize};
 
 use crate::common::{
+    credential::credential_env_vars,
     enums::{
         BybitEnvironment, BybitMarginMode, BybitOrderSmpType, BybitPositionMode, BybitProductType,
     },
@@ -44,9 +47,18 @@ use crate::common::{
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.bybit")
 )]
 pub struct BybitDataClientConfig {
-    /// Optional API key for authenticated REST/WebSocket requests.
+    /// API key.
+    ///
+    /// When omitted, the client loads `BYBIT_API_KEY`, `BYBIT_DEMO_API_KEY`, or
+    /// `BYBIT_TESTNET_API_KEY` for the selected [`BybitEnvironment`]. An explicit
+    /// value takes precedence. Public market-data requests stay unsigned.
     pub api_key: Option<SecretString>,
-    /// Optional API secret for authenticated REST/WebSocket requests.
+    /// API secret.
+    ///
+    /// When omitted, the client loads `BYBIT_API_SECRET`, `BYBIT_DEMO_API_SECRET`,
+    /// or `BYBIT_TESTNET_API_SECRET` for the selected [`BybitEnvironment`]. An
+    /// explicit value takes precedence. A missing key or secret leaves the client
+    /// without credentials.
     pub api_secret: Option<SecretString>,
     /// Product types to subscribe to (e.g., Linear, Spot, Inverse, Option).
     #[builder(default = vec![BybitProductType::Linear])]
@@ -86,9 +98,16 @@ pub struct BybitDataClientConfig {
     /// Interval in seconds for polling instrument definitions and status changes from REST.
     /// When `None`, instrument/status polling is disabled.
     pub instrument_poll_interval_secs: Option<u64>,
+    /// Maximum time to wait for an initial, post-reconnect, or recovery order book
+    /// snapshot in seconds. Set to 0 to disable.
+    #[builder(default = DEFAULT_BOOK_SNAPSHOT_TIMEOUT_SECS)]
+    pub book_snapshot_timeout_secs: u64,
     /// WebSocket transport backend (defaults to `Tungstenite`).
     #[builder(default)]
     pub transport_backend: TransportBackend,
+    /// Whether bar timestamps use the close time instead of the open time.
+    #[builder(default = true)]
+    pub bars_timestamp_on_close: bool,
 }
 
 #[cfg(feature = "python")]
@@ -105,7 +124,9 @@ nautilus_core::impl_pyo3_config_getters!(BybitDataClientConfig {
     heartbeat_interval_secs: u64,
     recv_window_ms: u64,
     update_instruments_interval_mins: Option<u64>,
+    book_snapshot_timeout_secs: u64,
     transport_backend: TransportBackend,
+    bars_timestamp_on_close: bool,
 });
 
 impl Default for BybitDataClientConfig {
@@ -125,10 +146,34 @@ impl BybitDataClientConfig {
         Self::default()
     }
 
-    /// Returns `true` if both API key and secret are available.
+    /// Validates that configured selections contain no duplicates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `product_types` repeats a value.
+    pub fn validate(&self) -> ConfigResult<()> {
+        check_unique_values("product_types", &self.product_types)
+    }
+
+    /// Returns `true` if both API key and secret fields are set.
     #[must_use]
     pub fn has_api_credentials(&self) -> bool {
         self.api_key.is_some() && self.api_secret.is_some()
+    }
+
+    pub(crate) fn resolved_api_credentials(&self) -> Option<(String, String)> {
+        let (key_var, secret_var) = credential_env_vars(self.environment);
+        // Keep each side in a zeroizing owner until both exist. An incomplete
+        // pair must not leave a plaintext secret on the heap.
+        let key = self
+            .api_key
+            .clone()
+            .or_else(|| std::env::var(key_var).ok().map(SecretString::from))?;
+        let secret = self
+            .api_secret
+            .clone()
+            .or_else(|| std::env::var(secret_var).ok().map(SecretString::from))?;
+        Some((key.into_inner(), secret.into_inner()))
     }
 
     /// Returns the REST base URL, considering overrides and environment.
@@ -290,6 +335,15 @@ impl BybitExecutionClientConfig {
         Self::default()
     }
 
+    /// Validates that configured selections contain no duplicates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `product_types` repeats a value.
+    pub fn validate(&self) -> ConfigResult<()> {
+        check_unique_values("product_types", &self.product_types)
+    }
+
     /// Returns `true` if both API key and secret are available.
     #[must_use]
     pub fn has_api_credentials(&self) -> bool {
@@ -322,9 +376,65 @@ impl BybitExecutionClientConfig {
 }
 #[cfg(test)]
 mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
+    use nautilus_common::{cache::Cache, config::ConfigError};
+    use nautilus_live::ExecutionClientCore;
+    use nautilus_model::{
+        enums::{AccountType, OmsType},
+        identifiers::{ClientId, TraderId, Venue},
+    };
     use rstest::rstest;
 
     use super::*;
+    use crate::{data::BybitDataClient, execution::BybitExecutionClient};
+
+    #[rstest]
+    fn test_data_client_rejects_duplicate_types() {
+        let config = BybitDataClientConfig {
+            product_types: vec![BybitProductType::Linear, BybitProductType::Linear],
+            ..Default::default()
+        };
+
+        let error = BybitDataClient::new(ClientId::from("BYBIT"), config)
+            .expect_err("duplicate config must fail before client setup");
+
+        assert_eq!(
+            error.downcast_ref::<ConfigError>(),
+            Some(&ConfigError::duplicate("product_types", None)),
+        );
+    }
+
+    #[rstest]
+    #[case::empty(vec![], false)]
+    #[case::distinct(vec![BybitProductType::Spot, BybitProductType::Linear], false)]
+    #[case::adjacent(vec![BybitProductType::Linear, BybitProductType::Linear], true)]
+    #[case::separated(vec![BybitProductType::Linear, BybitProductType::Spot, BybitProductType::Linear], true)]
+    fn test_config_duplicate_types(#[case] values: Vec<BybitProductType>, #[case] duplicate: bool) {
+        let data = BybitDataClientConfig {
+            product_types: values.clone(),
+            ..Default::default()
+        };
+
+        let execution = BybitExecutionClientConfig {
+            product_types: values.clone(),
+            ..Default::default()
+        };
+
+        let expected = if duplicate {
+            Err(ConfigError::duplicate("product_types", None))
+        } else {
+            Ok(())
+        };
+
+        let data_result = data.validate();
+        let execution_result = execution.validate();
+
+        assert_eq!(data_result, expected);
+        assert_eq!(execution_result, expected);
+        assert_eq!(data.product_types, values);
+        assert_eq!(execution.product_types, values);
+    }
 
     #[rstest]
     fn test_config_debug_redacts_credentials() {
@@ -396,10 +506,33 @@ mod tests {
     fn test_data_config_default() {
         let config = BybitDataClientConfig::default();
 
+        assert!(config.bars_timestamp_on_close);
         assert!(!config.has_api_credentials());
         assert_eq!(config.product_types, vec![BybitProductType::Linear]);
         assert_eq!(config.http_timeout_secs, 60);
         assert_eq!(config.heartbeat_interval_secs, 20);
+        assert_eq!(config.book_snapshot_timeout_secs, 10);
+    }
+
+    #[rstest]
+    fn test_data_config_bar_timestamp_builder() {
+        assert!(
+            BybitDataClientConfig::builder()
+                .build()
+                .bars_timestamp_on_close
+        );
+        assert!(
+            serde_json::from_str::<BybitDataClientConfig>("{}")
+                .unwrap()
+                .bars_timestamp_on_close
+        );
+        let config = BybitDataClientConfig::builder()
+            .bars_timestamp_on_close(false)
+            .build();
+        assert!(!config.bars_timestamp_on_close);
+        let config: BybitDataClientConfig =
+            serde_json::from_str(r#"{"bars_timestamp_on_close":false}"#).unwrap();
+        assert!(!config.bars_timestamp_on_close);
     }
 
     #[rstest]
@@ -602,5 +735,32 @@ http_timeout_secs = 45
         );
         assert_eq!(config.recv_window_ms, expected.recv_window_ms);
         assert_eq!(config.transport_backend, expected.transport_backend);
+    }
+
+    #[rstest]
+    fn test_execution_client_rejects_duplicate_types() {
+        let core = ExecutionClientCore::new(
+            TraderId::from("TESTER-001"),
+            ClientId::from("BYBIT"),
+            Venue::from("BYBIT"),
+            OmsType::Netting,
+            AccountId::from("BYBIT-001"),
+            AccountType::Margin,
+            None,
+            Rc::new(RefCell::new(Cache::default())),
+        );
+
+        let config = BybitExecutionClientConfig {
+            product_types: vec![BybitProductType::Linear, BybitProductType::Linear],
+            ..Default::default()
+        };
+
+        let error = BybitExecutionClient::new(core, config)
+            .expect_err("duplicate config must fail before credentials or client setup");
+
+        assert_eq!(
+            error.downcast_ref::<ConfigError>(),
+            Some(&ConfigError::duplicate("product_types", None))
+        );
     }
 }

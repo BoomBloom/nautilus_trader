@@ -1,4 +1,4 @@
-FROM public.ecr.aws/docker/library/rust:1.98.1-slim-bookworm@sha256:ebd900bae66fd508b466cef82d64a83a5fb34682e4c8b2797a42908bddc95a57 AS rust-toolchain
+FROM public.ecr.aws/docker/library/rust:1.99.1-slim-bookworm@sha256:86234e857a413004348b471d11a4ebe1aa92d2eae2b6b143cac68fd1ac3c48be AS rust-toolchain
 
 # Pin to specific digest for supply-chain security (python:3.13-slim as of 2026-08-23).
 # Keep the version tag: scripts/ci/check-docker-toolchain-pins.bash treats it as the
@@ -30,7 +30,7 @@ COPY --from=rust-toolchain /usr/local/cargo /usr/local/cargo
 COPY --from=rust-toolchain /usr/local/rustup /usr/local/rustup
 
 # Install UV
-COPY --from=ghcr.io/astral-sh/uv:0.12.15@sha256:62f8c047d0a0e9ece6b53fc63df902585a67a47a7f318ddec4a37db586edc8e3 \
+COPY --from=ghcr.io/astral-sh/uv:0.13.5@sha256:32a7bb39b496babbd997b0a39a4d66c126bdaf5661b302bf6f06abda8deca6ff \
   /uv /uvx /root/.local/bin/
 
 COPY Cargo.toml ./

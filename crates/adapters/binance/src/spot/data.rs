@@ -16,6 +16,7 @@
 //! Live market data client implementation for the Binance Spot adapter.
 
 use std::{
+    num::NonZeroU32,
     str::FromStr,
     sync::{
         Arc,
@@ -28,7 +29,7 @@ use ahash::AHashMap;
 use anyhow::Context;
 use futures_util::{StreamExt, pin_mut};
 use nautilus_common::{
-    clients::DataClient,
+    clients::{DataClient, execute_bar_subscriptions, execute_instrument_subscriptions},
     live::{runner::get_data_event_sender, sender::EventSender},
     messages::{
         DataEvent,
@@ -63,11 +64,17 @@ use nautilus_model::{
     instruments::{Instrument, InstrumentAny},
     types::{Price, Quantity},
 };
-use parking_lot::RwLock;
+use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
 
 use crate::{
+    book::{
+        BinanceBookError,
+        pacing::{SnapshotPacer, SnapshotPermit},
+        recovery::spawn_recovery,
+        sync::{BookSyncTracker, DepthSequencing, DepthSnapshot, DepthUpdate},
+    },
     common::{
         bar::{binance_bar_data_type, binance_bars_to_custom_data, parse_binance_bar_type},
         consts::{BINANCE_VENUE, BINANCE_WS_HEARTBEAT_SECS},
@@ -76,11 +83,12 @@ use crate::{
         parse::{bar_spec_to_binance_interval, quote_to_l1_deltas},
         status::diff_and_emit_statuses,
         urls::{get_http_base_url_with_us, get_ws_base_url_with_us},
+        websocket::chain_command,
     },
     config::{BinanceDataClientConfig, BinanceSpotMarketDataMode},
     data_types::register_binance_custom_data,
     spot::{
-        http::{BinanceDepth, DepthParams, client::BinanceSpotHttpClient},
+        http::{BinanceDepth, BinanceSpotHttpError, DepthParams, client::BinanceSpotHttpClient},
         websocket::{
             public_json::{
                 BinanceSpotPublicJsonWebSocketClient,
@@ -105,10 +113,12 @@ use crate::{
 };
 
 const BOOK_DEPTHS_JSON: [usize; 3] = [5, 10, 20];
-const MAX_SNAPSHOT_RETRIES: u32 = 5;
-const MAX_BUFFERED_DEPTH_UPDATES: usize = 10_000;
-const SNAPSHOT_RETRY_BACKOFF_BASE_MS: u64 = 250;
-const SNAPSHOT_RETRY_BACKOFF_CAP_MS: u64 = 3_000;
+
+// Venue maximum, so seeded books are as deep as REST allows, at the top request weight of 250
+const SNAPSHOT_DEPTH: u32 = 5000;
+
+// Half the venue's 6,000 per-minute request weight, leaving room for other requests
+const SNAPSHOT_WEIGHT_PER_MINUTE: NonZeroU32 = NonZeroU32::new(3_000).expect("non-zero");
 
 /// Binance Spot data client for SBE market data.
 #[derive(Debug)]
@@ -127,12 +137,13 @@ pub struct BinanceSpotDataClient {
     data_sender: EventSender<DataEvent>,
     instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     status_cache: Arc<AtomicMap<InstrumentId, MarketStatusAction>>,
-    book_buffers: Arc<AtomicMap<InstrumentId, BookBuffer>>,
-    book_subscriptions: Arc<AtomicMap<InstrumentId, u32>>,
+    instrument_update_lock: Arc<tokio::sync::Mutex<()>>,
+    book_sync: BookSyncTracker,
+    book_subscriptions: Arc<AtomicMap<InstrumentId, String>>,
     l1_book_subscriptions: Arc<AtomicMap<InstrumentId, u32>>,
     quote_refs: Arc<AtomicMap<InstrumentId, u32>>,
     ticker_refs: Arc<AtomicMap<InstrumentId, u32>>,
-    book_epoch: Arc<RwLock<u64>>,
+    book_command_tail: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
 
 impl BinanceSpotDataClient {
@@ -220,6 +231,9 @@ impl BinanceSpotDataClient {
             ),
         };
         let data_sender = get_data_event_sender();
+        let snapshot_pacer = Arc::new(SnapshotPacer::new(SNAPSHOT_WEIGHT_PER_MINUTE));
+        let book_sync =
+            BookSyncTracker::new(DepthSequencing::Spot, data_sender.clone(), snapshot_pacer);
 
         log::debug!("Configured Spot market data mode: {spot_market_data_mode:?}");
 
@@ -241,12 +255,13 @@ impl BinanceSpotDataClient {
             data_sender,
             instruments: Arc::new(AtomicMap::new()),
             status_cache: Arc::new(AtomicMap::new()),
-            book_buffers: Arc::new(AtomicMap::new()),
+            instrument_update_lock: Arc::new(tokio::sync::Mutex::new(())),
+            book_sync,
             book_subscriptions: Arc::new(AtomicMap::new()),
             l1_book_subscriptions: Arc::new(AtomicMap::new()),
             quote_refs: Arc::new(AtomicMap::new()),
             ticker_refs: Arc::new(AtomicMap::new()),
-            book_epoch: Arc::new(RwLock::new(0)),
+            book_command_tail: Mutex::new(None),
         })
     }
 
@@ -352,11 +367,13 @@ impl BinanceSpotDataClient {
         us: bool,
         instruments_cache: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
         status_cache: &Arc<AtomicMap<InstrumentId, MarketStatusAction>>,
+        instrument_update_lock: &tokio::sync::Mutex<()>,
         ws: &SpotWsClient,
         sender: &EventSender<DataEvent>,
         clock: &'static AtomicTime,
         emit_status_changes: bool,
     ) -> anyhow::Result<Vec<InstrumentAny>> {
+        let _guard = instrument_update_lock.lock().await;
         let instruments = http
             .request_instruments_with_config(provider, us)
             .await
@@ -388,7 +405,7 @@ impl BinanceSpotDataClient {
         }
 
         for instrument in &instruments {
-            if let Err(e) = sender.send(DataEvent::Instrument(instrument.clone())) {
+            if let Err(e) = sender.send(DataEvent::Data(instrument.clone().into())) {
                 log::warn!("Failed to send refreshed Binance Spot instrument: {e}");
             }
         }
@@ -402,11 +419,10 @@ impl BinanceSpotDataClient {
         data_sender: &EventSender<DataEvent>,
         instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
         ws_instruments: &Arc<AtomicMap<Ustr, InstrumentAny>>,
-        book_buffers: &Arc<AtomicMap<InstrumentId, BookBuffer>>,
-        book_subscriptions: &Arc<AtomicMap<InstrumentId, u32>>,
+        book_sync: &BookSyncTracker,
         l1_book_subscriptions: &Arc<AtomicMap<InstrumentId, u32>>,
-        book_epoch: &Arc<RwLock<u64>>,
         http_client: &BinanceSpotHttpClient,
+        snapshot_timeout: Duration,
         clock: &'static AtomicTime,
         command_spawner: &TaskSpawner,
     ) {
@@ -417,9 +433,13 @@ impl BinanceSpotDataClient {
                 let symbol = event.symbol;
                 let cache = ws_instruments.load();
                 if let Some(instrument) = cache.get(&symbol) {
-                    let trades = parse_trades_event(event, instrument, ts_init);
-                    for data in trades {
-                        Self::send_data(data_sender, data);
+                    match parse_trades_event(event, instrument, ts_init) {
+                        Ok(trades) => {
+                            for data in trades {
+                                Self::send_data(data_sender, data);
+                            }
+                        }
+                        Err(e) => log::warn!("Failed to parse Spot SBE trades: {e}"),
                     }
                 }
             }
@@ -427,40 +447,55 @@ impl BinanceSpotDataClient {
                 let symbol = event.symbol;
                 let cache = ws_instruments.load();
                 if let Some(instrument) = cache.get(&symbol) {
-                    let quote = parse_bbo_event(event, instrument, ts_init);
-                    Self::send_top_of_book(
-                        data_sender,
-                        l1_book_subscriptions,
-                        quote,
-                        event.book_update_id as u64,
-                    );
+                    match parse_bbo_event(event, instrument, ts_init) {
+                        Ok(quote) => Self::send_top_of_book(
+                            data_sender,
+                            l1_book_subscriptions,
+                            quote,
+                            event.book_update_id as u64,
+                        ),
+                        Err(e) => log::warn!("Failed to parse Spot SBE best bid/ask: {e}"),
+                    }
                 }
             }
             BinanceSpotWsMessage::DepthSnapshot(ref event) => {
                 let symbol = event.symbol;
                 let cache = ws_instruments.load();
-                if let Some(instrument) = cache.get(&symbol)
-                    && let Some(deltas) = parse_depth_snapshot(event, instrument, ts_init)
-                {
-                    Self::send_data(data_sender, Data::BookDeltas(Box::new(deltas)));
+                if let Some(instrument) = cache.get(&symbol) {
+                    match parse_depth_snapshot(event, instrument, ts_init) {
+                        Ok(deltas) => {
+                            Self::send_data(data_sender, Data::BookDeltas(Box::new(deltas)));
+                        }
+                        Err(e) => log::warn!("Failed to parse Spot SBE depth snapshot: {e}"),
+                    }
                 }
             }
             BinanceSpotWsMessage::DepthDiff(ref event) => {
                 let symbol = event.symbol;
                 let cache = ws_instruments.load();
-                if let Some(instrument) = cache.get(&symbol)
-                    && let Some(deltas) = parse_depth_diff(event, instrument, ts_init)
-                {
-                    let first_update_id = event.first_book_update_id as u64;
-                    let final_update_id = event.last_book_update_id as u64;
+                if let Some(instrument) = cache.get(&symbol) {
+                    match parse_depth_diff(event, instrument, ts_init) {
+                        Ok(deltas) => {
+                            let update = DepthUpdate {
+                                first_update_id: event.first_book_update_id as u64,
+                                final_update_id: event.last_book_update_id as u64,
+                                prev_final_update_id: None,
+                                deltas,
+                            };
 
-                    Self::route_depth_diff(
-                        data_sender,
-                        book_buffers,
-                        deltas,
-                        first_update_id,
-                        final_update_id,
-                    );
+                            Self::route_depth_diff(
+                                instrument.id(),
+                                update,
+                                book_sync,
+                                instruments,
+                                http_client,
+                                snapshot_timeout,
+                                clock,
+                                command_spawner,
+                            );
+                        }
+                        Err(e) => log::warn!("Failed to parse Spot SBE depth update: {e}"),
+                    }
                 }
             }
             BinanceSpotWsMessage::ServerShutdown(ref msg) => {
@@ -480,17 +515,7 @@ impl BinanceSpotDataClient {
             }
             BinanceSpotWsMessage::Reconnected => {
                 log::info!("WebSocket reconnected, rebuilding order book snapshots");
-
-                Self::rebuild_full_depth_books(
-                    data_sender,
-                    instruments,
-                    book_buffers,
-                    book_subscriptions,
-                    book_epoch,
-                    http_client,
-                    clock,
-                    command_spawner,
-                );
+                book_sync.reset_on_reconnect();
             }
         }
     }
@@ -501,11 +526,10 @@ impl BinanceSpotDataClient {
         data_sender: &EventSender<DataEvent>,
         instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
         ws_instruments: &Arc<AtomicMap<Ustr, InstrumentAny>>,
-        book_buffers: &Arc<AtomicMap<InstrumentId, BookBuffer>>,
-        book_subscriptions: &Arc<AtomicMap<InstrumentId, u32>>,
+        book_sync: &BookSyncTracker,
         l1_book_subscriptions: &Arc<AtomicMap<InstrumentId, u32>>,
-        book_epoch: &Arc<RwLock<u64>>,
         http_client: &BinanceSpotHttpClient,
+        snapshot_timeout: Duration,
         clock: &'static AtomicTime,
         command_spawner: &TaskSpawner,
     ) {
@@ -540,9 +564,8 @@ impl BinanceSpotDataClient {
             BinanceSpotPublicWsMessage::DepthSnapshot(ref event) => {
                 let symbol = event.symbol;
                 let cache = ws_instruments.load();
-                if let Some(instrument) = cache.get(&symbol)
-                    && let Some(deltas) = parse_json_depth_snapshot(event, instrument, ts_init)
-                {
+                if let Some(instrument) = cache.get(&symbol) {
+                    let deltas = parse_json_depth_snapshot(event, instrument, ts_init);
                     Self::send_data(data_sender, Data::BookDeltas(Box::new(deltas)));
                 }
             }
@@ -550,15 +573,27 @@ impl BinanceSpotDataClient {
                 let symbol = event.symbol;
                 let cache = ws_instruments.load();
                 if let Some(instrument) = cache.get(&symbol) {
+                    // A dropped diff surfaces as a sequence gap on the next one
                     match parse_json_depth_diff(event, instrument, ts_init) {
-                        Ok(Some(deltas)) => Self::route_depth_diff(
-                            data_sender,
-                            book_buffers,
-                            deltas,
-                            event.first_update_id,
-                            event.final_update_id,
-                        ),
-                        Ok(None) => {}
+                        Ok(deltas) => {
+                            let update = DepthUpdate {
+                                first_update_id: event.first_update_id,
+                                final_update_id: event.final_update_id,
+                                prev_final_update_id: None,
+                                deltas,
+                            };
+
+                            Self::route_depth_diff(
+                                instrument.id(),
+                                update,
+                                book_sync,
+                                instruments,
+                                http_client,
+                                snapshot_timeout,
+                                clock,
+                                command_spawner,
+                            );
+                        }
                         Err(e) => log::warn!("Failed to parse Spot JSON depth update: {e}"),
                     }
                 }
@@ -611,17 +646,7 @@ impl BinanceSpotDataClient {
             }
             BinanceSpotPublicWsMessage::Reconnected => {
                 log::info!("Spot JSON WebSocket reconnected, rebuilding order book snapshots");
-
-                Self::rebuild_full_depth_books(
-                    data_sender,
-                    instruments,
-                    book_buffers,
-                    book_subscriptions,
-                    book_epoch,
-                    http_client,
-                    clock,
-                    command_spawner,
-                );
+                book_sync.reset_on_reconnect();
             }
         }
     }
@@ -639,99 +664,44 @@ impl BinanceSpotDataClient {
         }
     }
 
-    fn route_depth_diff(
-        data_sender: &EventSender<DataEvent>,
-        book_buffers: &Arc<AtomicMap<InstrumentId, BookBuffer>>,
-        deltas: OrderBookDeltas,
-        first_update_id: u64,
-        final_update_id: u64,
-    ) {
-        let instrument_id = deltas.instrument_id;
-
-        if book_buffers.contains_key(&instrument_id) {
-            let mut handled_by_sync = false;
-            book_buffers.rcu(|m| {
-                handled_by_sync = false;
-
-                if let Some(buffer) = m.get_mut(&instrument_id) {
-                    handled_by_sync = true;
-
-                    if buffer.status == BookSyncStatus::Buffering {
-                        buffer.updates.push(BufferedDepthUpdate {
-                            deltas: deltas.clone(),
-                            first_update_id,
-                            final_update_id,
-                        });
-                        trim_buffered_depth_updates(&mut buffer.updates);
-                    }
-                }
-            });
-
-            if handled_by_sync {
-                return;
-            }
-        }
-
-        Self::send_data(data_sender, Data::BookDeltas(Box::new(deltas)));
-    }
-
     #[expect(
         clippy::too_many_arguments,
         reason = "book recovery requires the full subscription and command ownership context"
     )]
-    fn rebuild_full_depth_books(
-        data_sender: &EventSender<DataEvent>,
+    fn route_depth_diff(
+        instrument_id: InstrumentId,
+        update: DepthUpdate,
+        book_sync: &BookSyncTracker,
         instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
-        book_buffers: &Arc<AtomicMap<InstrumentId, BookBuffer>>,
-        book_subscriptions: &Arc<AtomicMap<InstrumentId, u32>>,
-        book_epoch: &Arc<RwLock<u64>>,
         http_client: &BinanceSpotHttpClient,
+        snapshot_timeout: Duration,
         clock: &'static AtomicTime,
         command_spawner: &TaskSpawner,
     ) {
-        let epoch = {
-            let mut guard = book_epoch.write();
-            *guard = guard.wrapping_add(1);
-            *guard
+        let Some(recovery) = book_sync.handle_update(instrument_id, update) else {
+            return;
         };
 
-        let subs: Vec<(InstrumentId, u32)> = {
-            let guard = book_subscriptions.load();
-            guard.iter().map(|(k, v)| (*k, *v)).collect()
-        };
+        let http = http_client.clone();
+        let instruments = instruments.clone();
 
-        for (instrument_id, depth) in subs {
-            if depth != 0 {
-                continue;
-            }
-
-            book_buffers.insert(instrument_id, BookBuffer::new(epoch));
-
-            log::debug!(
-                "OrderBook snapshot rebuild for {instrument_id} starting \
-                (reconnect, epoch={epoch})"
-            );
-
-            let http = http_client.clone();
-            let sender = data_sender.clone();
-            let buffers = book_buffers.clone();
-            let insts = instruments.clone();
-
-            if let Err(e) = command_spawner.spawn(async move {
-                Self::fetch_and_emit_snapshot(
-                    http,
-                    sender,
-                    buffers,
-                    insts,
+        spawn_recovery(
+            instrument_id,
+            recovery,
+            book_sync.clone(),
+            move |permit| {
+                Self::fetch_depth_snapshot(
+                    http.clone(),
+                    instruments.clone(),
                     instrument_id,
-                    epoch,
                     clock,
+                    permit,
                 )
-                .await;
-            }) {
-                log::warn!("Skipping Binance Spot snapshot rebuild after shutdown began: {e}");
-            }
-        }
+            },
+            depth_request_weight(SNAPSHOT_DEPTH),
+            snapshot_timeout,
+            command_spawner,
+        );
     }
 
     fn quote_stream_suffix(&self) -> &'static str {
@@ -754,545 +724,62 @@ impl BinanceSpotDataClient {
             .with_context(|| format!("invalid instrument_id metadata `{raw}`"))
     }
 
-    async fn fetch_and_emit_snapshot(
+    async fn fetch_depth_snapshot(
         http: BinanceSpotHttpClient,
-        sender: EventSender<DataEvent>,
-        buffers: Arc<AtomicMap<InstrumentId, BookBuffer>>,
         instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
         instrument_id: InstrumentId,
-        epoch: u64,
         clock: &'static AtomicTime,
-    ) {
-        Self::fetch_and_emit_snapshot_inner(
-            http,
-            sender,
-            buffers,
-            instruments,
-            instrument_id,
-            epoch,
-            clock,
-            0,
-        )
-        .await;
-    }
-
-    #[expect(clippy::too_many_arguments)]
-    async fn fetch_and_emit_snapshot_inner(
-        http: BinanceSpotHttpClient,
-        sender: EventSender<DataEvent>,
-        buffers: Arc<AtomicMap<InstrumentId, BookBuffer>>,
-        instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
-        instrument_id: InstrumentId,
-        epoch: u64,
-        clock: &'static AtomicTime,
-        retry_count: u32,
-    ) {
-        const SNAPSHOT_DEPTH: u32 = 5000;
-
-        if Self::wait_for_buffered_update(&buffers, instrument_id, epoch)
-            .await
-            .is_none()
-        {
-            return;
-        }
-
+        permit: SnapshotPermit,
+    ) -> Result<DepthSnapshot, BinanceBookError> {
         let params = DepthParams {
             symbol: instrument_id.symbol.as_str().to_uppercase(),
             limit: Some(SNAPSHOT_DEPTH),
         };
 
-        match http.inner().depth(&params).await {
-            Ok(depth_snapshot) => {
-                let ts_init = clock.get_time_ns();
-                let last_update_id = depth_snapshot.last_update_id as u64;
+        let depth = http
+            .inner()
+            .depth_paced(&params, permit)
+            .await
+            .map_err(|e| depth_snapshot_error(instrument_id, &e))?;
 
-                {
-                    let guard = buffers.load();
-                    match guard.get(&instrument_id) {
-                        None => {
-                            log::debug!(
-                                "OrderBook subscription for {instrument_id} was cancelled, \
-                                discarding snapshot"
-                            );
-                            return;
-                        }
-                        Some(buffer) if buffer.epoch != epoch => {
-                            log::debug!(
-                                "OrderBook snapshot for {instrument_id} is stale \
-                                (epoch {epoch} != {}), discarding",
-                                buffer.epoch
-                            );
-                            return;
-                        }
-                        Some(buffer) if buffer.status == BookSyncStatus::Failed => {
-                            log::debug!(
-                                "OrderBook snapshot for {instrument_id} belongs to a failed \
-                                sync, discarding"
-                            );
-                            return;
-                        }
-                        _ => {}
-                    }
-                }
+        let ts_init = clock.get_time_ns();
 
-                let (price_precision, size_precision) = {
-                    let guard = instruments.load();
-                    match guard.get(&instrument_id) {
-                        Some(inst) => (inst.price_precision(), inst.size_precision()),
-                        None => {
-                            log::error!("No instrument in cache for snapshot: {instrument_id}");
-                            Self::mark_book_sync_failed(&buffers, instrument_id, epoch);
-                            return;
-                        }
-                    }
-                };
+        let (price_precision, size_precision) = instruments
+            .load()
+            .get(&instrument_id)
+            .map(|instrument| (instrument.price_precision(), instrument.size_precision()))
+            .ok_or_else(|| {
+                BinanceBookError::Permanent(format!("no instrument cached for {instrument_id}"))
+            })?;
 
-                let Some(first) = Self::wait_for_first_applicable_update(
-                    &buffers,
-                    instrument_id,
-                    epoch,
-                    last_update_id,
-                )
-                .await
-                else {
-                    return;
-                };
+        let deltas = parse_spot_depth_snapshot(
+            &depth,
+            instrument_id,
+            price_precision,
+            size_precision,
+            ts_init,
+        )
+        .map_err(|e| {
+            BinanceBookError::Retryable(format!(
+                "failed to parse depth snapshot for {instrument_id}: {e}"
+            ))
+        })?;
 
-                let target = last_update_id + 1;
-                if !spot_overlap_valid(first.first_update_id, first.final_update_id, last_update_id)
-                {
-                    if retry_count < MAX_SNAPSHOT_RETRIES {
-                        log::warn!(
-                            "OrderBook overlap validation failed for {instrument_id}: \
-                            lastUpdateId={last_update_id}, first_update_id={}, \
-                            final_update_id={} (need U <= {} <= u), \
-                            retrying snapshot (attempt {}/{})",
-                            first.first_update_id,
-                            first.final_update_id,
-                            target,
-                            retry_count + 1,
-                            MAX_SNAPSHOT_RETRIES
-                        );
-
-                        tokio::time::sleep(spot_snapshot_retry_backoff(retry_count)).await;
-
-                        Box::pin(Self::fetch_and_emit_snapshot_inner(
-                            http,
-                            sender,
-                            buffers,
-                            instruments,
-                            instrument_id,
-                            epoch,
-                            clock,
-                            retry_count + 1,
-                        ))
-                        .await;
-                        return;
-                    }
-
-                    log::error!(
-                        "OrderBook overlap validation failed for {instrument_id} after \
-                        {MAX_SNAPSHOT_RETRIES} retries; no deltas will be emitted until \
-                        resubscribe or reconnect"
-                    );
-                    Self::mark_book_sync_failed(&buffers, instrument_id, epoch);
-                    return;
-                }
-
-                let Some(buffered) =
-                    Self::take_buffered_depth_updates(&buffers, instrument_id, epoch)
-                else {
-                    return;
-                };
-
-                let mut replayed = 0;
-                let mut last_final_update_id = last_update_id;
-                let mut is_first = true;
-                let mut replay_ready = Vec::with_capacity(buffered.len());
-
-                for update in buffered {
-                    if update.final_update_id <= last_update_id {
-                        continue;
-                    }
-
-                    if !spot_continuity_ok(is_first, update.first_update_id, last_final_update_id) {
-                        if retry_count < MAX_SNAPSHOT_RETRIES {
-                            log::warn!(
-                                "OrderBook continuity break for {instrument_id}: \
-                                expected U={}, was U={}, triggering resync (attempt {}/{})",
-                                last_final_update_id + 1,
-                                update.first_update_id,
-                                retry_count + 1,
-                                MAX_SNAPSHOT_RETRIES
-                            );
-
-                            Self::reset_book_sync_buffer(&buffers, instrument_id, epoch);
-                            tokio::time::sleep(spot_snapshot_retry_backoff(retry_count)).await;
-
-                            Box::pin(Self::fetch_and_emit_snapshot_inner(
-                                http,
-                                sender,
-                                buffers,
-                                instruments,
-                                instrument_id,
-                                epoch,
-                                clock,
-                                retry_count + 1,
-                            ))
-                            .await;
-                            return;
-                        }
-
-                        log::error!(
-                            "OrderBook continuity break for {instrument_id} after \
-                            {MAX_SNAPSHOT_RETRIES} retries; no deltas will be emitted until \
-                            resubscribe or reconnect"
-                        );
-                        Self::mark_book_sync_failed(&buffers, instrument_id, epoch);
-                        return;
-                    }
-
-                    last_final_update_id = update.final_update_id;
-                    is_first = false;
-                    replayed += 1;
-                    replay_ready.push(update);
-                }
-
-                let snapshot_ts_event = replay_ready
-                    .first()
-                    .map_or(ts_init, |update| update.deltas.ts_event);
-
-                let snapshot_deltas = match parse_spot_depth_snapshot(
-                    &depth_snapshot,
-                    instrument_id,
-                    price_precision,
-                    size_precision,
-                    snapshot_ts_event,
-                    ts_init,
-                ) {
-                    Ok(Some(deltas)) => deltas,
-                    Ok(None) => {
-                        if retry_count < MAX_SNAPSHOT_RETRIES {
-                            log::warn!(
-                                "OrderBook snapshot for {instrument_id} contained no levels; \
-                                retrying snapshot (attempt {}/{})",
-                                retry_count + 1,
-                                MAX_SNAPSHOT_RETRIES
-                            );
-
-                            tokio::time::sleep(spot_snapshot_retry_backoff(retry_count)).await;
-
-                            Box::pin(Self::fetch_and_emit_snapshot_inner(
-                                http,
-                                sender,
-                                buffers,
-                                instruments,
-                                instrument_id,
-                                epoch,
-                                clock,
-                                retry_count + 1,
-                            ))
-                            .await;
-                            return;
-                        }
-
-                        log::error!(
-                            "OrderBook snapshot for {instrument_id} contained no levels after \
-                            {MAX_SNAPSHOT_RETRIES} retries; no deltas will be emitted until \
-                            resubscribe or reconnect"
-                        );
-                        Self::mark_book_sync_failed(&buffers, instrument_id, epoch);
-                        return;
-                    }
-                    Err(e) => {
-                        if retry_count < MAX_SNAPSHOT_RETRIES {
-                            log::warn!(
-                                "Failed to parse order book snapshot for {instrument_id}: {e}; \
-                                retrying snapshot (attempt {}/{})",
-                                retry_count + 1,
-                                MAX_SNAPSHOT_RETRIES
-                            );
-
-                            tokio::time::sleep(spot_snapshot_retry_backoff(retry_count)).await;
-
-                            Box::pin(Self::fetch_and_emit_snapshot_inner(
-                                http,
-                                sender,
-                                buffers,
-                                instruments,
-                                instrument_id,
-                                epoch,
-                                clock,
-                                retry_count + 1,
-                            ))
-                            .await;
-                            return;
-                        }
-
-                        log::error!(
-                            "Failed to parse order book snapshot for {instrument_id} after \
-                            {MAX_SNAPSHOT_RETRIES} retries: {e}; no deltas will be emitted \
-                            until resubscribe or reconnect"
-                        );
-                        Self::mark_book_sync_failed(&buffers, instrument_id, epoch);
-                        return;
-                    }
-                };
-
-                if let Err(e) =
-                    sender.send(DataEvent::Data(Data::BookDeltas(Box::new(snapshot_deltas))))
-                {
-                    log::error!("Failed to send snapshot: {e}");
-                }
-
-                for update in replay_ready {
-                    if let Err(e) =
-                        sender.send(DataEvent::Data(Data::BookDeltas(Box::new(update.deltas))))
-                    {
-                        log::error!("Failed to send replayed deltas: {e}");
-                    }
-                }
-
-                while let Some(more) =
-                    Self::drain_buffered_depth_updates(&buffers, instrument_id, epoch)
-                {
-                    for update in more {
-                        if update.final_update_id <= last_update_id {
-                            continue;
-                        }
-
-                        if !spot_continuity_ok(
-                            is_first,
-                            update.first_update_id,
-                            last_final_update_id,
-                        ) {
-                            if retry_count < MAX_SNAPSHOT_RETRIES {
-                                log::warn!(
-                                    "OrderBook continuity break for {instrument_id}: \
-                                    expected U={}, was U={}, triggering resync (attempt {}/{})",
-                                    last_final_update_id + 1,
-                                    update.first_update_id,
-                                    retry_count + 1,
-                                    MAX_SNAPSHOT_RETRIES
-                                );
-
-                                Self::reset_book_sync_buffer(&buffers, instrument_id, epoch);
-                                tokio::time::sleep(spot_snapshot_retry_backoff(retry_count)).await;
-
-                                Box::pin(Self::fetch_and_emit_snapshot_inner(
-                                    http,
-                                    sender,
-                                    buffers,
-                                    instruments,
-                                    instrument_id,
-                                    epoch,
-                                    clock,
-                                    retry_count + 1,
-                                ))
-                                .await;
-                                return;
-                            }
-                            log::error!(
-                                "OrderBook continuity break for {instrument_id} after \
-                                {MAX_SNAPSHOT_RETRIES} retries; no deltas will be emitted \
-                                until resubscribe or reconnect"
-                            );
-                            Self::mark_book_sync_failed(&buffers, instrument_id, epoch);
-                            return;
-                        }
-
-                        last_final_update_id = update.final_update_id;
-                        is_first = false;
-                        replayed += 1;
-
-                        if let Err(e) =
-                            sender.send(DataEvent::Data(Data::BookDeltas(Box::new(update.deltas))))
-                        {
-                            log::error!("Failed to send replayed deltas: {e}");
-                        }
-                    }
-                }
-
-                log::debug!(
-                    "OrderBook snapshot rebuild for {instrument_id} completed \
-                    (lastUpdateId={last_update_id}, replayed={replayed})"
-                );
-            }
-            Err(e) => {
-                if retry_count < MAX_SNAPSHOT_RETRIES {
-                    log::warn!(
-                        "Failed to request order book snapshot for {instrument_id}: {e}; \
-                        retrying snapshot (attempt {}/{})",
-                        retry_count + 1,
-                        MAX_SNAPSHOT_RETRIES
-                    );
-
-                    tokio::time::sleep(spot_snapshot_retry_backoff(retry_count)).await;
-
-                    Box::pin(Self::fetch_and_emit_snapshot_inner(
-                        http,
-                        sender,
-                        buffers,
-                        instruments,
-                        instrument_id,
-                        epoch,
-                        clock,
-                        retry_count + 1,
-                    ))
-                    .await;
-                    return;
-                }
-
-                log::error!(
-                    "Failed to request order book snapshot for {instrument_id} after \
-                    {MAX_SNAPSHOT_RETRIES} retries: {e}; no deltas will be emitted until \
-                    resubscribe or reconnect"
-                );
-                Self::mark_book_sync_failed(&buffers, instrument_id, epoch);
-            }
-        }
-    }
-
-    async fn wait_for_buffered_update(
-        buffers: &Arc<AtomicMap<InstrumentId, BookBuffer>>,
-        instrument_id: InstrumentId,
-        epoch: u64,
-    ) -> Option<()> {
-        loop {
-            let guard = buffers.load();
-            match guard.get(&instrument_id) {
-                Some(buffer)
-                    if buffer.epoch == epoch
-                        && buffer.status == BookSyncStatus::Buffering
-                        && !buffer.updates.is_empty() =>
-                {
-                    return Some(());
-                }
-                Some(buffer)
-                    if buffer.epoch == epoch && buffer.status == BookSyncStatus::Buffering => {}
-                _ => return None,
-            }
-
-            drop(guard);
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    }
-
-    async fn wait_for_first_applicable_update(
-        buffers: &Arc<AtomicMap<InstrumentId, BookBuffer>>,
-        instrument_id: InstrumentId,
-        epoch: u64,
-        last_update_id: u64,
-    ) -> Option<BufferedDepthUpdate> {
-        loop {
-            let mut first = None;
-            let mut waiting = false;
-            buffers.rcu(|m| {
-                first = None;
-                waiting = false;
-
-                if let Some(buffer) = m.get_mut(&instrument_id)
-                    && buffer.epoch == epoch
-                    && buffer.status == BookSyncStatus::Buffering
-                {
-                    buffer
-                        .updates
-                        .retain(|update| update.final_update_id > last_update_id);
-                    first = first_applicable_spot_update(&buffer.updates, last_update_id).cloned();
-                    waiting = first.is_none();
-                }
-            });
-
-            if first.is_some() {
-                return first;
-            }
-
-            if !waiting {
-                return None;
-            }
-
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    }
-
-    fn take_buffered_depth_updates(
-        buffers: &Arc<AtomicMap<InstrumentId, BookBuffer>>,
-        instrument_id: InstrumentId,
-        epoch: u64,
-    ) -> Option<Vec<BufferedDepthUpdate>> {
-        let mut taken = None;
-        buffers.rcu(|m| {
-            taken = None;
-
-            if let Some(buffer) = m.get_mut(&instrument_id)
-                && buffer.epoch == epoch
-                && buffer.status == BookSyncStatus::Buffering
-            {
-                taken = Some(std::mem::take(&mut buffer.updates));
-            }
-        });
-        taken
-    }
-
-    fn drain_buffered_depth_updates(
-        buffers: &Arc<AtomicMap<InstrumentId, BookBuffer>>,
-        instrument_id: InstrumentId,
-        epoch: u64,
-    ) -> Option<Vec<BufferedDepthUpdate>> {
-        let mut taken = None;
-        buffers.rcu(|m| {
-            taken = None;
-
-            if let Some(buffer) = m.get_mut(&instrument_id)
-                && buffer.epoch == epoch
-                && buffer.status == BookSyncStatus::Buffering
-            {
-                if buffer.updates.is_empty() {
-                    m.remove(&instrument_id);
-                } else {
-                    taken = Some(std::mem::take(&mut buffer.updates));
-                }
-            }
-        });
-        taken
-    }
-
-    fn reset_book_sync_buffer(
-        buffers: &Arc<AtomicMap<InstrumentId, BookBuffer>>,
-        instrument_id: InstrumentId,
-        epoch: u64,
-    ) {
-        buffers.rcu(|m| {
-            if let Some(buffer) = m.get_mut(&instrument_id)
-                && buffer.epoch == epoch
-            {
-                buffer.updates.clear();
-                buffer.status = BookSyncStatus::Buffering;
-            }
-        });
-    }
-
-    fn mark_book_sync_failed(
-        buffers: &Arc<AtomicMap<InstrumentId, BookBuffer>>,
-        instrument_id: InstrumentId,
-        epoch: u64,
-    ) {
-        buffers.rcu(|m| {
-            if let Some(buffer) = m.get_mut(&instrument_id)
-                && buffer.epoch == epoch
-            {
-                buffer.updates.clear();
-                buffer.status = BookSyncStatus::Failed;
-            }
-        });
+        Ok(DepthSnapshot {
+            last_update_id: depth.last_update_id as u64,
+            deltas,
+            has_event_time: false,
+        })
     }
 }
 
 fn spot_ticker_data_type(instrument_id: InstrumentId) -> DataType {
-    let mut metadata = Params::new();
-    metadata.insert(
-        "instrument_id".to_string(),
-        serde_json::Value::String(instrument_id.to_string()),
+    let metadata = Params::new(
+        [(
+            "instrument_id".to_string(),
+            serde_json::Value::String(instrument_id.to_string()),
+        )]
+        .into(),
     );
     DataType::new(
         "BinanceSpotTicker",
@@ -1301,46 +788,19 @@ fn spot_ticker_data_type(instrument_id: InstrumentId) -> DataType {
     )
 }
 
-fn upsert_instrument(
+fn upsert_instruments(
     cache: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
-    instrument: InstrumentAny,
+    instruments: &[InstrumentAny],
 ) {
-    cache.insert(instrument.id(), instrument);
-}
-
-// Spot requires first diff to overlap the REST snapshot: `U <= lastUpdateId + 1 <= u`.
-fn spot_overlap_valid(first_update_id: u64, final_update_id: u64, last_update_id: u64) -> bool {
-    let target = last_update_id + 1;
-    first_update_id <= target && final_update_id >= target
-}
-
-// After the first applied diff, each spot update must satisfy `U == previous u + 1`.
-fn spot_continuity_ok(is_first: bool, first_update_id: u64, prev_final_update_id: u64) -> bool {
-    is_first || first_update_id == prev_final_update_id + 1
-}
-
-fn spot_snapshot_retry_backoff(retry_count: u32) -> Duration {
-    let multiplier = 1_u64 << retry_count.min(4);
-    let millis = SNAPSHOT_RETRY_BACKOFF_BASE_MS
-        .saturating_mul(multiplier)
-        .min(SNAPSHOT_RETRY_BACKOFF_CAP_MS);
-    Duration::from_millis(millis)
-}
-
-fn first_applicable_spot_update(
-    updates: &[BufferedDepthUpdate],
-    last_update_id: u64,
-) -> Option<&BufferedDepthUpdate> {
-    updates
-        .iter()
-        .find(|update| update.final_update_id > last_update_id)
-}
-
-fn trim_buffered_depth_updates(updates: &mut Vec<BufferedDepthUpdate>) {
-    let excess = updates.len().saturating_sub(MAX_BUFFERED_DEPTH_UPDATES);
-    if excess > 0 {
-        updates.drain(..excess);
+    if instruments.is_empty() {
+        return;
     }
+
+    cache.rcu(|cache| {
+        for instrument in instruments {
+            cache.insert(instrument.id(), instrument.clone());
+        }
+    });
 }
 
 fn parse_spot_depth_snapshot(
@@ -1348,87 +808,76 @@ fn parse_spot_depth_snapshot(
     instrument_id: InstrumentId,
     price_precision: u8,
     size_precision: u8,
-    ts_event: UnixNanos,
     ts_init: UnixNanos,
-) -> anyhow::Result<Option<OrderBookDeltas>> {
+) -> anyhow::Result<OrderBookDeltas> {
     let sequence = depth.last_update_id as u64;
 
     let total_levels = depth.bids.len() + depth.asks.len();
     let mut deltas = Vec::with_capacity(total_levels + 1);
 
-    // REST snapshots carry no event time; use the caller's best venue-time estimate.
+    // REST snapshots carry no event time; book sync stamps the first replayed diff's time
     deltas.push(OrderBookDelta::clear(
         instrument_id,
         sequence,
-        ts_event,
+        ts_init,
         ts_init,
     ));
 
-    for (i, level) in depth.bids.iter().enumerate() {
-        let price = Price::from_mantissa_exponent_checked(
-            level.price_mantissa,
-            depth.price_exponent,
-            price_precision,
-        )?;
-        let size = Quantity::from_mantissa_exponent_checked(
-            level.qty_mantissa as u64,
-            depth.qty_exponent,
-            size_precision,
-        )?;
-        let flags = if i == depth.bids.len() - 1 && depth.asks.is_empty() {
-            RecordFlag::F_LAST as u8
-        } else {
-            0
-        };
+    for (side, levels) in [
+        (OrderSide::Buy, &depth.bids),
+        (OrderSide::Sell, &depth.asks),
+    ] {
+        for level in levels {
+            let price = Price::from_mantissa_exponent_checked(
+                level.price_mantissa,
+                depth.price_exponent,
+                price_precision,
+            )?;
+            let size = Quantity::from_mantissa_exponent_checked(
+                level.qty_mantissa as u64,
+                depth.qty_exponent,
+                size_precision,
+            )?;
+            let order = BookOrder::new(side, price, size, 0);
 
-        let order = BookOrder::new(OrderSide::Buy, price, size, 0);
-
-        deltas.push(OrderBookDelta::new(
-            instrument_id,
-            BookAction::Add,
-            order,
-            flags,
-            sequence,
-            ts_event,
-            ts_init,
-        ));
+            deltas.push(OrderBookDelta::new(
+                instrument_id,
+                BookAction::Add,
+                order,
+                RecordFlag::F_SNAPSHOT as u8,
+                sequence,
+                ts_init,
+                ts_init,
+            ));
+        }
     }
 
-    for (i, level) in depth.asks.iter().enumerate() {
-        let price = Price::from_mantissa_exponent_checked(
-            level.price_mantissa,
-            depth.price_exponent,
-            price_precision,
-        )?;
-        let size = Quantity::from_mantissa_exponent_checked(
-            level.qty_mantissa as u64,
-            depth.qty_exponent,
-            size_precision,
-        )?;
-        let flags = if i == depth.asks.len() - 1 {
-            RecordFlag::F_LAST as u8
-        } else {
-            0
-        };
-
-        let order = BookOrder::new(OrderSide::Sell, price, size, 0);
-
-        deltas.push(OrderBookDelta::new(
-            instrument_id,
-            BookAction::Add,
-            order,
-            flags,
-            sequence,
-            ts_event,
-            ts_init,
-        ));
+    if let Some(delta) = deltas.last_mut() {
+        delta.flags |= RecordFlag::F_LAST as u8;
     }
 
-    if deltas.len() <= 1 {
-        return Ok(None);
-    }
+    Ok(OrderBookDeltas::new(instrument_id, deltas))
+}
 
-    Ok(Some(OrderBookDeltas::new(instrument_id, deltas)))
+// Spot `/api/v3/depth` request weight by level limit
+fn depth_request_weight(limit: u32) -> u32 {
+    match limit {
+        ..=100 => 5,
+        101..=500 => 25,
+        501..=1000 => 50,
+        _ => 250,
+    }
+}
+
+// The HTTP client has already spent its own retries, so an exhausted budget stays retryable
+fn depth_snapshot_error(instrument_id: InstrumentId, e: &BinanceSpotHttpError) -> BinanceBookError {
+    let message = format!("depth snapshot request for {instrument_id} failed: {e}");
+
+    if e.is_retryable() || matches!(e, BinanceSpotHttpError::RetryBudgetExceeded(_)) {
+        BinanceBookError::Retryable(message)
+    } else {
+        BinanceBookError::Permanent(message)
+    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -1472,7 +921,7 @@ impl DataClient for BinanceSpotDataClient {
         self.l1_book_subscriptions.store(AHashMap::new());
         self.quote_refs.store(AHashMap::new());
         self.ticker_refs.store(AHashMap::new());
-        self.book_buffers.store(AHashMap::new());
+        self.book_sync.clear();
 
         Ok(())
     }
@@ -1512,6 +961,7 @@ impl DataClient for BinanceSpotDataClient {
             self.config.us,
             &self.instruments,
             &self.status_cache,
+            &self.instrument_update_lock,
             &self.ws_client,
             &self.data_sender,
             self.clock,
@@ -1524,7 +974,6 @@ impl DataClient for BinanceSpotDataClient {
                 SpotWsClient::Sbe(ws_client) => {
                     log::info!("Connecting to Binance Spot SBE WebSocket...");
                     ws_client.connect().await.map_err(|e| {
-                        log::error!("Binance Spot SBE WebSocket connection failed: {e:?}");
                         anyhow::anyhow!("failed to connect Binance Spot SBE WebSocket: {e}")
                     })?;
                     log::info!("Binance Spot SBE WebSocket connected");
@@ -1533,11 +982,11 @@ impl DataClient for BinanceSpotDataClient {
                     let sender = self.data_sender.clone();
                     let insts = self.instruments.clone();
                     let ws_insts = ws_client.instruments_cache();
-                    let buffers = self.book_buffers.clone();
-                    let book_subs = self.book_subscriptions.clone();
+                    let book_sync = self.book_sync.clone();
                     let l1_book_subs = self.l1_book_subscriptions.clone();
-                    let book_epoch = self.book_epoch.clone();
                     let http = self.http_client.clone();
+                    let snapshot_timeout =
+                        Duration::from_secs(self.config.book_snapshot_timeout_secs);
                     let clock = self.clock;
                     let cancel = self.cancellation_token.clone();
                     let command_spawner = self
@@ -1556,11 +1005,10 @@ impl DataClient for BinanceSpotDataClient {
                                         &sender,
                                         &insts,
                                         &ws_insts,
-                                        &buffers,
-                                        &book_subs,
+                                        &book_sync,
                                         &l1_book_subs,
-                                        &book_epoch,
                                         &http,
+                                        snapshot_timeout,
                                         clock,
                                         &command_spawner,
                                     );
@@ -1579,7 +1027,6 @@ impl DataClient for BinanceSpotDataClient {
                 SpotWsClient::JsonPublic(ws_client) => {
                     log::info!("Connecting to Binance Spot public JSON WebSocket...");
                     ws_client.connect().await.map_err(|e| {
-                        log::error!("Binance Spot public JSON WebSocket connection failed: {e:?}");
                         anyhow::anyhow!("failed to connect Binance Spot public JSON WebSocket: {e}")
                     })?;
                     log::info!("Binance Spot public JSON WebSocket connected");
@@ -1588,11 +1035,11 @@ impl DataClient for BinanceSpotDataClient {
                     let sender = self.data_sender.clone();
                     let insts = self.instruments.clone();
                     let ws_insts = ws_client.instruments_cache();
-                    let buffers = self.book_buffers.clone();
-                    let book_subs = self.book_subscriptions.clone();
+                    let book_sync = self.book_sync.clone();
                     let l1_book_subs = self.l1_book_subscriptions.clone();
-                    let book_epoch = self.book_epoch.clone();
                     let http = self.http_client.clone();
+                    let snapshot_timeout =
+                        Duration::from_secs(self.config.book_snapshot_timeout_secs);
                     let clock = self.clock;
                     let cancel = self.cancellation_token.clone();
                     let command_spawner = self
@@ -1611,11 +1058,10 @@ impl DataClient for BinanceSpotDataClient {
                                         &sender,
                                         &insts,
                                         &ws_insts,
-                                        &buffers,
-                                        &book_subs,
+                                        &book_sync,
                                         &l1_book_subs,
-                                        &book_epoch,
                                         &http,
+                                        snapshot_timeout,
                                         clock,
                                         &command_spawner,
                                     );
@@ -1639,6 +1085,7 @@ impl DataClient for BinanceSpotDataClient {
                 let poll_sender = self.data_sender.clone();
                 let poll_instruments = self.instruments.clone();
                 let poll_status_cache = self.status_cache.clone();
+                let poll_update_lock = self.instrument_update_lock.clone();
                 let poll_cancel = self.cancellation_token.clone();
                 let clock = self.clock;
                 let us = self.config.us;
@@ -1651,6 +1098,8 @@ impl DataClient for BinanceSpotDataClient {
                     loop {
                         tokio::select! {
                             _ = interval.tick() => {
+                                let _guard = poll_update_lock.lock().await;
+
                                 match http.request_symbol_statuses(us).await {
                                     Ok(statuses) => {
                                         let ts = clock.get_time_ns();
@@ -1695,6 +1144,7 @@ impl DataClient for BinanceSpotDataClient {
                 let us = self.config.us;
                 let instruments = self.instruments.clone();
                 let statuses = self.status_cache.clone();
+                let update_lock = self.instrument_update_lock.clone();
                 let ws = self.ws_client.clone();
                 let sender = self.data_sender.clone();
                 let clock = self.clock;
@@ -1713,6 +1163,7 @@ impl DataClient for BinanceSpotDataClient {
                                     us,
                                     &instruments,
                                     &statuses,
+                                    &update_lock,
                                     &ws,
                                     &sender,
                                     clock,
@@ -1760,7 +1211,7 @@ impl DataClient for BinanceSpotDataClient {
         self.l1_book_subscriptions.store(AHashMap::new());
         self.quote_refs.store(AHashMap::new());
         self.ticker_refs.store(AHashMap::new());
-        self.book_buffers.store(AHashMap::new());
+        self.book_sync.clear();
 
         self.is_connected.store(false, Ordering::Release);
         log::info!("Disconnected: client_id={}", self.client_id);
@@ -1830,241 +1281,236 @@ impl DataClient for BinanceSpotDataClient {
     }
 
     fn subscribe_book_deltas(&mut self, cmd: SubscribeBookDeltas) -> anyhow::Result<()> {
-        if cmd.book_type == BookType::L1_MBP {
-            anyhow::ensure!(
-                cmd.depth.is_none_or(|depth| depth.get() == 1),
-                "Binance Spot L1_MBP supports depth 1 only"
-            );
-            anyhow::ensure!(
-                !self.book_subscriptions.contains_key(&cmd.instrument_id),
-                "cannot subscribe L1_MBP and L2_MBP for the same Binance Spot instrument"
-            );
-            self.l1_book_subscriptions.rcu(|subscriptions| {
-                *subscriptions.entry(cmd.instrument_id).or_insert(0) += 1;
-            });
-            self.subscribe_top_of_book(cmd.instrument_id);
-            return Ok(());
-        }
-
-        if cmd.book_type != BookType::L2_MBP {
-            anyhow::bail!("Binance Spot supports L1_MBP and L2_MBP order book subscriptions");
-        }
-        anyhow::ensure!(
-            !self.l1_book_subscriptions.contains_key(&cmd.instrument_id),
-            "cannot subscribe L1_MBP and L2_MBP for the same Binance Spot instrument"
-        );
-
-        let instrument_id = cmd.instrument_id;
-        let ws = self.ws_client.clone();
-        let symbol_lower = instrument_id.symbol.as_str().to_lowercase();
-
-        if self.spot_market_data_mode == BinanceSpotMarketDataMode::Json
-            && let Some(depth) = cmd.depth
-        {
-            // Explicit depth requests use partial-book streams. Full-depth JSON
-            // subscriptions fall through to the REST snapshot + @depth diff path.
-            let depth = depth.get();
-
-            if !BOOK_DEPTHS_JSON.contains(&depth) {
-                anyhow::bail!(
-                    "Invalid depth {depth} for Binance Spot JSON order book. \
-                    Valid values: {BOOK_DEPTHS_JSON:?}"
+        execute_instrument_subscriptions(&cmd.instrument_ids, |instrument_id| {
+            let cmd = cmd.with_instrument_ids(instrument_id);
+            if cmd.book_type == BookType::L1_MBP {
+                anyhow::ensure!(
+                    cmd.depth.is_none_or(|depth| depth.get() == 1),
+                    "Binance Spot L1_MBP supports depth 1 only"
                 );
+                anyhow::ensure!(
+                    !self.book_subscriptions.contains_key(&instrument_id),
+                    "cannot subscribe L1_MBP and L2_MBP for the same Binance Spot instrument"
+                );
+                self.l1_book_subscriptions.rcu(|subscriptions| {
+                    *subscriptions.entry(instrument_id).or_insert(0) += 1;
+                });
+
+                self.subscribe_top_of_book(instrument_id);
+                return Ok(());
             }
 
-            let depth_level = depth as u32;
-            self.book_subscriptions.insert(instrument_id, depth_level);
+            if cmd.book_type != BookType::L2_MBP {
+                anyhow::bail!("Binance Spot supports L1_MBP and L2_MBP order book subscriptions");
+            }
 
-            let stream = format!("{symbol_lower}@depth{depth_level}");
+            anyhow::ensure!(
+                !self.l1_book_subscriptions.contains_key(&instrument_id),
+                "cannot subscribe L1_MBP and L2_MBP for the same Binance Spot instrument"
+            );
+
+            let ws = self.ws_client.clone();
+            let symbol_lower = instrument_id.symbol.as_str().to_lowercase();
+            let stream = self.depth_stream(
+                &symbol_lower,
+                cmd.depth.map(|d| d.get()),
+                cmd.params.as_ref(),
+            )?;
+
+            if let Some(existing) = self.book_subscriptions.load().get(&instrument_id) {
+                anyhow::ensure!(
+                    existing == &stream,
+                    "unsubscribe before changing Binance Spot book depth or update_speed"
+                );
+                return Ok(());
+            }
+
+            if self.spot_market_data_mode == BinanceSpotMarketDataMode::Json
+                && let Some(depth) = cmd.depth
+            {
+                // Explicit depth requests use partial-book streams. Full-depth JSON
+                // subscriptions fall through to the REST snapshot + @depth diff path.
+                let depth = depth.get();
+
+                if !BOOK_DEPTHS_JSON.contains(&depth) {
+                    anyhow::bail!(
+                        "Invalid depth {depth} for Binance Spot JSON order book. \
+                        Valid values: {BOOK_DEPTHS_JSON:?}"
+                    );
+                }
+
+                self.book_subscriptions
+                    .insert(instrument_id, stream.clone());
+                self.spawn_ws(
+                    chain_command(&self.book_command_tail, async move {
+                        ws.subscribe(vec![stream])
+                            .await
+                            .context("book deltas subscription")
+                    }),
+                    "order book subscription",
+                );
+
+                return Ok(());
+            }
+
+            match cmd.depth.map(|d| d.get()) {
+                // Partial book streams are self-contained snapshots.
+                Some(depth) => {
+                    anyhow::ensure!(
+                        depth == 20,
+                        "Binance Spot SBE partial books support depth 20 only; use JSON market data for other depths"
+                    );
+                    self.book_subscriptions
+                        .insert(instrument_id, stream.clone());
+                    self.spawn_ws(
+                        chain_command(&self.book_command_tail, async move {
+                            ws.subscribe(vec![stream])
+                                .await
+                                .context("book deltas subscription")
+                        }),
+                        "order book subscription",
+                    );
+                }
+                // Full book diffs are seeded by a REST snapshot and replayed.
+                None => {
+                    self.book_subscriptions
+                        .insert(instrument_id, stream.clone());
+
+                    // Resync from the next diff, cancelling any recovery from a prior subscription
+                    self.book_sync.subscribe(instrument_id);
+
+                    self.spawn_ws(
+                        chain_command(&self.book_command_tail, async move {
+                            ws.subscribe(vec![stream])
+                                .await
+                                .context("book deltas subscription")
+                        }),
+                        "order book subscription",
+                    );
+                }
+            }
+
+            Ok(())
+        })
+    }
+
+    fn subscribe_quotes(&mut self, cmd: SubscribeQuotes) -> anyhow::Result<()> {
+        execute_instrument_subscriptions(&cmd.instrument_ids, |instrument_id| {
+            self.subscribe_top_of_book(instrument_id);
+            Ok(())
+        })
+    }
+
+    fn subscribe_trades(&mut self, cmd: SubscribeTrades) -> anyhow::Result<()> {
+        execute_instrument_subscriptions(&cmd.instrument_ids, |instrument_id| {
+            let ws = self.ws_client.clone();
+
+            let stream = format!("{}@trade", instrument_id.symbol.as_str().to_lowercase());
+
             self.spawn_ws(
                 async move {
                     ws.subscribe(vec![stream])
                         .await
-                        .context("book deltas subscription")
+                        .context("trades subscription")
                 },
-                "order book subscription",
+                "trade subscription",
             );
-            return Ok(());
-        }
 
-        match cmd.depth.map(|d| d.get()) {
-            // Partial book streams are self-contained snapshots.
-            Some(depth) => {
-                anyhow::ensure!(
-                    depth == 20,
-                    "Binance Spot SBE partial books support depth 20 only; use JSON market data for other depths"
-                );
-                let depth_level = depth as u32;
-                self.book_subscriptions.insert(instrument_id, depth_level);
-
-                let stream = format!("{symbol_lower}@depth{depth_level}");
-                self.spawn_ws(
-                    async move {
-                        ws.subscribe(vec![stream])
-                            .await
-                            .context("book deltas subscription")
-                    },
-                    "order book subscription",
-                );
-            }
-            // Full book diffs are seeded by a REST snapshot and replayed.
-            None => {
-                self.book_subscriptions.insert(instrument_id, 0);
-
-                // Bump epoch to invalidate any in-flight snapshot from a prior subscription
-                let epoch = {
-                    let mut guard = self.book_epoch.write();
-                    *guard = guard.wrapping_add(1);
-                    *guard
-                };
-
-                // Start buffering diffs before the snapshot lands
-                self.book_buffers
-                    .insert(instrument_id, BookBuffer::new(epoch));
-
-                log::debug!("OrderBook full snapshot rebuild for {instrument_id} starting");
-
-                let stream = format!("{symbol_lower}@depth");
-                self.spawn_ws(
-                    async move {
-                        ws.subscribe(vec![stream])
-                            .await
-                            .context("book deltas subscription")
-                    },
-                    "order book subscription",
-                );
-
-                let http = self.http_client.clone();
-                let sender = self.data_sender.clone();
-                let buffers = self.book_buffers.clone();
-                let instruments = self.instruments.clone();
-                let clock = self.clock;
-
-                self.spawn_command(async move {
-                    Self::fetch_and_emit_snapshot(
-                        http,
-                        sender,
-                        buffers,
-                        instruments,
-                        instrument_id,
-                        epoch,
-                        clock,
-                    )
-                    .await;
-                });
-            }
-        }
-        Ok(())
-    }
-
-    fn subscribe_quotes(&mut self, cmd: SubscribeQuotes) -> anyhow::Result<()> {
-        self.subscribe_top_of_book(cmd.instrument_id);
-        Ok(())
-    }
-
-    fn subscribe_trades(&mut self, cmd: SubscribeTrades) -> anyhow::Result<()> {
-        let instrument_id = cmd.instrument_id;
-        let ws = self.ws_client.clone();
-
-        let stream = format!("{}@trade", instrument_id.symbol.as_str().to_lowercase());
-
-        self.spawn_ws(
-            async move {
-                ws.subscribe(vec![stream])
-                    .await
-                    .context("trades subscription")
-            },
-            "trade subscription",
-        );
-        Ok(())
+            Ok(())
+        })
     }
 
     fn subscribe_bars(&mut self, cmd: SubscribeBars) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.spot_market_data_mode == BinanceSpotMarketDataMode::Json,
-            "Binance Spot kline subscriptions require JSON market-data mode"
-        );
-        let bar_type = cmd.bar_type;
-        let ws = self.ws_client.clone();
-        let interval = bar_spec_to_binance_interval(bar_type.spec())?;
+        execute_bar_subscriptions(&cmd.bar_types, |bar_type| {
+            anyhow::ensure!(
+                self.spot_market_data_mode == BinanceSpotMarketDataMode::Json,
+                "Binance Spot kline subscriptions require JSON market-data mode"
+            );
+            let ws = self.ws_client.clone();
+            let interval = bar_spec_to_binance_interval(bar_type.spec())?;
 
-        let stream = format!(
-            "{}@kline_{}",
-            bar_type.instrument_id().symbol.as_str().to_lowercase(),
-            interval.as_str()
-        );
+            let stream = format!(
+                "{}@kline_{}",
+                bar_type.instrument_id().symbol.as_str().to_lowercase(),
+                interval.as_str()
+            );
 
-        self.spawn_ws(
-            async move {
-                ws.subscribe(vec![stream])
-                    .await
-                    .context("bars subscription")
-            },
-            "bar subscription",
-        );
-        Ok(())
+            self.spawn_ws(
+                async move {
+                    ws.subscribe(vec![stream])
+                        .await
+                        .context("bars subscription")
+                },
+                "bar subscription",
+            );
+
+            Ok(())
+        })
     }
 
     fn subscribe_instrument_status(
         &mut self,
         cmd: SubscribeInstrumentStatus,
     ) -> anyhow::Result<()> {
-        log::debug!(
-            "subscribe_instrument_status: {id} (status changes detected via periodic exchange info polling)",
-            id = cmd.instrument_id,
-        );
-        Ok(())
+        execute_instrument_subscriptions(&cmd.instrument_ids, |instrument_id| {
+            log::debug!(
+                "subscribe_instrument_status: {instrument_id} (status changes detected via periodic exchange info polling)",
+            );
+            Ok(())
+        })
     }
 
     fn unsubscribe_book_deltas(&mut self, cmd: &UnsubscribeBookDeltas) -> anyhow::Result<()> {
-        let instrument_id = cmd.instrument_id;
+        execute_instrument_subscriptions(&cmd.instrument_ids, |instrument_id| {
+            if let Some(count) = self
+                .l1_book_subscriptions
+                .load()
+                .get(&instrument_id)
+                .copied()
+            {
+                if count == 1 {
+                    self.l1_book_subscriptions.remove(&instrument_id);
+                } else {
+                    self.l1_book_subscriptions.rcu(|subscriptions| {
+                        if let Some(existing) = subscriptions.get_mut(&instrument_id) {
+                            *existing -= 1;
+                        }
+                    });
+                }
 
-        if let Some(count) = self
-            .l1_book_subscriptions
-            .load()
-            .get(&instrument_id)
-            .copied()
-        {
-            if count == 1 {
-                self.l1_book_subscriptions.remove(&instrument_id);
-            } else {
-                self.l1_book_subscriptions.rcu(|subscriptions| {
-                    if let Some(existing) = subscriptions.get_mut(&instrument_id) {
-                        *existing -= 1;
-                    }
-                });
+                self.unsubscribe_top_of_book(instrument_id);
+                return Ok(());
             }
-            self.unsubscribe_top_of_book(instrument_id);
-            return Ok(());
-        }
-        let ws = self.ws_client.clone();
 
-        // Stop buffering/tracking so any in-flight snapshot task is discarded
-        self.book_subscriptions.remove(&instrument_id);
-        self.book_buffers.remove(&instrument_id);
+            let ws = self.ws_client.clone();
 
-        let symbol_lower = instrument_id.symbol.as_str().to_lowercase();
-        let streams = vec![
-            format!("{symbol_lower}@depth"),
-            format!("{symbol_lower}@depth5"),
-            format!("{symbol_lower}@depth10"),
-            format!("{symbol_lower}@depth20"),
-        ];
+            // Stop book sync so an in-flight snapshot cannot emit after unsubscribe
+            let stream = self.book_subscriptions.load().get(&instrument_id).cloned();
+            self.book_subscriptions.remove(&instrument_id);
+            self.book_sync.remove(instrument_id);
 
-        self.spawn_ws(
-            async move {
-                ws.unsubscribe(streams)
-                    .await
-                    .context("book deltas unsubscribe")
-            },
-            "order book unsubscribe",
-        );
-        Ok(())
+            let Some(stream) = stream else {
+                return Ok(());
+            };
+
+            self.spawn_ws(
+                chain_command(&self.book_command_tail, async move {
+                    ws.unsubscribe(vec![stream])
+                        .await
+                        .context("book deltas unsubscribe")
+                }),
+                "order book unsubscribe",
+            );
+
+            Ok(())
+        })
     }
 
     fn unsubscribe_quotes(&mut self, cmd: &UnsubscribeQuotes) -> anyhow::Result<()> {
-        self.unsubscribe_top_of_book(cmd.instrument_id);
-        Ok(())
+        execute_instrument_subscriptions(&cmd.instrument_ids, |instrument_id| {
+            self.unsubscribe_top_of_book(instrument_id);
+            Ok(())
+        })
     }
 
     fn unsubscribe(&mut self, cmd: &UnsubscribeCustomData) -> anyhow::Result<()> {
@@ -2108,53 +1554,56 @@ impl DataClient for BinanceSpotDataClient {
     }
 
     fn unsubscribe_trades(&mut self, cmd: &UnsubscribeTrades) -> anyhow::Result<()> {
-        let instrument_id = cmd.instrument_id;
-        let ws = self.ws_client.clone();
+        execute_instrument_subscriptions(&cmd.instrument_ids, |instrument_id| {
+            let ws = self.ws_client.clone();
 
-        let stream = format!("{}@trade", instrument_id.symbol.as_str().to_lowercase());
+            let stream = format!("{}@trade", instrument_id.symbol.as_str().to_lowercase());
 
-        self.spawn_ws(
-            async move {
-                ws.unsubscribe(vec![stream])
-                    .await
-                    .context("trades unsubscribe")
-            },
-            "trade unsubscribe",
-        );
-        Ok(())
+            self.spawn_ws(
+                async move {
+                    ws.unsubscribe(vec![stream])
+                        .await
+                        .context("trades unsubscribe")
+                },
+                "trade unsubscribe",
+            );
+
+            Ok(())
+        })
     }
 
     fn unsubscribe_bars(&mut self, cmd: &UnsubscribeBars) -> anyhow::Result<()> {
-        let bar_type = cmd.bar_type;
-        let ws = self.ws_client.clone();
-        let interval = bar_spec_to_binance_interval(bar_type.spec())?;
+        execute_bar_subscriptions(&cmd.bar_types, |bar_type| {
+            let ws = self.ws_client.clone();
+            let interval = bar_spec_to_binance_interval(bar_type.spec())?;
 
-        let stream = format!(
-            "{}@kline_{}",
-            bar_type.instrument_id().symbol.as_str().to_lowercase(),
-            interval.as_str()
-        );
+            let stream = format!(
+                "{}@kline_{}",
+                bar_type.instrument_id().symbol.as_str().to_lowercase(),
+                interval.as_str()
+            );
 
-        self.spawn_ws(
-            async move {
-                ws.unsubscribe(vec![stream])
-                    .await
-                    .context("bars unsubscribe")
-            },
-            "bar unsubscribe",
-        );
-        Ok(())
+            self.spawn_ws(
+                async move {
+                    ws.unsubscribe(vec![stream])
+                        .await
+                        .context("bars unsubscribe")
+                },
+                "bar unsubscribe",
+            );
+
+            Ok(())
+        })
     }
 
     fn unsubscribe_instrument_status(
         &mut self,
         cmd: &UnsubscribeInstrumentStatus,
     ) -> anyhow::Result<()> {
-        log::debug!(
-            "unsubscribe_instrument_status: {id}",
-            id = cmd.instrument_id,
-        );
-        Ok(())
+        execute_instrument_subscriptions(&cmd.instrument_ids, |instrument_id| {
+            log::debug!("unsubscribe_instrument_status: {instrument_id}",);
+            Ok(())
+        })
     }
 
     fn request_instruments(&self, request: RequestInstruments) -> anyhow::Result<()> {
@@ -2176,9 +1625,7 @@ impl DataClient for BinanceSpotDataClient {
         self.spawn_command(async move {
             match http.request_instruments_with_config(&provider, us).await {
                 Ok(instruments) => {
-                    for instrument in &instruments {
-                        upsert_instrument(&instruments_cache, instrument.clone());
-                    }
+                    upsert_instruments(&instruments_cache, &instruments);
 
                     let response = DataResponse::Instruments(InstrumentsResponse::new(
                         request_id,
@@ -2203,10 +1650,11 @@ impl DataClient for BinanceSpotDataClient {
     }
 
     fn request_instrument(&self, request: RequestInstrument) -> anyhow::Result<()> {
+        let instrument_id = request.single_instrument_id()?;
+
         let http = self.http_client.clone();
         let sender = self.data_sender.clone();
         let instruments = self.instruments.clone();
-        let instrument_id = request.instrument_id;
         let request_id = request.request_id;
         let client_id = request.client_id.unwrap_or(self.client_id);
         let start = request.start;
@@ -2221,9 +1669,7 @@ impl DataClient for BinanceSpotDataClient {
         self.spawn_command(async move {
             match http.request_instruments_with_config(&provider, us).await {
                 Ok(all_instruments) => {
-                    for instrument in &all_instruments {
-                        upsert_instrument(&instruments, instrument.clone());
-                    }
+                    upsert_instruments(&instruments, &all_instruments);
 
                     let instrument = all_instruments
                         .into_iter()
@@ -2316,9 +1762,10 @@ impl DataClient for BinanceSpotDataClient {
     }
 
     fn request_trades(&self, request: RequestTrades) -> anyhow::Result<()> {
+        let instrument_id = request.single_instrument_id()?;
+
         let http = self.http_client.clone();
         let sender = self.data_sender.clone();
-        let instrument_id = request.instrument_id;
         let limit = request.limit.map(|n| n.get() as u32);
         let request_id = request.request_id;
         let client_id = request.client_id.unwrap_or(self.client_id);
@@ -2366,9 +1813,10 @@ impl DataClient for BinanceSpotDataClient {
     }
 
     fn request_bars(&self, request: RequestBars) -> anyhow::Result<()> {
+        let bar_type = request.single_bar_type()?;
+
         let http = self.http_client.clone();
         let sender = self.data_sender.clone();
-        let bar_type = request.bar_type;
         let start = request.start;
         let end = request.end;
         let limit = request.limit.map(|n| n.get() as u32);
@@ -2419,21 +1867,30 @@ impl DataClient for BinanceSpotDataClient {
     }
 
     fn request_book_snapshot(&self, request: RequestBookSnapshot) -> anyhow::Result<()> {
+        let instrument_id = request.single_instrument_id()?;
+
         let depth = request.depth.map(|value| value.get() as u32);
         anyhow::ensure!(
             depth.is_none_or(|value| (1..=5000).contains(&value)),
             "Binance Spot order-book depth must be between 1 and 5000"
         );
         let http = self.http_client.clone();
+        let book_sync = self.book_sync.clone();
         let sender = self.data_sender.clone();
-        let instrument_id = request.instrument_id;
         let request_id = request.request_id;
         let client_id = request.client_id.unwrap_or(self.client_id);
         let params = request.params;
         let clock = self.clock;
 
         self.spawn_command(async move {
-            match http.request_book_snapshot(instrument_id, depth).await {
+            // The venue applies a 100-level limit when none is given
+            let weight = depth_request_weight(depth.unwrap_or(100));
+            let permit = book_sync.pacer().acquire(weight).await;
+
+            match http
+                .request_book_snapshot_with_permit(instrument_id, depth, Some(permit))
+                .await
+            {
                 Ok(book) => {
                     let response = DataResponse::Book(BookResponse::new(
                         request_id,
@@ -2458,6 +1915,34 @@ impl DataClient for BinanceSpotDataClient {
 }
 
 impl BinanceSpotDataClient {
+    fn depth_stream(
+        &self,
+        symbol: &str,
+        depth: Option<usize>,
+        params: Option<&Params>,
+    ) -> anyhow::Result<String> {
+        let mut stream = match depth {
+            Some(depth) => format!("{symbol}@depth{depth}"),
+            None => format!("{symbol}@depth"),
+        };
+
+        if self.spot_market_data_mode == BinanceSpotMarketDataMode::Json {
+            let speed = params.and_then(|p| p.get("update_speed"));
+            if let Some(speed) = speed {
+                anyhow::ensure!(
+                    matches!(speed.as_u64(), Some(100 | 1000)),
+                    "Binance Spot JSON update_speed must be 100 or 1000, was {speed}"
+                );
+            }
+
+            if speed.is_none_or(|speed| speed.as_u64() == Some(100)) {
+                stream.push_str("@100ms");
+            }
+        }
+
+        Ok(stream)
+    }
+
     fn subscribe_top_of_book(&self, instrument_id: InstrumentId) {
         let should_subscribe = {
             let previous = self
@@ -2516,36 +2001,6 @@ impl BinanceSpotDataClient {
                 },
                 "top-of-book unsubscribe",
             );
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct BufferedDepthUpdate {
-    deltas: OrderBookDeltas,
-    first_update_id: u64,
-    final_update_id: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BookSyncStatus {
-    Buffering,
-    Failed,
-}
-
-#[derive(Debug, Clone)]
-struct BookBuffer {
-    updates: Vec<BufferedDepthUpdate>,
-    epoch: u64,
-    status: BookSyncStatus,
-}
-
-impl BookBuffer {
-    fn new(epoch: u64) -> Self {
-        Self {
-            updates: Vec::new(),
-            epoch,
-            status: BookSyncStatus::Buffering,
         }
     }
 }
@@ -2634,40 +2089,57 @@ fn looks_like_spot_sbe_ws_url(base_url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{num::NonZeroU32, sync::Arc, time::Duration};
 
-    use nautilus_common::messages::DataEvent;
+    use nautilus_common::{
+        live::{runner::replace_data_event_sender, sender::EventSender},
+        messages::DataEvent,
+        testing::wait_until_async,
+    };
     use nautilus_core::{AtomicMap, nanos::UnixNanos, time::AtomicTime};
     use nautilus_live::task::TaskGroup;
     use nautilus_model::{
-        data::{BookOrder, Data, OrderBookDelta, OrderBookDeltas},
-        enums::{BookAction, OrderSide, RecordFlag},
+        data::Data,
+        enums::{BookAction, RecordFlag},
         identifiers::InstrumentId,
         instruments::{Instrument, InstrumentAny, stubs::currency_pair_btcusdt},
-        types::{Price, Quantity},
     };
-    use parking_lot::RwLock;
+    use parking_lot::Mutex;
     use rstest::rstest;
     use rust_decimal_macros::dec;
     use ustr::Ustr;
 
     use super::{
-        BinanceDepth, BinanceEnvironment, BinanceSpotDataClient, BinanceSpotMarketDataMode,
-        BookBuffer, BufferedDepthUpdate, first_applicable_spot_update, parse_spot_depth_snapshot,
-        resolve_spot_json_ws_url, spot_continuity_ok, spot_overlap_valid,
-        spot_snapshot_retry_backoff,
+        BinanceBookError, BinanceDepth, BinanceEnvironment, BinanceSpotDataClient,
+        BinanceSpotHttpError, BinanceSpotMarketDataMode, depth_request_weight,
+        depth_snapshot_error, parse_spot_depth_snapshot, resolve_spot_json_ws_url,
     };
     use crate::{
-        common::consts::BINANCE_SPOT_WS_URL,
+        book::{
+            pacing::SnapshotPacer,
+            sync::{BookSyncTracker, DepthSequencing},
+        },
+        common::{
+            consts::{BINANCE_CLIENT_ID, BINANCE_SPOT_WS_URL},
+            websocket::chain_command,
+        },
+        config::BinanceDataClientConfig,
         spot::{
             http::{BinancePriceLevel, BinanceSpotHttpClient},
-            sbe::stream::BestBidAskStreamEvent,
+            sbe::stream::{
+                BestBidAskStreamEvent, DepthDiffStreamEvent, DepthSnapshotStreamEvent, PriceLevel,
+                Trade, TradesStreamEvent,
+            },
             websocket::streams::messages::BinanceSpotWsMessage,
         },
     };
 
     #[rstest]
-    fn handle_ws_message_uses_clock_timestamp_for_sbe_bbo_ts_init() {
+    #[case::trades("trades")]
+    #[case::bbo("bbo")]
+    #[case::snapshot("snapshot")]
+    #[case::diff("diff")]
+    fn handle_ws_message_rejects_invalid_sbe_then_processes_valid_bbo(#[case] kind: &str) {
         let ts_init = UnixNanos::from(1_800_000_000_000_000_000u64);
         let clock = Box::leak(Box::new(AtomicTime::new(false, ts_init)));
         let instrument = InstrumentAny::CurrencyPair(currency_pair_btcusdt());
@@ -2675,10 +2147,7 @@ mod tests {
         instruments.insert(instrument.id(), instrument.clone());
         let ws_instruments = Arc::new(AtomicMap::new());
         ws_instruments.insert(Ustr::from("BTCUSDT"), instrument);
-        let book_buffers = Arc::new(AtomicMap::<InstrumentId, BookBuffer>::new());
-        let book_subscriptions = Arc::new(AtomicMap::<InstrumentId, u32>::new());
         let l1_book_subscriptions = Arc::new(AtomicMap::<InstrumentId, u32>::new());
-        let book_epoch = Arc::new(RwLock::new(0));
         let http_client = BinanceSpotHttpClient::new(
             BinanceEnvironment::Testnet,
             clock,
@@ -2691,6 +2160,10 @@ mod tests {
         )
         .unwrap();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender = EventSender::from(sender);
+        let pacer = SnapshotPacer::new(NonZeroU32::new(60_000).unwrap());
+        let book_sync =
+            BookSyncTracker::new(DepthSequencing::Spot, sender.clone(), Arc::new(pacer));
         let event_time_us = 1_700_000_000_000_000;
         let message = BinanceSpotWsMessage::BestBidAsk(BestBidAskStreamEvent {
             event_time_us,
@@ -2706,16 +2179,92 @@ mod tests {
         let command_tasks = TaskGroup::new();
         let command_spawner = command_tasks.spawner().unwrap();
 
+        let invalid_level = PriceLevel {
+            price_mantissa: i64::MAX,
+            qty_mantissa: 1,
+        };
+
+        let invalid = match kind {
+            "trades" => BinanceSpotWsMessage::Trades(TradesStreamEvent {
+                event_time_us,
+                transact_time_us: event_time_us,
+                price_exponent: 0,
+                qty_exponent: 0,
+                trades: vec![
+                    Trade {
+                        id: 1,
+                        price_mantissa: 1,
+                        qty_mantissa: 1,
+                        is_buyer_maker: false,
+                    },
+                    Trade {
+                        id: 2,
+                        price_mantissa: i64::MAX,
+                        qty_mantissa: 1,
+                        is_buyer_maker: true,
+                    },
+                ],
+                symbol: Ustr::from("BTCUSDT"),
+            }),
+            "bbo" => BinanceSpotWsMessage::BestBidAsk(BestBidAskStreamEvent {
+                event_time_us,
+                book_update_id: 122,
+                price_exponent: 0,
+                qty_exponent: 0,
+                bid_price_mantissa: i64::MAX,
+                bid_qty_mantissa: 1,
+                ask_price_mantissa: 1,
+                ask_qty_mantissa: 1,
+                symbol: Ustr::from("BTCUSDT"),
+            }),
+            "snapshot" => BinanceSpotWsMessage::DepthSnapshot(DepthSnapshotStreamEvent {
+                event_time_us,
+                book_update_id: 122,
+                price_exponent: 0,
+                qty_exponent: 0,
+                bids: vec![invalid_level],
+                asks: vec![],
+                symbol: Ustr::from("BTCUSDT"),
+            }),
+            "diff" => BinanceSpotWsMessage::DepthDiff(DepthDiffStreamEvent {
+                event_time_us,
+                first_book_update_id: 121,
+                last_book_update_id: 122,
+                price_exponent: 0,
+                qty_exponent: 0,
+                bids: vec![invalid_level],
+                asks: vec![],
+                symbol: Ustr::from("BTCUSDT"),
+            }),
+            _ => unreachable!(),
+        };
+
         BinanceSpotDataClient::handle_ws_message(
-            message,
-            &sender.into(),
+            invalid,
+            &sender,
             &instruments,
             &ws_instruments,
-            &book_buffers,
-            &book_subscriptions,
+            &book_sync,
             &l1_book_subscriptions,
-            &book_epoch,
             &http_client,
+            Duration::from_secs(10),
+            clock,
+            &command_spawner,
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        BinanceSpotDataClient::handle_ws_message(
+            message,
+            &sender,
+            &instruments,
+            &ws_instruments,
+            &book_sync,
+            &l1_book_subscriptions,
+            &http_client,
+            Duration::from_secs(10),
             clock,
             &command_spawner,
         );
@@ -2723,61 +2272,59 @@ mod tests {
         let DataEvent::Data(Data::Quote(quote)) = receiver.try_recv().unwrap() else {
             panic!("expected quote data event");
         };
+
+        assert_eq!(quote.instrument_id, InstrumentId::from("BTCUSDT.BINANCE"));
+        assert_eq!(quote.bid_price.as_decimal(), dec!(123.45));
+        assert_eq!(quote.ask_price.as_decimal(), dec!(123.50));
+        assert_eq!(quote.bid_size.as_decimal(), dec!(2.5));
+        assert_eq!(quote.ask_size.as_decimal(), dec!(3.0));
         assert_eq!(quote.ts_event, UnixNanos::from_micros(event_time_us as u64));
         assert_eq!(quote.ts_init, ts_init);
     }
 
     #[rstest]
-    fn overlap_accepts_first_diff_straddling_snapshot() {
-        assert!(spot_overlap_valid(90, 110, 100));
-        assert!(spot_overlap_valid(101, 101, 100));
-        assert!(spot_overlap_valid(101, 200, 100));
-    }
+    #[tokio::test]
+    async fn chained_book_commands_run_in_issue_order() {
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        replace_data_event_sender(sender);
 
-    #[rstest]
-    fn overlap_rejects_gap_and_stale() {
-        assert!(!spot_overlap_valid(103, 110, 100));
-        assert!(!spot_overlap_valid(90, 100, 100));
-    }
+        let config = BinanceDataClientConfig {
+            spot_market_data_mode: BinanceSpotMarketDataMode::Json,
+            ..Default::default()
+        };
 
-    #[rstest]
-    fn continuity_skips_first_then_requires_contiguous_u() {
-        assert!(spot_continuity_ok(true, 999, 100));
-        assert!(spot_continuity_ok(false, 101, 100));
-        assert!(!spot_continuity_ok(false, 102, 100));
-        assert!(!spot_continuity_ok(false, 100, 100));
-    }
+        let client = BinanceSpotDataClient::new(*BINANCE_CLIENT_ID, config).unwrap();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let unsubscribe = Arc::clone(&order);
+        let subscribe = Arc::clone(&order);
 
-    #[rstest]
-    #[case(0, 250)]
-    #[case(1, 500)]
-    #[case(2, 1_000)]
-    #[case(3, 2_000)]
-    #[case(4, 3_000)]
-    #[case(5, 3_000)]
-    fn snapshot_retry_backoff_exponentially_increases_then_caps(
-        #[case] retry_count: u32,
-        #[case] expected_ms: u64,
-    ) {
-        assert_eq!(
-            spot_snapshot_retry_backoff(retry_count),
-            Duration::from_millis(expected_ms)
+        client.spawn_ws(
+            chain_command(&client.book_command_tail, async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                unsubscribe.lock().push("unsubscribe");
+                Ok(())
+            }),
+            "order book unsubscribe",
         );
-    }
 
-    #[rstest]
-    fn first_applicable_update_skips_stale_diffs() {
-        let updates = vec![
-            buffered_update(90, 100),
-            buffered_update(101, 101),
-            buffered_update(102, 103),
-        ];
+        client.spawn_ws(
+            chain_command(&client.book_command_tail, async move {
+                subscribe.lock().push("subscribe");
+                Ok(())
+            }),
+            "order book subscription",
+        );
 
-        let update = first_applicable_spot_update(&updates, 100).unwrap();
+        wait_until_async(
+            || {
+                let finished = order.lock().len() == 2;
+                async move { finished }
+            },
+            Duration::from_secs(5),
+        )
+        .await;
 
-        assert_eq!(update.first_update_id, 101);
-        assert_eq!(update.final_update_id, 101);
-        assert!(first_applicable_spot_update(&updates, 103).is_none());
+        assert_eq!(*order.lock(), vec!["unsubscribe", "subscribe"]);
     }
 
     #[rstest]
@@ -2788,27 +2335,22 @@ mod tests {
             vec![price_level(10_100, 2_000)],
         );
 
-        let deltas = parse_spot_depth_snapshot(
-            &depth,
-            instrument_id,
-            2,
-            3,
-            UnixNanos::from(1),
-            UnixNanos::from(2),
-        )
-        .unwrap()
-        .unwrap();
+        let deltas =
+            parse_spot_depth_snapshot(&depth, instrument_id, 2, 3, UnixNanos::from(2)).unwrap();
 
         assert_eq!(deltas.deltas.len(), 3);
         assert_eq!(deltas.deltas[0].sequence, 123);
         assert_eq!(deltas.deltas[1].sequence, 123);
         assert_eq!(deltas.deltas[2].sequence, 123);
-        assert_eq!(deltas.ts_event, UnixNanos::from(1));
+        assert_eq!(deltas.ts_event, UnixNanos::from(2));
         assert_eq!(deltas.ts_init, UnixNanos::from(2));
         assert_eq!(deltas.deltas[1].order.price.as_decimal(), dec!(100.00));
         assert_eq!(deltas.deltas[1].order.size.as_decimal(), dec!(1.000));
-        assert_eq!(deltas.deltas[1].flags, 0);
-        assert_eq!(deltas.deltas[2].flags, RecordFlag::F_LAST as u8);
+        assert_eq!(deltas.deltas[1].flags, RecordFlag::F_SNAPSHOT as u8);
+        assert_eq!(
+            deltas.deltas[2].flags,
+            RecordFlag::F_SNAPSHOT as u8 | RecordFlag::F_LAST as u8
+        );
     }
 
     #[rstest]
@@ -2816,37 +2358,31 @@ mod tests {
         let instrument_id = InstrumentId::from("BTCUSDT.BINANCE");
         let depth = depth_snapshot(vec![price_level(10_000, 1_000)], vec![]);
 
-        let deltas = parse_spot_depth_snapshot(
-            &depth,
-            instrument_id,
-            2,
-            3,
-            UnixNanos::from(1),
-            UnixNanos::from(2),
-        )
-        .unwrap()
-        .unwrap();
+        let deltas =
+            parse_spot_depth_snapshot(&depth, instrument_id, 2, 3, UnixNanos::from(2)).unwrap();
 
         assert_eq!(deltas.deltas.len(), 2);
-        assert_eq!(deltas.deltas[1].flags, RecordFlag::F_LAST as u8);
+        assert_eq!(
+            deltas.deltas[1].flags,
+            RecordFlag::F_SNAPSHOT as u8 | RecordFlag::F_LAST as u8
+        );
     }
 
     #[rstest]
-    fn parse_spot_depth_snapshot_returns_none_for_empty_book() {
+    fn parse_spot_depth_snapshot_returns_clear_only_for_empty_book() {
         let instrument_id = InstrumentId::from("BTCUSDT.BINANCE");
         let depth = depth_snapshot(vec![], vec![]);
 
-        let deltas = parse_spot_depth_snapshot(
-            &depth,
-            instrument_id,
-            2,
-            3,
-            UnixNanos::from(1),
-            UnixNanos::from(2),
-        )
-        .unwrap();
+        let deltas =
+            parse_spot_depth_snapshot(&depth, instrument_id, 2, 3, UnixNanos::from(2)).unwrap();
 
-        assert!(deltas.is_none());
+        assert_eq!(deltas.deltas.len(), 1);
+        assert_eq!(deltas.deltas[0].action, BookAction::Clear);
+        assert_eq!(deltas.deltas[0].sequence, 123);
+        assert_eq!(
+            deltas.deltas[0].flags,
+            RecordFlag::F_SNAPSHOT as u8 | RecordFlag::F_LAST as u8
+        );
     }
 
     #[rstest]
@@ -2860,14 +2396,7 @@ mod tests {
             asks: vec![],
         };
 
-        let result = parse_spot_depth_snapshot(
-            &depth,
-            instrument_id,
-            2,
-            3,
-            UnixNanos::from(1),
-            UnixNanos::from(2),
-        );
+        let result = parse_spot_depth_snapshot(&depth, instrument_id, 2, 3, UnixNanos::from(2));
 
         assert!(result.is_err());
     }
@@ -2883,43 +2412,9 @@ mod tests {
             asks: vec![],
         };
 
-        let result = parse_spot_depth_snapshot(
-            &depth,
-            instrument_id,
-            2,
-            3,
-            UnixNanos::from(1),
-            UnixNanos::from(2),
-        );
+        let result = parse_spot_depth_snapshot(&depth, instrument_id, 2, 3, UnixNanos::from(2));
 
         assert!(result.is_err());
-    }
-
-    fn buffered_update(first_update_id: u64, final_update_id: u64) -> BufferedDepthUpdate {
-        let instrument_id = InstrumentId::from("BTCUSDT.BINANCE");
-        let ts = UnixNanos::default();
-        let order = BookOrder::new(
-            OrderSide::Buy,
-            Price::from_raw(1, 0),
-            Quantity::from_raw(1, 0),
-            0,
-        );
-        let delta = OrderBookDelta::new(
-            instrument_id,
-            BookAction::Update,
-            order,
-            0,
-            final_update_id,
-            ts,
-            ts,
-        );
-        let deltas = OrderBookDeltas::new(instrument_id, vec![delta]);
-
-        BufferedDepthUpdate {
-            deltas,
-            first_update_id,
-            final_update_id,
-        }
     }
 
     fn depth_snapshot(bids: Vec<BinancePriceLevel>, asks: Vec<BinancePriceLevel>) -> BinanceDepth {
@@ -2982,5 +2477,68 @@ mod tests {
             resolve_spot_json_ws_url(None, BinanceEnvironment::Live, true),
             "wss://stream.binance.us:9443/ws"
         );
+    }
+
+    #[rstest]
+    #[case::smallest(1, 5)]
+    #[case::tier_one_max(100, 5)]
+    #[case::tier_two_min(101, 25)]
+    #[case::tier_two_max(500, 25)]
+    #[case::tier_three_min(501, 50)]
+    #[case::tier_three_max(1000, 50)]
+    #[case::tier_four_min(1001, 250)]
+    #[case::largest(5000, 250)]
+    fn depth_request_weight_follows_venue_tiers(#[case] limit: u32, #[case] expected: u32) {
+        assert_eq!(depth_request_weight(limit), expected);
+    }
+
+    #[rstest]
+    #[case::network(BinanceSpotHttpError::NetworkError("connection reset".to_string()), true)]
+    #[case::server_error(
+        BinanceSpotHttpError::UnexpectedStatus {
+            status: 503,
+            body: String::new(),
+            retry_after: None,
+        },
+        true
+    )]
+    #[case::rate_limited(
+        BinanceSpotHttpError::BinanceError {
+            code: -1003,
+            message: "Too many requests".to_string(),
+            status: 429,
+            retry_after: None,
+        },
+        true
+    )]
+    #[case::retry_budget_exceeded(
+        BinanceSpotHttpError::RetryBudgetExceeded("elapsed budget exhausted".to_string()),
+        true
+    )]
+    #[case::invalid_symbol(
+        BinanceSpotHttpError::BinanceError {
+            code: -1121,
+            message: "Invalid symbol.".to_string(),
+            status: 400,
+            retry_after: None,
+        },
+        false
+    )]
+    fn depth_snapshot_error_retries_transient_failures(
+        #[case] error: BinanceSpotHttpError,
+        #[case] retryable: bool,
+    ) {
+        let instrument_id = InstrumentId::from("BTCUSDT.BINANCE");
+        let message = format!("depth snapshot request for {instrument_id} failed: {error}");
+
+        let classified = depth_snapshot_error(instrument_id, &error);
+
+        let expected = if retryable {
+            BinanceBookError::Retryable(message)
+        } else {
+            BinanceBookError::Permanent(message)
+        };
+
+        assert_eq!(classified, expected);
     }
 }

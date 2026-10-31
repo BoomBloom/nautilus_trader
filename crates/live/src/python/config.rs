@@ -25,7 +25,7 @@ use nautilus_common::{
     cache::CacheConfig, enums::Environment, logging::logger::LoggerConfig,
     msgbus::MessageBusConfig, python::config_error_to_pyvalue_err,
 };
-use nautilus_core::{UUID4, python::to_pyvalue_err};
+use nautilus_core::{UUID4, datetime::get_timezone, python::to_pyvalue_err};
 use nautilus_model::{
     enums::BarIntervalType,
     identifiers::{ClientId, TraderId, Venue},
@@ -132,6 +132,7 @@ pub fn json_value_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<P
         }
         serde_json::Value::Object(obj) => {
             let dict = pyo3::types::PyDict::new(py);
+
             for (k, v) in obj {
                 dict.set_item(k, json_value_to_py(py, v)?)?;
             }
@@ -187,7 +188,7 @@ impl LiveDataEngineConfig {
         clippy::needless_pass_by_value,
         reason = "PyO3 #[new] requires owned params"
     )]
-    #[pyo3(signature = (time_bars_build_with_no_updates=None, time_bars_timestamp_on_close=None, time_bars_skip_first_non_full_bar=None, time_bars_interval_type=None, time_bars_build_delay=None, time_bars_origin_offset=None, validate_data_sequence=None, buffer_deltas=None, emit_quotes_from_book=None, emit_quotes_from_book_depths=None, external_clients=None, debug=None))]
+    #[pyo3(signature = (time_bars_build_with_no_updates=None, time_bars_timestamp_on_close=None, time_bars_skip_first_non_full_bar=None, time_bars_interval_type=None, time_bars_build_delay=None, time_bars_origin_offset=None, validate_data_sequence=None, buffer_deltas=None, emit_quotes_from_book=None, emit_quotes_from_book_depths=None, external_clients=None, debug=None, time_bars_time_zone=None))]
     fn py_new(
         time_bars_build_with_no_updates: Option<bool>,
         time_bars_timestamp_on_close: Option<bool>,
@@ -201,7 +202,12 @@ impl LiveDataEngineConfig {
         emit_quotes_from_book_depths: Option<bool>,
         external_clients: Option<Vec<ClientId>>,
         debug: Option<bool>,
+        time_bars_time_zone: Option<String>,
     ) -> PyResult<Self> {
+        if let Some(name) = &time_bars_time_zone {
+            get_timezone(name).map_err(to_pyvalue_err)?;
+        }
+
         let default = Self::default();
 
         let time_bars_interval_type = match time_bars_interval_type {
@@ -219,6 +225,7 @@ impl LiveDataEngineConfig {
             time_bars_interval_type,
             time_bars_build_delay: time_bars_build_delay.unwrap_or(default.time_bars_build_delay),
             time_bars_origin_offset: time_bars_origin_offset.unwrap_or_default(),
+            time_bars_time_zone,
             validate_data_sequence: validate_data_sequence
                 .unwrap_or(default.validate_data_sequence),
             buffer_deltas: buffer_deltas.unwrap_or(default.buffer_deltas),
@@ -229,6 +236,12 @@ impl LiveDataEngineConfig {
             debug: debug.unwrap_or(default.debug),
             qsize: default.qsize,
         })
+    }
+
+    #[getter]
+    #[pyo3(name = "time_bars_time_zone")]
+    fn py_time_bars_time_zone(&self) -> Option<String> {
+        self.time_bars_time_zone.clone()
     }
 
     #[getter]
@@ -417,7 +430,7 @@ impl LiveExecutionEngineConfig {
     /// Configuration for live execution engines.
     #[new]
     #[expect(clippy::too_many_arguments)]
-    #[pyo3(signature = (load_cache=None, manage_own_order_books=None, snapshot_positions_interval_secs=None, external_clients=None, allow_overfills=None, reconciliation=None, reconciliation_startup_delay_secs=None, reconciliation_lookback_mins=None, reconciliation_instrument_ids=None, filter_unclaimed_external_orders=None, filter_position_reports=None, filtered_client_order_ids=None, generate_missing_orders=None, inflight_check_interval_ms=None, inflight_check_threshold_ms=None, inflight_check_retries=None, open_check_interval_secs=None, open_check_lookback_mins=None, open_check_threshold_ms=None, open_check_missing_retries=None, open_check_open_only=None, max_single_order_queries_per_cycle=None, single_order_query_delay_ms=None, position_check_interval_secs=None, position_check_lookback_mins=None, position_check_threshold_ms=None, position_check_retries=None, purge_closed_orders_interval_mins=None, purge_closed_orders_buffer_mins=None, purge_closed_positions_interval_mins=None, purge_closed_positions_buffer_mins=None, purge_account_events_interval_mins=None, purge_account_events_lookback_mins=None, own_books_audit_interval_secs=None, debug=None, snapshot_orders=None, snapshot_positions=None, submission_recovery_policy=None))]
+    #[pyo3(signature = (load_cache=None, manage_own_order_books=None, snapshot_positions_interval_secs=None, external_clients=None, allow_overfills=None, reconciliation=None, reconciliation_startup_delay_secs=None, reconciliation_lookback_mins=None, reconciliation_instrument_ids=None, filter_unclaimed_external_orders=None, filter_position_reports=None, filtered_client_order_ids=None, generate_missing_orders=None, inflight_check_interval_ms=None, inflight_check_threshold_ms=None, inflight_check_retries=None, open_check_interval_secs=None, open_check_lookback_mins=None, open_check_threshold_ms=None, open_check_missing_retries=None, open_check_open_only=None, max_single_order_queries_per_cycle=None, single_order_query_delay_ms=None, position_check_interval_secs=None, position_check_lookback_mins=None, position_check_threshold_ms=None, position_check_retries=None, purge_closed_orders_interval_mins=None, purge_closed_orders_buffer_mins=None, purge_closed_positions_interval_mins=None, purge_closed_positions_buffer_mins=None, purge_account_events_interval_mins=None, purge_account_events_lookback_mins=None, own_books_audit_interval_secs=None, debug=None, snapshot_orders=None, snapshot_positions=None, submission_recovery_policy=None, purge_from_database=None))]
     fn py_new(
         load_cache: Option<bool>,
         manage_own_order_books: Option<bool>,
@@ -457,6 +470,7 @@ impl LiveExecutionEngineConfig {
         snapshot_orders: Option<bool>,
         snapshot_positions: Option<bool>,
         submission_recovery_policy: Option<SubmissionRecoveryPolicy>,
+        purge_from_database: Option<bool>,
     ) -> PyResult<Self> {
         let default = Self::default();
 
@@ -513,7 +527,7 @@ impl LiveExecutionEngineConfig {
             purge_closed_positions_buffer_mins,
             purge_account_events_interval_mins,
             purge_account_events_lookback_mins,
-            purge_from_database: default.purge_from_database,
+            purge_from_database: purge_from_database.unwrap_or(default.purge_from_database),
             debug: debug.unwrap_or(default.debug),
             own_books_audit_interval_secs,
             qsize: default.qsize,
@@ -742,6 +756,12 @@ impl LiveExecutionEngineConfig {
     }
 
     #[getter]
+    #[pyo3(name = "purge_from_database")]
+    const fn py_purge_from_database(&self) -> bool {
+        self.purge_from_database
+    }
+
+    #[getter]
     #[pyo3(name = "own_books_audit_interval_secs")]
     const fn py_own_books_audit_interval_secs(&self) -> Option<f64> {
         self.own_books_audit_interval_secs
@@ -848,6 +868,7 @@ impl InstrumentProviderConfig {
     #[getter]
     fn filters(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let dict = pyo3::types::PyDict::new(py);
+
         for (k, v) in &self.filters {
             let py_val = json_value_to_py(py, v)?;
             dict.set_item(k, py_val)?;
@@ -1054,6 +1075,7 @@ impl PluginConfig {
     #[getter]
     fn config(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let dict = PyDict::new(py);
+
         for (key, value) in &self.config {
             dict.set_item(key, json_value_to_py(py, value)?)?;
         }

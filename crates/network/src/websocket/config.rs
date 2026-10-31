@@ -16,8 +16,8 @@
 //! Static transport and lifecycle configuration for WebSocket connections.
 //!
 //! [`WebSocketConfig`] selects the endpoint, upgrade headers, heartbeat and idle detection,
-//! reconnect policy, transport backend, and optional proxy. Runtime handlers and rate limiting are
-//! supplied through the client builders instead.
+//! reconnect policy, inbound size limits, transport backend, and optional proxy. Runtime handlers
+//! and rate limiting are supplied through the client builders instead.
 //!
 //! # Reconnection strategy
 //!
@@ -202,6 +202,15 @@ pub struct WebSocketConfig {
     /// Only applies to handler mode; stream mode ignores this field.
     #[serde(default)]
     pub idle_timeout_ms: Option<u64>,
+    /// The maximum number of outstanding ordinary messages, including queued, in-flight, and replay messages.
+    ///
+    /// Ownership-bound sends, keepalives, and control frames share a separate allowance of the same size,
+    /// so authentication can proceed when replay fills the ordinary allowance.
+    ///
+    /// Defaults to 1,024. Sends fail immediately when full. Must be positive and no greater
+    /// than [`tokio::sync::Semaphore::MAX_PERMITS`]. This bounds message count, not payload bytes.
+    #[serde(default)]
+    pub writer_capacity: Option<usize>,
     /// The transport backend to use for the WebSocket connection.
     ///
     /// Defaults to [`TransportBackend::Sockudo`] when the `transport-sockudo`
@@ -218,6 +227,23 @@ pub struct WebSocketConfig {
     /// `http://` and `https://` schemes; SOCKS schemes are not yet supported.
     #[serde(default)]
     pub proxy_url: Option<String>,
+    /// Maximum size in bytes of one inbound WebSocket message.
+    ///
+    /// `None` passes the selected backend's default message cap of 64 MiB. The cap applies to
+    /// single-frame and fragmented messages. `Some(0)` is rejected. A message that exceeds this cap
+    /// and fits in the frame cap fails the read with `MessageTooLarge`. This cap does not bound
+    /// per-frame memory: both backends apply it after the frame payload is read. Set
+    /// `max_frame_size_bytes` for that bound.
+    #[serde(default)]
+    pub max_message_size_bytes: Option<usize>,
+    /// Maximum size in bytes of one inbound WebSocket frame payload, excluding the frame header.
+    ///
+    /// `None` keeps the selected backend's default of 16 MiB. `Some(0)` is rejected. Sockudo reports
+    /// a frame that exceeds the cap as `FrameTooLarge`, including a fully buffered small frame.
+    /// Tungstenite uses one capacity error for both limits, so every frame breach is
+    /// `MessageTooLarge`. On Sockudo, a frame that exceeds this cap fails before the message cap.
+    #[serde(default)]
+    pub max_frame_size_bytes: Option<usize>,
 }
 
 impl Debug for WebSocketConfig {
@@ -230,6 +256,7 @@ impl Debug for WebSocketConfig {
             )
             .field("heartbeat_interval_secs", &self.heartbeat_interval_secs)
             .field("heartbeat_payload", &self.heartbeat_payload)
+            .field("writer_capacity", &self.writer_capacity)
             .field("connect_timeout_ms", &self.connect_timeout_ms)
             .field(
                 "reconnect_delay_initial_ms",
@@ -243,6 +270,8 @@ impl Debug for WebSocketConfig {
             .field("idle_timeout_ms", &self.idle_timeout_ms)
             .field("backend", &self.backend)
             .field("proxy_url", &self.proxy_url.as_ref().map(|_| REDACTED))
+            .field("max_message_size_bytes", &self.max_message_size_bytes)
+            .field("max_frame_size_bytes", &self.max_frame_size_bytes)
             .finish()
     }
 }
@@ -252,8 +281,7 @@ impl<S: web_socket_config_builder::IsComplete> WebSocketConfigBuilder<S> {
     ///
     /// # Errors
     ///
-    /// Returns a [`NetworkConfigError`] if any field fails validation
-    /// (see [`WebSocketConfig::validate`]).
+    /// Returns an error if any field fails validation (see [`WebSocketConfig::validate`]).
     pub fn build(self) -> NetworkConfigResult<WebSocketConfig> {
         let config = self.build_inner();
         config.validate()?;
@@ -266,11 +294,15 @@ impl WebSocketConfig {
     ///
     /// # Errors
     ///
-    /// Returns a [`NetworkConfigError`] if `url` is empty, the heartbeat interval or a
-    /// reconnection timing field is not positive, `reconnect_backoff_factor` is outside
-    /// `[1.0, 100.0]`, or `reconnect_delay_initial_ms` exceeds `reconnect_delay_max_ms`.
+    /// Returns an error if `url` is empty, the heartbeat interval, a reconnection timing field, or
+    /// an inbound size limit is not positive, `reconnect_backoff_factor` is outside `[1.0, 100.0]`,
+    /// `reconnect_delay_initial_ms` exceeds `reconnect_delay_max_ms`, or `writer_capacity` is
+    /// outside `[1, Semaphore::MAX_PERMITS]`.
     pub fn validate(&self) -> NetworkConfigResult<()> {
         let mut errors = Vec::new();
+        if let Err(e) = crate::writer::validate_capacity(self.writer_capacity) {
+            errors.push(e);
+        }
 
         if self.url.trim().is_empty() {
             errors.push(NetworkConfigError::invalid("url", "must not be empty"));
@@ -310,6 +342,20 @@ impl WebSocketConfig {
             ("reconnect_delay_max_ms", self.reconnect_delay_max_ms),
             ("heartbeat_timeout_secs", self.heartbeat_timeout_secs),
             ("idle_timeout_ms", self.idle_timeout_ms),
+        ] {
+            if let Some(value) = value
+                && value == 0
+            {
+                errors.push(NetworkConfigError::invalid(
+                    field,
+                    format!("must be positive, was {value}"),
+                ));
+            }
+        }
+
+        for (field, value) in [
+            ("max_message_size_bytes", self.max_message_size_bytes),
+            ("max_frame_size_bytes", self.max_frame_size_bytes),
         ] {
             if let Some(value) = value
                 && value == 0
@@ -424,6 +470,26 @@ mod tests {
     }
 
     #[rstest]
+    fn test_deserialize_websocket_config_defaults_inbound_size_limits() {
+        let config = serde_json::from_value::<WebSocketConfig>(json!({
+            "url": "wss://example.com/ws",
+        }))
+        .unwrap();
+
+        assert_eq!(config.max_message_size_bytes, None);
+        assert_eq!(config.max_frame_size_bytes, None);
+    }
+
+    #[rstest]
+    fn test_validate_accepts_positive_inbound_size_limits() {
+        let mut config = valid_config();
+        config.max_message_size_bytes = Some(1);
+        config.max_frame_size_bytes = Some(1);
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[rstest]
     fn test_validate_accepts_zero_jitter() {
         let mut config = valid_config();
         config.reconnect_jitter_ms = Some(0);
@@ -432,6 +498,8 @@ mod tests {
     }
 
     #[rstest]
+    #[case::writer_capacity_zero(|c: &mut WebSocketConfig| c.writer_capacity = Some(0), "writer_capacity")]
+    #[case::writer_capacity_excess(|c: &mut WebSocketConfig| c.writer_capacity = Some(usize::MAX), "writer_capacity")]
     #[case::empty_url(|c: &mut WebSocketConfig| c.url = String::new(), "url")]
     #[case::heartbeat_interval(|c: &mut WebSocketConfig| c.heartbeat_interval_secs = Some(0), "heartbeat_interval_secs")]
     #[case::heartbeat_timeout_below_interval(|c: &mut WebSocketConfig| { c.heartbeat_interval_secs = Some(30); c.heartbeat_timeout_secs = Some(30); }, "heartbeat_timeout_secs")]
@@ -440,6 +508,8 @@ mod tests {
     #[case::reconnect_delay_max(|c: &mut WebSocketConfig| c.reconnect_delay_max_ms = Some(0), "reconnect_delay_max_ms")]
     #[case::heartbeat_timeout_zero(|c: &mut WebSocketConfig| c.heartbeat_timeout_secs = Some(0), "heartbeat_timeout_secs")]
     #[case::idle_timeout(|c: &mut WebSocketConfig| c.idle_timeout_ms = Some(0), "idle_timeout_ms")]
+    #[case::message_size(|c: &mut WebSocketConfig| c.max_message_size_bytes = Some(0), "max_message_size_bytes")]
+    #[case::frame_size(|c: &mut WebSocketConfig| c.max_frame_size_bytes = Some(0), "max_frame_size_bytes")]
     fn test_validate_rejects_invalid_field(
         #[case] mutate: fn(&mut WebSocketConfig),
         #[case] expected_field: &str,

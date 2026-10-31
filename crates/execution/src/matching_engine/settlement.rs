@@ -30,12 +30,6 @@ use ustr::Ustr;
 
 use super::OrderMatchingEngine;
 
-enum UnderlyingLookup {
-    Found(InstrumentId),
-    NotFound,
-    Ambiguous(Vec<InstrumentId>),
-}
-
 impl OrderMatchingEngine {
     pub(super) fn process_option_expiry(&mut self, ts_now: UnixNanos) -> anyhow::Result<bool> {
         let instrument_id = self.instrument.id();
@@ -62,6 +56,7 @@ impl OrderMatchingEngine {
                 ));
             }
         };
+
         let same_venue_id = InstrumentId::from(format!("{underlying}.{}", self.venue).as_str());
 
         let lookup = {
@@ -141,6 +136,16 @@ impl OrderMatchingEngine {
             }
         };
 
+        // Inverse settlement divides by the spot, so an invalid level defers like a missing one
+        if self.instrument.is_inverse() && !underlying_price.is_positive() {
+            return Ok(self.option_settlement_retry(
+                "non-positive-underlying-price",
+                &format!(
+                    "Non-positive underlying price {underlying_price} for inverse option {instrument_id}"
+                ),
+            ));
+        }
+
         let option_close_price = self
             .instrument_close
             .as_ref()
@@ -154,7 +159,7 @@ impl OrderMatchingEngine {
             should_exercise,
             ts_now,
             option_close_price,
-        );
+        )?;
         self.option_apply_settlement_plan(plan)?;
         Ok(true)
     }
@@ -164,6 +169,7 @@ impl OrderMatchingEngine {
             log::warn!("{message}; settlement will retry");
             self.option_settlement_warning = Some(reason);
         }
+
         false
     }
 
@@ -175,7 +181,7 @@ impl OrderMatchingEngine {
         should_exercise: bool,
         ts_now: UnixNanos,
         option_close_price: Option<Price>,
-    ) -> OptionSettlementPlan {
+    ) -> anyhow::Result<OptionSettlementPlan> {
         let mut legs = Vec::new();
 
         for position in positions {
@@ -187,12 +193,15 @@ impl OrderMatchingEngine {
                     underlying_price,
                     ts_now,
                     option_close_price,
-                );
+                )?;
             } else {
-                legs.push(self.option_plan_otm_expiry(position, ts_now, option_close_price));
+                let close_px = option_close_price
+                    .unwrap_or_else(|| Price::zero(self.instrument.price_precision()));
+                legs.push(self.option_plan_close(position, close_px, ts_now, "OTM"));
             }
         }
-        OptionSettlementPlan { legs }
+
+        Ok(OptionSettlementPlan { legs })
     }
 
     fn option_apply_settlement_plan(&mut self, plan: OptionSettlementPlan) -> anyhow::Result<()> {
@@ -227,6 +236,7 @@ impl OrderMatchingEngine {
                 .map_err(|e| {
                     anyhow::anyhow!("cannot add settlement order {client_order_id}: {e}")
                 })?;
+
             cache
                 .add_venue_order_id(&client_order_id, &leg.fill.venue_order_id, false)
                 .map_err(|e| {
@@ -236,6 +246,7 @@ impl OrderMatchingEngine {
                     )
                 })?;
         }
+
         Ok(())
     }
 
@@ -244,6 +255,7 @@ impl OrderMatchingEngine {
             Some(p) => p.as_decimal(),
             None => return false,
         };
+
         let spot = underlying_price.as_decimal();
         match self.instrument.option_kind() {
             Some(OptionKind::Call) => spot > strike,
@@ -257,17 +269,30 @@ impl OrderMatchingEngine {
             .instrument
             .strike_price()
             .expect("option must have strike");
+
         if !cash_settled {
             return strike;
         }
 
         let spot = underlying_price.as_decimal();
         let strike_value = strike.as_decimal();
-        let value = match self.instrument.option_kind() {
+        let intrinsic = match self.instrument.option_kind() {
             Some(OptionKind::Call) => (spot - strike_value).max(Decimal::ZERO),
             _ => (strike_value - spot).max(Decimal::ZERO),
         };
-        Price::from_decimal_dp(value, strike.precision).expect("Invalid option settlement price")
+
+        // Inverse options quote the premium in the base currency, so the quote-point
+        // payout converts at the settlement spot.
+        let (value, precision) = if self.instrument.is_inverse() {
+            let value = intrinsic
+                .checked_div(spot)
+                .expect("inverse option settlement requires a positive underlying price");
+            (value, self.instrument.price_precision())
+        } else {
+            (intrinsic, strike.precision)
+        };
+
+        Price::from_decimal_dp(value, precision).expect("Invalid option settlement price")
     }
 
     fn option_plan_exercise_position(
@@ -278,58 +303,21 @@ impl OrderMatchingEngine {
         underlying_price: Price,
         ts_now: UnixNanos,
         option_close_price: Option<Price>,
-    ) {
+    ) -> anyhow::Result<()> {
         if matches!(underlying_instrument, InstrumentAny::IndexInstrument(_)) {
-            legs.push(self.option_plan_cash_settlement(
-                position,
-                underlying_price,
-                ts_now,
-                option_close_price,
-            ));
+            let close_px = option_close_price
+                .unwrap_or_else(|| self.option_settlement_price(underlying_price, true));
+            legs.push(self.option_plan_close(position, close_px, ts_now, "CASH"));
         } else {
             legs.extend(self.option_plan_physical_settlement(
                 position,
                 underlying_instrument,
                 underlying_price,
                 ts_now,
-                option_close_price,
-            ));
+            )?);
         }
-    }
 
-    fn option_plan_cash_settlement(
-        &self,
-        position: &Position,
-        underlying_price: Price,
-        ts_now: UnixNanos,
-        option_close_price: Option<Price>,
-    ) -> OptionSettlementLeg {
-        let venue = self.venue;
-        let client_order_id = ClientOrderId::from(format!("EXPIRATION-{venue}-{}", UUID4::new()));
-        let venue_order_id = VenueOrderId::from(format!("EXPIRATION-{venue}-{}", UUID4::new()));
-        let trade_id = TradeId::from(UUID4::new().to_string());
-        let close_px = option_close_price
-            .unwrap_or_else(|| self.option_settlement_price(underlying_price, true));
-        let close_side = OrderCore::closing_side(position.side)
-            .expect("Settlement position must be Long or Short");
-        let order = self.option_create_settlement_order(
-            position,
-            self.instrument.id(),
-            close_side,
-            position.quantity,
-            client_order_id,
-            true,
-            &format!("EXPIRATION_{venue}_CASH"),
-        );
-        let fill = self.option_create_close_fill(
-            position,
-            close_px,
-            client_order_id,
-            venue_order_id,
-            trade_id,
-            ts_now,
-        );
-        OptionSettlementLeg { order, fill }
+        Ok(())
     }
 
     fn option_plan_physical_settlement(
@@ -338,14 +326,19 @@ impl OrderMatchingEngine {
         underlying_instrument: &InstrumentAny,
         underlying_price: Price,
         ts_now: UnixNanos,
-        option_close_price: Option<Price>,
-    ) -> [OptionSettlementLeg; 2] {
+    ) -> anyhow::Result<[OptionSettlementLeg; 2]> {
         let multiplier = self.instrument.multiplier();
-        let underlying_qty = Quantity::from_decimal_dp(
-            position.quantity.as_decimal() * multiplier.as_decimal(),
-            underlying_instrument.size_precision(),
-        )
-        .expect("Invalid underlying settlement quantity");
+        let position_qty = position.quantity.as_decimal();
+        let underlying_multiplier = underlying_instrument.multiplier().as_decimal();
+        let underlying_precision = underlying_instrument.size_precision();
+        let delivery = position_qty * multiplier.as_decimal() / underlying_multiplier;
+        let underlying_qty = Quantity::from_decimal_dp(delivery, underlying_precision)?;
+        if underlying_qty.as_decimal() != delivery {
+            anyhow::bail!(
+                "cannot deliver {delivery} {} at size precision {underlying_precision}",
+                underlying_instrument.id()
+            );
+        }
 
         let underlying_side = if self.instrument.option_kind() == Some(OptionKind::Call) {
             position.side
@@ -369,10 +362,13 @@ impl OrderMatchingEngine {
             VenueOrderId::from(format!("EXPIRATION-{venue}-{}", UUID4::new()));
         let open_trade_id = TradeId::from(UUID4::new().to_string());
         let settlement_px = self.option_settlement_price(underlying_price, false);
-        let option_close_px =
-            option_close_price.unwrap_or_else(|| Price::zero(self.instrument.price_precision()));
+
+        // Delivery at strike carries the intrinsic value, so the option leg closes at zero
+        // whatever the `InstrumentClose` price.
+        let option_close_px = Price::zero(self.instrument.price_precision());
         let close_side = OrderCore::closing_side(position.side)
             .expect("Settlement position must be Long or Short");
+
         let underlying_order_side = match underlying_side {
             PositionSide::Long => OrderSide::Buy,
             _ => OrderSide::Sell,
@@ -416,7 +412,7 @@ impl OrderMatchingEngine {
             open_trade_id,
             ts_now,
         );
-        [
+        Ok([
             OptionSettlementLeg {
                 order: close_order,
                 fill: option_fill,
@@ -425,21 +421,20 @@ impl OrderMatchingEngine {
                 order: open_order,
                 fill: underlying_fill,
             },
-        ]
+        ])
     }
 
-    fn option_plan_otm_expiry(
+    fn option_plan_close(
         &self,
         position: &Position,
+        close_px: Price,
         ts_now: UnixNanos,
-        option_close_price: Option<Price>,
+        tag: &str,
     ) -> OptionSettlementLeg {
         let venue = self.venue;
         let client_order_id = ClientOrderId::from(format!("EXPIRATION-{venue}-{}", UUID4::new()));
         let venue_order_id = VenueOrderId::from(format!("EXPIRATION-{venue}-{}", UUID4::new()));
         let trade_id = TradeId::from(UUID4::new().to_string());
-        let close_px =
-            option_close_price.unwrap_or_else(|| Price::zero(self.instrument.price_precision()));
         let close_side = OrderCore::closing_side(position.side)
             .expect("Settlement position must be Long or Short");
         let order = self.option_create_settlement_order(
@@ -449,7 +444,7 @@ impl OrderMatchingEngine {
             position.quantity,
             client_order_id,
             true,
-            &format!("EXPIRATION_{venue}_OTM"),
+            &format!("EXPIRATION_{venue}_{tag}"),
         );
         let fill = self.option_create_close_fill(
             position,
@@ -508,6 +503,7 @@ impl OrderMatchingEngine {
     ) -> OrderFilled {
         let close_side = OrderCore::closing_side(position.side)
             .expect("Settlement position must be Long or Short");
+
         OrderFilled::new(
             position.trader_id,
             position.strategy_id,
@@ -552,6 +548,7 @@ impl OrderMatchingEngine {
                 unreachable!("flat position cannot create an underlying settlement fill")
             }
         };
+
         OrderFilled::new(
             position.trader_id,
             position.strategy_id,
@@ -575,6 +572,12 @@ impl OrderMatchingEngine {
             None,
         )
     }
+}
+
+enum UnderlyingLookup {
+    Found(InstrumentId),
+    NotFound,
+    Ambiguous(Vec<InstrumentId>),
 }
 
 struct OptionSettlementLeg {

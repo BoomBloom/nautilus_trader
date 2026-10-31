@@ -75,6 +75,7 @@ bon = { workspace = true }
 derive_builder = { workspace = true }
 dotenvy = { workspace = true }
 futures-util = { workspace = true }
+indexmap = { workspace = true }
 jiff = { workspace = true }
 log = { workspace = true }
 parking_lot = { workspace = true }
@@ -105,6 +106,7 @@ criterion = { workspace = true }
 dashmap = { workspace = true }
 rstest = { workspace = true }
 rust_decimal_macros = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 toml = { workspace = true }
 
 # Run with `cargo bench -p nautilus-deribit --bench websocket`

@@ -76,8 +76,8 @@ fn utc_timestamp(date: Date, hour: i8, minute: i8, second: i8, nanosecond: i32) 
 ///
 /// # Errors
 ///
-/// Returns an error if reading or parsing the config file fails,
-/// or if any downstream replay operation fails.
+/// Returns an error if reading or parsing the config file fails, replay selections contain
+/// duplicates, or any downstream replay operation fails.
 ///
 /// # Panics
 ///
@@ -91,6 +91,7 @@ pub async fn run_tardis_machine_replay_from_config(config_filepath: &Path) -> an
         .with_context(|| format!("Failed to read config file: {}", config_filepath.display()))?;
     let config: TardisReplayConfig = serde_json::from_str(&config_data)
         .context("failed to parse config JSON into TardisReplayConfig")?;
+    config.validate()?;
 
     let path = config
         .output_path
@@ -262,7 +263,7 @@ pub async fn run_tardis_machine_replay_from_config(config_filepath: &Path) -> an
                 }
             }
             Err(e) => {
-                log::error!("Stream error: {e:?}");
+                e.log_stream_error();
                 break;
             }
         }
@@ -727,7 +728,7 @@ mod tests {
     use std::sync::Arc;
 
     use nautilus_core::DurationNanos;
-    use nautilus_persistence::backend::catalog::ParquetDataCatalog;
+    use nautilus_persistence::backend::parquet::catalog::ParquetDataCatalog;
     use rstest::rstest;
 
     use super::*;

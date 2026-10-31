@@ -106,6 +106,7 @@ nautilus-trading = { workspace = true, features = ["examples"] }
 
 criterion = { workspace = true }
 rstest = { workspace = true }
+rust_decimal_macros = { workspace = true }
 tempfile = { workspace = true }
 
 # Run with `cargo bench -p nautilus-backtest --bench engine`
@@ -113,6 +114,13 @@ tempfile = { workspace = true }
 name = "engine"
 path = "benches/engine.rs"
 harness = false
+
+# Run with `cargo bench -p nautilus-backtest --features streaming --bench node`
+[[bench]]
+name = "node"
+path = "benches/node.rs"
+harness = false
+required-features = ["streaming"]
 
 # Run with `cargo run -p nautilus-backtest --features examples --example engine-ema-cross`
 [[example]]

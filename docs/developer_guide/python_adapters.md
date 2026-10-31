@@ -1,8 +1,8 @@
 # Python Adapter Interface
 
-Use this guide to implement a custom live adapter in a separate Python package, optionally with
-its own Rust/PyO3 extension. It covers the client interface, registration, and runtime contracts.
-For the platform overview, see [Adapters](../concepts/adapters.md). For in-tree Rust adapters, see
+Use this guide to implement a custom live adapter in a separate Python package. That package can have its own
+Rust/PyO3 extension. This guide covers the client interface, registration, and runtime contracts. For the
+platform overview, see [Adapters](../concepts/adapters.md). For in-tree Rust adapters, see
 [the Rust adapter guide](adapters.md).
 
 Custom clients run on the node's Python event loop and exchange typed objects with the Rust engines
@@ -11,7 +11,7 @@ through PyO3. Subclass a client from `nautilus_trader.live.clients`:
 | Base class         | Responsibility                                                       |
 | ------------------ | -------------------------------------------------------------------- |
 | `DataClient`       | Data subscriptions and historical requests.                          |
-| `MarketDataClient` | Naming specialization of `DataClient`; identical hooks and behavior. |
+| `MarketDataClient` | Naming specialization of `DataClient`. Identical hooks and behavior. |
 | `ExecutionClient`  | Order commands, account updates, and reconciliation reports.         |
 
 Start with the [deterministic adapter template](../../examples/live/_template/README.md).
@@ -78,8 +78,8 @@ use each config's `RoutingConfig` through the same builder path as direct regist
 
 Both registration paths preserve these rules:
 
-- **Native and custom clients can share a node.** Registration distinguishes native factories from
-  Python factories; custom configs do not pass through a native config downcast.
+- **Native and custom clients can share a node.** Registration distinguishes native factories from Python
+  factories. Custom configs do not pass through a native config downcast.
 - **Duplicate names fail.** Each registered client needs a distinct name.
 - **Failed builds preserve Python client registrations.** The node disposes clients from the failed
   attempt, then a retry creates fresh client instances.
@@ -106,7 +106,7 @@ Classes defined inside functions are not importable.
 ### Serialize configuration
 
 Keep runtime resources out of config objects. Instance fields, including underscore-prefixed fields,
-participate in serialization; `ClassVar` metadata does not.
+participate in serialization. `ClassVar` metadata does not.
 
 JSON serialization supports:
 
@@ -185,8 +185,9 @@ to enter the normal command path. Disconnection then:
 The node bounds disconnection by its configured timeout. The runtime requests cancellation
 **at most once per task** and shields tasks while draining them, so repeated supervisor cancellation
 does not interrupt asynchronous cleanup. A deadline reports incomplete cleanup rather than issuing
-another cancellation. Independently cancelled commands allow the next queued operation to run while
-admission remains open.
+another cancellation.
+
+Independently cancelled commands allow the next queued operation to run while admission remains open.
 
 :::warning[Cancellation is not completion]
 Resistant tasks remain supervised, and incomplete cleanup is reported, including when a host closes
@@ -254,10 +255,9 @@ report ownership must match the registered client.
 
 ### Subscriptions and requests
 
-Each hook is async and receives an owned, frozen command or request from `nautilus_trader.live`.
-Nested params are copied. Override the hooks for the venue's supported capabilities; unimplemented
-hooks raise `NotImplementedError`. Track venue subscription acknowledgments and reconnect replay
-in adapter-local state.
+Each hook is async and receives an owned, frozen command or request from `nautilus_trader.live`. Nested params
+are copied. Override the hooks for the venue's supported capabilities. Unimplemented hooks raise
+`NotImplementedError`. Track venue subscription acknowledgments and reconnect replay in adapter-local state.
 
 | Family            | Subscribe/unsubscribe suffix            | Historical request suffix                    |
 | ----------------- | --------------------------------------- | -------------------------------------------- |
@@ -271,8 +271,55 @@ in adapter-local state.
 | Instrument events | `instrument_status`, `instrument_close` | *Not supported*                              |
 | Options           | `option_greeks`                         | `option_chain_reference_price`               |
 
-For example, quote subscriptions call `_subscribe_quotes(command)` and
-`_unsubscribe_quotes(command)`; quote history calls `_request_quotes(request)`.
+For example, quote subscriptions call `_subscribe_quotes(command)` and `_unsubscribe_quotes(command)`.
+Quote history calls `_request_quotes(request)`.
+
+### Subscription lists
+
+Update command readers in both subscribe and unsubscribe hooks:
+
+| Command kind     | Read list property       | Actor/Strategy keyword |
+| ---------------- | ------------------------ | ---------------------- |
+| Instrument-keyed | `command.instrument_ids` | `instrument_id`        |
+| Bars             | `command.bar_types`      | `bar_type`             |
+
+Replace scalar `command.instrument_id` and `command.bar_type` readers. The properties are read-only and
+return list copies; mutating a copy does not change the command. Bar lists contain full requested types.
+
+Actor and Strategy calls keep the singular keyword for scalar and collection inputs. Historical
+request hooks read `request.instrument_ids` or `request.bar_types`. Their scalar accessors raise
+`ValueError` when the request has multiple members. Custom data and venue-wide instrument hooks keep
+their existing fields.
+
+Compatible direct members reach each hook as one ordered list for both subscribe and unsubscribe.
+For each hook:
+
+- Validate command-wide settings and reject unsupported lists before effects.
+- Process supported lists best effort, logging individual failures and continuing with later members.
+
+Internal bars, book snapshots, and other engine services create separate source acquisitions, which
+can remain singleton commands.
+
+### Queue admission and failures
+
+The bridge accepts the whole command when the runtime admits it to the client command queue.
+
+:::warning
+Later async hook failures, including unsupported-list errors, are logged. They cannot change the
+synchronous admission result or report per-member outcomes to the engine. Unsubscribe hooks must
+therefore tolerate members whose subscription failed.
+:::
+
+Native Rust hooks report partial outcomes with `SubscriptionError::instruments` or `SubscriptionError::bars`.
+Neither native acceptance nor Python queue admission reports venue acknowledgements.
+
+### Catalog start times
+
+With `streaming`:
+
+- Direct quote/trade lists skip catalog start inference; scalar calls retain it.
+- External bars infer a start per type. Different starts produce compatible subsets.
+- Explicit `start_ns` suppresses inference. Releases use the original route and parameters.
 
 ### Historical responses
 
@@ -285,9 +332,13 @@ response. Response classes in `nautilus_trader.live` are:
 - **Funding and bars**: `FundingRatesResponse`, `BarsResponse`.
 - **Options**: `OptionChainReferencePriceResponse`.
 
-An **empty response still completes the adapter's response path**. Windowed requests expose UTC
-`start`/`end` datetimes and exact `start_ns`/`end_ns`; response bounds use integer nanoseconds.
-`RequestBookSnapshot` and `RequestOptionChainReferencePrice` have no time-window fields.
+Call `_handle_response` only after a successful fetch. An empty response completes the request and,
+with `update_catalog=True`, can record known-empty coverage. If the fetch fails, raise an exception
+instead. Its message becomes the requester-visible `failure_reason`.
+
+Windowed requests expose UTC `start`/`end` datetimes and exact `start_ns`/`end_ns`.
+Response bounds use integer nanoseconds. `RequestBookSnapshot` and
+`RequestOptionChainReferencePrice` have no time-window fields.
 
 ### Instrument providers
 
@@ -329,9 +380,9 @@ Implement the reconciliation hooks:
 - `_generate_position_status_reports`
 
 Return typed reports, lists, or the optional result prescribed by the method.
-`_generate_mass_status(lookback_mins)` defaults to native composition of the bulk methods using the
-owning node's clock; an override returns an `ExecutionMassStatus`.
-**Propagated report failures fail startup reconciliation.**
+`_generate_mass_status(lookback_mins)` defaults to native composition of the bulk methods using the owning
+node's clock. An override returns an `ExecutionMassStatus`. **Propagated report failures fail startup
+reconciliation.**
 
 ### Handle order commands
 
@@ -382,15 +433,16 @@ make an unchanged Cython adapter source-compatible.
 
 - **Forward prices**: use `RequestOptionChainReferencePrice` and its matching response for a v2 option series.
 - **DeFi**: native block/pool subscriptions and pool snapshots are outside this Python interface.
-- **Historical requests**: the [known migration limitations](../../MIGRATION_V2.md#known-limitations)
-  for request joining/completion still apply.
-- **Custom publication and subscription**: the same migration limitations apply. Clients emit
-  `CustomData` through typed data output; they do not expose component `publish_message` or topic
-  subscription methods.
+- **Historical requests**: actors and strategies support callbacks, completion joins, and pending inspection.
+  Joins do not merge or replay historical data. See
+  [Python callbacks and joins](../concepts/actors.md#python-callbacks-and-joins).
+- **Custom publication and subscription**: the same migration limitations apply. Clients emit `CustomData`
+  through typed data output. They do not expose component `publish_message` or topic subscription methods.
 - **Database cache backing**: unsupported with custom Python clients in either launch mode. See
   [startup](#startup-scheduling-and-shutdown) and [hosted event loops](../concepts/live.md#hosted-event-loops).
-- **Revised bars**: config retains `handle_revised_bars`, but the v2 core lacks the v1 bar revision
-  marker and revision overwrite behavior.
+- **Revised bars**: Config keeps `handle_revised_bars`. If a later time bar has an equal `ts_event`, the v2
+  core cache replaces the cached bar. The cache skips older bars. The v1 `Bar.is_revision` marker is still
+  absent. Adapter-level filtering still determines whether revised bars are emitted at all.
 - **Networking**: this interface does not restore removed HTTP/WebSocket bindings.
 
 ## Independent Rust/PyO3 packages
@@ -449,7 +501,7 @@ build-backend = "maturin"
 [project]
 name = "external-adapter"
 version = "0.1.0"
-requires-python = ">=3.12,<3.15"
+requires-python = ">=3.13,<3.15"
 dependencies = ["nautilus-trader"]
 
 [tool.maturin]
@@ -462,15 +514,17 @@ to the releases covered by your adapter's tests.
 
 ### Exchange wheel-owned objects
 
-Use `Bound<'_, PyAny>` for incoming commands and `Py<PyAny>` for objects returned to Python. Import
-classes while attached to Python, read typed command attributes, and construct output with those
-imported classes. This method illustrates the conversion inside a `#[pymethods]` implementation:
+Use `Bound<'_, PyAny>` for incoming commands and instrument IDs, and `Py<PyAny>` for values returned to Python.
+Read command attributes and import classes while attached to Python; construct output with those classes.
+
+The client hook below passes each `command.instrument_ids` member to this backend method in a
+`#[pymethods]` implementation:
 
 ```rust
-fn quote(&self, py: Python<'_>, command: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+fn quote(&self, py: Python<'_>, instrument_id: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
     let model = py.import("nautilus_trader.model")?;
     let values = PyDict::new(py);
-    values.set_item("instrument_id", command.getattr("instrument_id")?)?;
+    values.set_item("instrument_id", instrument_id)?;
     for (name, value) in [("bid_price", "1.12345"), ("ask_price", "1.12349")] {
         values.set_item(
             name,
@@ -489,10 +543,10 @@ fn quote(&self, py: Python<'_>, command: &Bound<'_, PyAny>) -> PyResult<Py<PyAny
 }
 ```
 
-Import `pyo3::{prelude::*, types::PyDict}` and expose the containing class from a `#[pymodule]`
-function named `_backend`. The example values are deterministic; a venue implementation supplies
-its received prices, sizes, and nanosecond timestamps. Construct prices, quantities, and money
-from exact decimal values or strings without a floating-point round trip.
+Import `pyo3::{prelude::*, types::PyDict}` and expose the containing class from a `#[pymodule]` function named
+`_backend`. The example values are deterministic. A venue implementation supplies its received prices, sizes,
+and nanosecond timestamps. Construct prices, quantities, and money from exact decimal values or strings
+without a floating-point round trip.
 
 ### Delegate from Python client hooks
 
@@ -504,27 +558,33 @@ from external_adapter._backend import Backend
 
 
 async def _subscribe_quotes(self, command):
-    self._handle_data(Backend().quote(command))
+    backend = Backend()
+    for instrument_id in command.instrument_ids:
+        self._handle_data(backend.quote(instrument_id))
 ```
 
-Place that hook on a `MarketDataClient` subclass. Publish the instrument definition before its
-market data. Implement connection and disconnection hooks, and supply a `DataClientFactory` that
-constructs the subclass using the node-provided name, config, cache, and clock. The
-[Python template](../../examples/live/_template/README.md) demonstrates those hooks and
-factory registration. A backend with persistent venue state should be retained by its client.
+Place that hook on a `MarketDataClient` subclass:
 
-Execution adapters follow the same pattern with `ExecutionClient` and `ExecutionClientFactory`.
-Read `command.order` and emit submission, acceptance, rejection, and fill events through the
-client's `generate_*` methods. Return the documented report types from reconciliation hooks.
-Preserve client/account identity, request correlation, exact commission values, and event order;
-calling from Rust does not change these contracts.
+- Publish the instrument definition before its market data.
+- Implement connection and disconnection hooks.
+- Supply a `DataClientFactory` that constructs the subclass using the node-provided name, config,
+  cache, and clock.
+- Retain a backend with persistent venue state in its client.
+
+The [Python template](../../examples/live/_template/README.md) demonstrates the hooks and factory registration.
+
+Execution adapters follow the same pattern with `ExecutionClient` and `ExecutionClientFactory`. Read
+`command.order` and emit submission, acceptance, rejection, and fill events through the client's `generate_*`
+methods. Return the documented report types from reconciliation hooks. Preserve client/account identity,
+request correlation, exact commission values, and event order. Calling from Rust does not change these
+contracts.
 
 ### Lifecycle and cache ownership
 
-Keep Python calls and cache access on the node's owner thread and event loop. The GIL permits Python
-object access; it does not grant another thread permission to use the node's cache or output
-capability. The supplied cache is read-only, and returned mutable snapshots do not mutate the core.
-Send typed output through the client so the synchronous core applies state changes.
+Keep Python calls and cache access on the node's owner thread and event loop. The GIL permits Python object
+access. It does not grant another thread permission to use the node's cache or output capability. The supplied
+cache is read-only, and returned mutable snapshots do not mutate the core. Send typed output through the
+client so the synchronous core applies state changes.
 
 The extension follows the same lifecycle as a Python adapter:
 

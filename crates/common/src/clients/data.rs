@@ -16,7 +16,10 @@
 //! Data client trait definition.
 
 use async_trait::async_trait;
-use nautilus_model::identifiers::{ClientId, Venue};
+use nautilus_model::{
+    data::BarType,
+    identifiers::{ClientId, InstrumentId, Venue},
+};
 
 use super::log_not_implemented;
 use crate::messages::data::{
@@ -25,7 +28,7 @@ use crate::messages::data::{
     RequestQuotes, RequestTrades, SubscribeBars, SubscribeBookDeltas, SubscribeBookDepth,
     SubscribeCustomData, SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstrument,
     SubscribeInstrumentClose, SubscribeInstrumentStatus, SubscribeInstruments, SubscribeMarkPrices,
-    SubscribeOptionGreeks, SubscribeQuotes, SubscribeTrades, UnsubscribeBars,
+    SubscribeOptionGreeks, SubscribeQuotes, SubscribeTrades, SubscriptionError, UnsubscribeBars,
     UnsubscribeBookDeltas, UnsubscribeBookDepth, UnsubscribeCustomData, UnsubscribeFundingRates,
     UnsubscribeIndexPrices, UnsubscribeInstrument, UnsubscribeInstrumentClose,
     UnsubscribeInstrumentStatus, UnsubscribeInstruments, UnsubscribeMarkPrices,
@@ -40,6 +43,15 @@ use crate::messages::defi::{
 };
 
 /// Defines the interface for a data client, managing connections, subscriptions, and requests.
+///
+/// Instrument and bar commands carry ordered member lists in both directions. A hook limited to
+/// one member rejects a larger list before effects. Supported lists execute best effort without
+/// rolling back accepted members. Validate command-wide settings before effects.
+///
+/// `Ok(())` accepts every member. [`SubscriptionError`] lists the accepted members exactly.
+/// Acceptance is synchronous; other errors accept none. Bar outcomes use full bar types, and
+/// unsubscribe acceptance means successful release. Venue acknowledgements remain asynchronous.
+/// Adapters can batch wire requests or iterate locally.
 ///
 /// # Thread Safety
 ///
@@ -117,7 +129,7 @@ pub trait DataClient {
     ///
     /// Returns an error if the subscribe operation fails.
     fn subscribe(&mut self, cmd: SubscribeCustomData) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(())
     }
 
@@ -127,101 +139,111 @@ pub trait DataClient {
     ///
     /// Returns an error if the subscribe operation fails.
     fn subscribe_instruments(&mut self, cmd: SubscribeInstruments) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(())
     }
 
-    /// Subscribes to data for a single instrument.
+    /// Subscribes to definitions for the specified instruments.
     ///
     /// # Errors
     ///
     /// Returns an error if the subscribe operation fails.
     fn subscribe_instrument(&mut self, cmd: SubscribeInstrument) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(())
     }
 
-    /// Subscribes to order book delta updates for the specified instrument.
+    /// Subscribes to order book delta updates for the specified instruments.
     ///
     /// # Errors
     ///
     /// Returns an error if the subscribe operation fails.
     fn subscribe_book_deltas(&mut self, cmd: SubscribeBookDeltas) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(())
     }
 
-    /// Subscribes to order book depth snapshot updates for the specified instrument.
+    /// Subscribes to order book depth snapshot updates for the specified instruments.
     ///
     /// # Errors
     ///
     /// Returns an error if the subscribe operation fails.
     fn subscribe_book_depth(&mut self, cmd: SubscribeBookDepth) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(())
     }
 
-    /// Subscribes to quote updates for the specified instrument.
+    /// Subscribes to quote updates for the specified instruments.
+    ///
+    /// If a failed dispatch accepted any IDs, the client returns
+    /// [`SubscriptionError`](crate::messages::data::SubscriptionError) with exactly those IDs.
+    /// Accepted IDs must belong to the command. Acceptance records client dispatch;
+    /// venue acknowledgements arrive asynchronously.
     ///
     /// # Errors
     ///
     /// Returns an error if the subscribe operation fails.
     fn subscribe_quotes(&mut self, cmd: SubscribeQuotes) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(())
     }
 
-    /// Subscribes to trade updates for the specified instrument.
+    /// Subscribes to trade updates for the specified instruments.
+    ///
+    /// If a failed dispatch accepted any IDs, the client returns
+    /// [`SubscriptionError`](crate::messages::data::SubscriptionError) with exactly those IDs.
+    /// Accepted IDs must belong to the command. Acceptance records client dispatch;
+    /// venue acknowledgements arrive asynchronously.
     ///
     /// # Errors
     ///
     /// Returns an error if the subscribe operation fails.
     fn subscribe_trades(&mut self, cmd: SubscribeTrades) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(())
     }
 
-    /// Subscribes to mark price updates for the specified instrument.
+    /// Subscribes to mark price updates for the specified instruments.
     ///
     /// # Errors
     ///
     /// Returns an error if the subscribe operation fails.
     fn subscribe_mark_prices(&mut self, cmd: SubscribeMarkPrices) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(())
     }
 
-    /// Subscribes to index price updates for the specified instrument.
+    /// Subscribes to index price updates for the specified instruments.
     ///
     /// # Errors
     ///
     /// Returns an error if the subscribe operation fails.
     fn subscribe_index_prices(&mut self, cmd: SubscribeIndexPrices) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(())
     }
 
-    /// Subscribes to funding rate updates for the specified instrument.
+    /// Subscribes to funding rate updates for the specified instruments.
     ///
     /// # Errors
     ///
     /// Returns an error if the subscribe operation fails.
     fn subscribe_funding_rates(&mut self, cmd: SubscribeFundingRates) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(())
     }
 
-    /// Subscribes to bar updates of the specified bar type.
+    /// Subscribes to bar updates of the specified full bar types.
     ///
     /// # Errors
     ///
     /// Returns an error if the subscribe operation fails.
     fn subscribe_bars(&mut self, cmd: SubscribeBars) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(())
     }
 
-    /// Subscribes to status updates for the specified instrument.
+    /// Subscribes to status updates for the specified instruments.
     ///
     /// # Errors
     ///
@@ -230,27 +252,27 @@ pub trait DataClient {
         &mut self,
         cmd: SubscribeInstrumentStatus,
     ) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(())
     }
 
-    /// Subscribes to instrument close events for the specified instrument.
+    /// Subscribes to instrument close events for the specified instruments.
     ///
     /// # Errors
     ///
     /// Returns an error if the subscription operation fails.
     fn subscribe_instrument_close(&mut self, cmd: SubscribeInstrumentClose) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(())
     }
 
-    /// Subscribes to exchange-provided option greeks for the specified instrument.
+    /// Subscribes to exchange-provided option greeks for the specified instruments.
     ///
     /// # Errors
     ///
     /// Returns an error if the subscription operation fails.
     fn subscribe_option_greeks(&mut self, cmd: SubscribeOptionGreeks) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(())
     }
 
@@ -261,7 +283,7 @@ pub trait DataClient {
     ///
     /// Returns an error if the subscription operation fails.
     fn subscribe_blocks(&mut self, cmd: SubscribeBlocks) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(())
     }
 
@@ -272,7 +294,7 @@ pub trait DataClient {
     ///
     /// Returns an error if the subscription operation fails.
     fn subscribe_pool(&mut self, cmd: SubscribePool) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(())
     }
 
@@ -283,7 +305,7 @@ pub trait DataClient {
     ///
     /// Returns an error if the subscription operation fails.
     fn subscribe_pool_swaps(&mut self, cmd: SubscribePoolSwaps) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(())
     }
 
@@ -297,7 +319,7 @@ pub trait DataClient {
         &mut self,
         cmd: SubscribePoolLiquidityUpdates,
     ) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(())
     }
 
@@ -308,7 +330,7 @@ pub trait DataClient {
     ///
     /// Returns an error if the subscription operation fails.
     fn subscribe_pool_fee_collects(&mut self, cmd: SubscribePoolFeeCollects) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(())
     }
 
@@ -319,7 +341,7 @@ pub trait DataClient {
     ///
     /// Returns an error if the subscription operation fails.
     fn subscribe_pool_flash_events(&mut self, cmd: SubscribePoolFlashEvents) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(())
     }
 
@@ -329,7 +351,7 @@ pub trait DataClient {
     ///
     /// Returns an error if the unsubscribe operation fails.
     fn unsubscribe(&mut self, cmd: &UnsubscribeCustomData) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), cmd);
         Ok(())
     }
 
@@ -339,101 +361,101 @@ pub trait DataClient {
     ///
     /// Returns an error if the unsubscribe operation fails.
     fn unsubscribe_instruments(&mut self, cmd: &UnsubscribeInstruments) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), cmd);
         Ok(())
     }
 
-    /// Unsubscribes from data for the specified instrument.
+    /// Unsubscribes from data for the specified instruments.
     ///
     /// # Errors
     ///
     /// Returns an error if the unsubscribe operation fails.
     fn unsubscribe_instrument(&mut self, cmd: &UnsubscribeInstrument) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), cmd);
         Ok(())
     }
 
-    /// Unsubscribes from order book delta updates for the specified instrument.
+    /// Unsubscribes from order book delta updates for the specified instruments.
     ///
     /// # Errors
     ///
     /// Returns an error if the unsubscribe operation fails.
     fn unsubscribe_book_deltas(&mut self, cmd: &UnsubscribeBookDeltas) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), cmd);
         Ok(())
     }
 
-    /// Unsubscribes from order book depth snapshot updates for the specified instrument.
+    /// Unsubscribes from order book depth snapshot updates for the specified instruments.
     ///
     /// # Errors
     ///
     /// Returns an error if the unsubscribe operation fails.
     fn unsubscribe_book_depth(&mut self, cmd: &UnsubscribeBookDepth) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), cmd);
         Ok(())
     }
 
-    /// Unsubscribes from quote updates for the specified instrument.
+    /// Unsubscribes from quote updates for the specified instruments.
     ///
     /// # Errors
     ///
     /// Returns an error if the unsubscribe operation fails.
     fn unsubscribe_quotes(&mut self, cmd: &UnsubscribeQuotes) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), cmd);
         Ok(())
     }
 
-    /// Unsubscribes from trade updates for the specified instrument.
+    /// Unsubscribes from trade updates for the specified instruments.
     ///
     /// # Errors
     ///
     /// Returns an error if the unsubscribe operation fails.
     fn unsubscribe_trades(&mut self, cmd: &UnsubscribeTrades) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), cmd);
         Ok(())
     }
 
-    /// Unsubscribes from mark price updates for the specified instrument.
+    /// Unsubscribes from mark price updates for the specified instruments.
     ///
     /// # Errors
     ///
     /// Returns an error if the unsubscribe operation fails.
     fn unsubscribe_mark_prices(&mut self, cmd: &UnsubscribeMarkPrices) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), cmd);
         Ok(())
     }
 
-    /// Unsubscribes from index price updates for the specified instrument.
+    /// Unsubscribes from index price updates for the specified instruments.
     ///
     /// # Errors
     ///
     /// Returns an error if the unsubscribe operation fails.
     fn unsubscribe_index_prices(&mut self, cmd: &UnsubscribeIndexPrices) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), cmd);
         Ok(())
     }
 
-    /// Unsubscribes from funding rate updates for the specified instrument.
+    /// Unsubscribes from funding rate updates for the specified instruments.
     ///
     /// # Errors
     ///
     /// Returns an error if the unsubscribe operation fails.
     fn unsubscribe_funding_rates(&mut self, cmd: &UnsubscribeFundingRates) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), cmd);
         Ok(())
     }
 
-    /// Unsubscribes from bar updates of the specified bar type.
+    /// Unsubscribes from bar updates of the specified full bar types.
     ///
     /// # Errors
     ///
     /// Returns an error if the unsubscribe operation fails.
     fn unsubscribe_bars(&mut self, cmd: &UnsubscribeBars) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), cmd);
         Ok(())
     }
 
-    /// Unsubscribes from instrument status updates for the specified instrument.
+    /// Unsubscribes from instrument status updates for the specified instruments.
     ///
     /// # Errors
     ///
@@ -442,11 +464,11 @@ pub trait DataClient {
         &mut self,
         cmd: &UnsubscribeInstrumentStatus,
     ) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), cmd);
         Ok(())
     }
 
-    /// Unsubscribes from instrument close events for the specified instrument.
+    /// Unsubscribes from instrument close events for the specified instruments.
     ///
     /// # Errors
     ///
@@ -455,17 +477,17 @@ pub trait DataClient {
         &mut self,
         cmd: &UnsubscribeInstrumentClose,
     ) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), cmd);
         Ok(())
     }
 
-    /// Unsubscribes from exchange-provided option greeks for the specified instrument.
+    /// Unsubscribes from exchange-provided option greeks for the specified instruments.
     ///
     /// # Errors
     ///
     /// Returns an error if the unsubscribe operation fails.
     fn unsubscribe_option_greeks(&mut self, cmd: &UnsubscribeOptionGreeks) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), cmd);
         Ok(())
     }
 
@@ -476,7 +498,7 @@ pub trait DataClient {
     ///
     /// Returns an error if the subscription operation fails.
     fn unsubscribe_blocks(&mut self, cmd: &UnsubscribeBlocks) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), cmd);
         Ok(())
     }
 
@@ -487,7 +509,7 @@ pub trait DataClient {
     ///
     /// Returns an error if the subscription operation fails.
     fn unsubscribe_pool(&mut self, cmd: &UnsubscribePool) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), cmd);
         Ok(())
     }
 
@@ -498,7 +520,7 @@ pub trait DataClient {
     ///
     /// Returns an error if the subscription operation fails.
     fn unsubscribe_pool_swaps(&mut self, cmd: &UnsubscribePoolSwaps) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), cmd);
         Ok(())
     }
 
@@ -512,7 +534,7 @@ pub trait DataClient {
         &mut self,
         cmd: &UnsubscribePoolLiquidityUpdates,
     ) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), cmd);
         Ok(())
     }
 
@@ -526,7 +548,7 @@ pub trait DataClient {
         &mut self,
         cmd: &UnsubscribePoolFeeCollects,
     ) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), cmd);
         Ok(())
     }
 
@@ -540,7 +562,7 @@ pub trait DataClient {
         &mut self,
         cmd: &UnsubscribePoolFlashEvents,
     ) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), cmd);
         Ok(())
     }
 
@@ -549,9 +571,11 @@ pub trait DataClient {
     /// # Errors
     ///
     /// Returns an error if the data request fails.
-    fn request_data(&self, request: RequestCustomData) -> anyhow::Result<()> {
-        log_not_implemented(&request);
-        Ok(())
+    fn request_data(&self, _request: RequestCustomData) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "Data client {} does not support RequestCustomData",
+            self.client_id()
+        )
     }
 
     /// Requests a list of instruments from the provider for a given venue.
@@ -559,9 +583,11 @@ pub trait DataClient {
     /// # Errors
     ///
     /// Returns an error if the instruments request fails.
-    fn request_instruments(&self, request: RequestInstruments) -> anyhow::Result<()> {
-        log_not_implemented(&request);
-        Ok(())
+    fn request_instruments(&self, _request: RequestInstruments) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "Data client {} does not support RequestInstruments",
+            self.client_id()
+        )
     }
 
     /// Requests detailed data for a single instrument.
@@ -569,9 +595,11 @@ pub trait DataClient {
     /// # Errors
     ///
     /// Returns an error if the instrument request fails.
-    fn request_instrument(&self, request: RequestInstrument) -> anyhow::Result<()> {
-        log_not_implemented(&request);
-        Ok(())
+    fn request_instrument(&self, _request: RequestInstrument) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "Data client {} does not support RequestInstrument",
+            self.client_id()
+        )
     }
 
     /// Requests a snapshot of the order book for a specified instrument.
@@ -579,9 +607,11 @@ pub trait DataClient {
     /// # Errors
     ///
     /// Returns an error if the book snapshot request fails.
-    fn request_book_snapshot(&self, request: RequestBookSnapshot) -> anyhow::Result<()> {
-        log_not_implemented(&request);
-        Ok(())
+    fn request_book_snapshot(&self, _request: RequestBookSnapshot) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "Data client {} does not support RequestBookSnapshot",
+            self.client_id()
+        )
     }
 
     /// Requests historical or streaming quote data for a specified instrument.
@@ -589,9 +619,11 @@ pub trait DataClient {
     /// # Errors
     ///
     /// Returns an error if the quotes request fails.
-    fn request_quotes(&self, request: RequestQuotes) -> anyhow::Result<()> {
-        log_not_implemented(&request);
-        Ok(())
+    fn request_quotes(&self, _request: RequestQuotes) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "Data client {} does not support RequestQuotes",
+            self.client_id()
+        )
     }
 
     /// Requests historical or streaming trade data for a specified instrument.
@@ -599,9 +631,11 @@ pub trait DataClient {
     /// # Errors
     ///
     /// Returns an error if the trades request fails.
-    fn request_trades(&self, request: RequestTrades) -> anyhow::Result<()> {
-        log_not_implemented(&request);
-        Ok(())
+    fn request_trades(&self, _request: RequestTrades) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "Data client {} does not support RequestTrades",
+            self.client_id()
+        )
     }
 
     /// Requests historical or streaming funding rate data for a specified instrument.
@@ -609,9 +643,11 @@ pub trait DataClient {
     /// # Errors
     ///
     /// Returns an error if the trades request fails.
-    fn request_funding_rates(&self, request: RequestFundingRates) -> anyhow::Result<()> {
-        log_not_implemented(&request);
-        Ok(())
+    fn request_funding_rates(&self, _request: RequestFundingRates) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "Data client {} does not support RequestFundingRates",
+            self.client_id()
+        )
     }
 
     /// Requests a reference price for an option-chain bootstrap.
@@ -623,7 +659,7 @@ pub trait DataClient {
         &self,
         request: RequestOptionChainReferencePrice,
     ) -> anyhow::Result<()> {
-        log_not_implemented(&request);
+        log_not_implemented(self.client_id(), &request);
         anyhow::bail!("option-chain reference price requests are not supported")
     }
 
@@ -632,9 +668,11 @@ pub trait DataClient {
     /// # Errors
     ///
     /// Returns an error if the bars request fails.
-    fn request_bars(&self, request: RequestBars) -> anyhow::Result<()> {
-        log_not_implemented(&request);
-        Ok(())
+    fn request_bars(&self, _request: RequestBars) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "Data client {} does not support RequestBars",
+            self.client_id()
+        )
     }
 
     /// Requests historical order book depth data for a specified instrument.
@@ -642,9 +680,11 @@ pub trait DataClient {
     /// # Errors
     ///
     /// Returns an error if the order book depths request fails.
-    fn request_book_depth(&self, request: RequestBookDepth) -> anyhow::Result<()> {
-        log_not_implemented(&request);
-        Ok(())
+    fn request_book_depth(&self, _request: RequestBookDepth) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "Data client {} does not support RequestBookDepth",
+            self.client_id()
+        )
     }
 
     /// Requests historical order book delta data for a specified instrument.
@@ -652,9 +692,11 @@ pub trait DataClient {
     /// # Errors
     ///
     /// Returns an error if the order book deltas request fails.
-    fn request_book_deltas(&self, request: RequestBookDeltas) -> anyhow::Result<()> {
-        log_not_implemented(&request);
-        Ok(())
+    fn request_book_deltas(&self, _request: RequestBookDeltas) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "Data client {} does not support RequestBookDeltas",
+            self.client_id()
+        )
     }
 
     #[cfg(feature = "defi")]
@@ -664,7 +706,60 @@ pub trait DataClient {
     ///
     /// Returns an error if the pool snapshot request fails.
     fn request_pool_snapshot(&self, request: RequestPoolSnapshot) -> anyhow::Result<()> {
-        log_not_implemented(&request);
+        log_not_implemented(self.client_id(), &request);
         Ok(())
+    }
+}
+
+/// Executes each instrument operation in order and reports synchronous acceptance.
+///
+/// Validate command-wide settings before calling this function. A member failure does not stop
+/// later members; the returned error preserves the first failure and lists only accepted members.
+///
+/// # Errors
+///
+/// Returns an error if any member fails, with a [`SubscriptionError`] listing accepted members.
+pub fn execute_instrument_subscriptions(
+    members: &[InstrumentId],
+    execute: impl FnMut(InstrumentId) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    execute_members(members, execute)
+        .map_err(|(accepted, source)| SubscriptionError::instruments(accepted, source).into())
+}
+
+/// Executes each full bar type operation in order and reports synchronous acceptance.
+///
+/// Validate command-wide settings before calling this function. A member failure does not stop
+/// later members; acceptance uses full bar types, including types on the same instrument.
+///
+/// # Errors
+///
+/// Returns an error if any member fails, with a [`SubscriptionError`] listing accepted members.
+pub fn execute_bar_subscriptions(
+    members: &[BarType],
+    execute: impl FnMut(BarType) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    execute_members(members, execute)
+        .map_err(|(accepted, source)| SubscriptionError::bars(accepted, source).into())
+}
+
+fn execute_members<T: Copy>(
+    members: &[T],
+    mut execute: impl FnMut(T) -> anyhow::Result<()>,
+) -> Result<(), (Vec<T>, anyhow::Error)> {
+    let mut accepted = Vec::new();
+    let mut failure = None;
+
+    for &member in members {
+        match execute(member) {
+            Ok(()) => accepted.push(member),
+            Err(e) if failure.is_none() => failure = Some(e),
+            Err(_) => {}
+        }
+    }
+
+    match failure {
+        Some(e) => Err((accepted, e)),
+        None => Ok(()),
     }
 }

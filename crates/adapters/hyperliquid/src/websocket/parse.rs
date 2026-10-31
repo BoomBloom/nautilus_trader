@@ -147,7 +147,7 @@ pub fn parse_ws_order_book_deltas(
             instrument.id(),
             BookAction::Add,
             order,
-            RecordFlag::F_LAST as u8,
+            RecordFlag::F_SNAPSHOT as u8,
             0, // sequence
             ts_event,
             ts_init,
@@ -170,13 +170,18 @@ pub fn parse_ws_order_book_deltas(
             instrument.id(),
             BookAction::Add,
             order,
-            RecordFlag::F_LAST as u8,
+            RecordFlag::F_SNAPSHOT as u8,
             0, // sequence
             ts_event,
             ts_init,
         );
 
         deltas.push(delta);
+    }
+
+    // One event group, so consumers never observe a partially rebuilt book
+    if let Some(last) = deltas.last_mut() {
+        last.flags |= RecordFlag::F_LAST as u8;
     }
 
     Ok(OrderBookDeltas::new(instrument.id(), deltas))
@@ -399,6 +404,34 @@ pub fn parse_ws_fill_report(
 ) -> anyhow::Result<FillReport> {
     let instrument_id = instrument.id();
 
+    let venue_order_id = VenueOrderId::new(fill.oid.to_string());
+    let trade_id = make_fill_trade_id(
+        &fill.hash,
+        fill.oid,
+        fill.px,
+        fill.sz,
+        fill.time,
+        fill.start_position,
+    );
+
+    let order_side = OrderSide::from(fill.side);
+    let last_qty = parse_quantity(fill.sz, instrument, "fill.sz")?;
+    let last_px = parse_price(fill.px, instrument, "fill.px")?;
+    let liquidity_side = if fill.crossed {
+        LiquiditySide::Taker
+    } else {
+        LiquiditySide::Maker
+    };
+
+    let ts_event = millis_to_nanos(fill.time)?;
+    let fee_amount = fill.fee;
+
+    let commission_currency =
+        crate::http::parse::resolve_fee_currency(fill.fee_token.as_str(), fee_amount, instrument)?;
+
+    let commission = Money::from_decimal(fee_amount, commission_currency)
+        .with_context(|| format!("Failed to create commission from fee='{}'", fill.fee))?;
+
     if let Some(liquidation) = fill.liquidation.as_ref() {
         log::warn!(
             "Liquidation fill: {} oid={} method={:?} mark_px={} liquidated_user={}",
@@ -419,34 +452,6 @@ pub fn parse_ws_fill_report(
             fill.sz,
         );
     }
-
-    let venue_order_id = VenueOrderId::new(fill.oid.to_string());
-    let trade_id = make_fill_trade_id(
-        &fill.hash,
-        fill.oid,
-        fill.px,
-        fill.sz,
-        fill.time,
-        fill.start_position,
-    );
-
-    let order_side = OrderSide::from(fill.side);
-    let last_qty = parse_quantity(fill.sz, instrument, "fill.sz")?;
-    let last_px = parse_price(fill.px, instrument, "fill.px")?;
-    let liquidity_side = if fill.crossed {
-        LiquiditySide::Taker
-    } else {
-        LiquiditySide::Maker
-    };
-
-    let fee_amount = fill.fee;
-
-    let commission_currency =
-        crate::http::parse::resolve_fee_currency(fill.fee_token.as_str(), fee_amount, instrument)?;
-
-    let commission = Money::from_decimal(fee_amount, commission_currency)
-        .with_context(|| format!("Failed to create commission from fee='{}'", fill.fee))?;
-    let ts_event = millis_to_nanos(fill.time)?;
 
     // No client order ID available in fill data directly
     let client_order_id = None;
@@ -723,6 +728,7 @@ mod tests {
                 tpsl: None,
                 trigger_activated: None,
                 trailing_stop: None,
+                order_type: None,
             },
             status: HyperliquidOrderStatusEnum::Open,
             status_timestamp: 1704470400000,
@@ -776,6 +782,7 @@ mod tests {
                 tpsl: None,
                 trigger_activated: None,
                 trailing_stop: None,
+                order_type: None,
             },
             status,
             status_timestamp: 1704470400000,
@@ -880,6 +887,7 @@ mod tests {
                 outcome: 99,
                 name: "BTC daily".to_string(),
                 description: String::new(),
+                quote_token: Some("USDC".to_string()),
                 side_specs: vec![],
             }],
             questions: vec![],
@@ -919,9 +927,9 @@ mod tests {
         .unwrap();
 
         // Zero-fee outcome fills fall back to the instrument's quote currency
-        // (USDH) instead of the unregistered side token, keeping downstream
+        // instead of the unregistered side token, keeping downstream
         // OrderFilled events and persistence on a registered currency.
-        assert_eq!(report.commission.currency.code, "USDH");
+        assert_eq!(report.commission.currency.code, "USDC");
         assert!(report.commission.as_decimal().is_zero());
         assert_eq!(report.order_side, OrderSide::Buy);
     }
@@ -952,18 +960,46 @@ mod tests {
 
         assert_eq!(deltas.deltas.len(), 3); // clear + bid + ask
         assert_eq!(deltas.deltas[0].action, BookAction::Clear);
+        assert_eq!(deltas.deltas[0].flags, RecordFlag::F_SNAPSHOT as u8);
 
         let bid_delta = &deltas.deltas[1];
         assert_eq!(bid_delta.action, BookAction::Add);
         assert_eq!(bid_delta.order.side, OrderSide::Buy.into());
-        assert!(bid_delta.order.size.is_positive());
+        assert_eq!(bid_delta.order.price.as_decimal(), dec!(50000.0));
+        assert_eq!(bid_delta.order.size.as_decimal(), dec!(1.0));
         assert_eq!(bid_delta.order.order_id, 0);
+        assert_eq!(bid_delta.flags, RecordFlag::F_SNAPSHOT as u8);
 
         let ask_delta = &deltas.deltas[2];
         assert_eq!(ask_delta.action, BookAction::Add);
         assert_eq!(ask_delta.order.side, OrderSide::Sell.into());
-        assert!(ask_delta.order.size.is_positive());
+        assert_eq!(ask_delta.order.price.as_decimal(), dec!(50001.0));
+        assert_eq!(ask_delta.order.size.as_decimal(), dec!(2.0));
         assert_eq!(ask_delta.order.order_id, 0);
+        assert_eq!(
+            ask_delta.flags,
+            RecordFlag::F_SNAPSHOT as u8 | RecordFlag::F_LAST as u8
+        );
+    }
+
+    #[rstest]
+    fn test_parse_ws_order_book_deltas_empty_book_is_lone_clear() {
+        let instrument = create_test_instrument();
+
+        let book = WsBookData {
+            coin: Ustr::from("BTC"),
+            levels: [vec![], vec![]],
+            time: 1_704_470_400_000,
+        };
+
+        let deltas = parse_ws_order_book_deltas(&book, &instrument, UnixNanos::default()).unwrap();
+
+        assert_eq!(deltas.deltas.len(), 1);
+        assert_eq!(deltas.deltas[0].action, BookAction::Clear);
+        assert_eq!(
+            deltas.deltas[0].flags,
+            RecordFlag::F_SNAPSHOT as u8 | RecordFlag::F_LAST as u8
+        );
     }
 
     #[rstest]
@@ -1090,7 +1126,7 @@ mod tests {
                     prev_day_px: dec!(49000.0),
                     mark_px: dec!(50000.0),
                     mid_px: Some(dec!(50001.0)),
-                    impact_pxs: Some(vec!["50000.0".to_string(), "50002.0".to_string()]),
+                    impact_pxs: Some(vec![dec!(50000.0), dec!(50002.0)]),
                     day_base_vlm: Some(dec!(100.0)),
                 },
                 funding: dec!(0.0001),
@@ -1133,7 +1169,7 @@ mod tests {
                     prev_day_px: dec!(49000.0),
                     mark_px: dec!(50000.0),
                     mid_px: Some(dec!(50001.0)),
-                    impact_pxs: Some(vec!["50000.0".to_string(), "50002.0".to_string()]),
+                    impact_pxs: Some(vec![dec!(50000.0), dec!(50002.0)]),
                     day_base_vlm: Some(dec!(100.0)),
                 },
                 circulating_supply: dec!(19000000.0),

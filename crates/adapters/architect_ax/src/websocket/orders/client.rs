@@ -39,12 +39,14 @@ use nautilus_live::{
     task::{SharedTaskSlot, TaskJoinOutcome},
 };
 use nautilus_model::{
-    enums::{OrderSide, TimeInForce},
+    enums::TimeInForce,
+    events::OrderInitialized,
     identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     types::{Price, Quantity},
 };
 use nautilus_network::{
+    ConnectionUrl,
     http::create_standard_nautilus_headers,
     mode::ConnectionMode,
     websocket::{
@@ -78,6 +80,7 @@ pub struct OrdersCaches {
     pub venue_to_client_id: Arc<DashMap<VenueOrderId, ClientOrderId>>,
     /// Maps AX cid values to client order IDs.
     pub cid_to_client_order_id: Arc<DashMap<u64, ClientOrderId>>,
+    pub(crate) pending_modifies: Arc<DashMap<VenueOrderId, (ClientOrderId, usize, bool)>>,
 }
 
 impl Default for OrdersCaches {
@@ -86,6 +89,7 @@ impl Default for OrdersCaches {
             orders_metadata: Arc::new(DashMap::new()),
             venue_to_client_id: Arc::new(DashMap::new()),
             cid_to_client_order_id: Arc::new(DashMap::new()),
+            pending_modifies: Arc::new(DashMap::new()),
         }
     }
 }
@@ -128,7 +132,7 @@ impl From<&'static str> for AxOrdersWsClientError {
 /// and monitoring order status via WebSocket.
 pub struct AxOrdersWebSocketClient {
     clock: &'static AtomicTime,
-    url: String,
+    url: ConnectionUrl,
     heartbeat: Option<u64>,
     reconnect_headers: Arc<Mutex<Option<ReconnectHeaders>>>,
     connection_mode: Arc<ArcSwap<AtomicU8>>,
@@ -214,7 +218,7 @@ impl AxOrdersWebSocketClient {
 
         Self {
             clock: get_atomic_clock_realtime(),
-            url,
+            url: url.into(),
             heartbeat: Some(heartbeat),
             reconnect_headers: Arc::new(Mutex::new(None)),
             connection_mode,
@@ -250,7 +254,7 @@ impl AxOrdersWebSocketClient {
     /// Returns the WebSocket URL.
     #[must_use]
     pub fn url(&self) -> &str {
-        &self.url
+        self.url.expose()
     }
 
     /// Returns the account ID.
@@ -381,6 +385,8 @@ impl AxOrdersWebSocketClient {
             strategy_id,
             instrument_id,
             client_order_id,
+            order_init: None,
+            is_accepted: true,
             venue_order_id: Some(venue_order_id),
             ts_init: self.generate_ts_init(),
             size_precision: instrument.size_precision(),
@@ -461,7 +467,7 @@ impl AxOrdersWebSocketClient {
         ));
 
         let config = WebSocketConfig {
-            url: self.url.clone(),
+            url: self.url.expose().to_owned(),
             headers,
             heartbeat_interval_secs: self.heartbeat,
             heartbeat_payload: None, // Ax server sends heartbeats
@@ -473,11 +479,14 @@ impl AxOrdersWebSocketClient {
             reconnect_max_attempts: None,
             heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
+            writer_capacity: None,
             backend: self.transport_backend,
             proxy_url: self
                 .proxy_url
                 .as_ref()
                 .map(|url| url.expose_secret().to_owned()),
+            max_message_size_bytes: None,
+            max_frame_size_bytes: None,
         };
 
         let client = WebSocketClient::builder()
@@ -490,10 +499,14 @@ impl AxOrdersWebSocketClient {
             .connect()
             .await
             .map_err(|e| {
-                AxOrdersWsClientError::Transport(format!("Failed to connect to {}: {e}", self.url))
+                AxOrdersWsClientError::Transport(format!(
+                    "WebSocket connection failed: {}: {}",
+                    self.url.origin(),
+                    e.redacted_message()
+                ))
             })?;
 
-        self.connection_mode.store(client.connection_mode_atomic());
+        let connection_mode = client.connection_mode_atomic();
         let reconnect_handle = client.reconnect_handle();
         *self.reconnect_headers.lock() = Some(client.reconnect_headers());
 
@@ -501,17 +514,24 @@ impl AxOrdersWebSocketClient {
         self.out_rx = Some(Arc::new(out_rx));
 
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
-        *self.cmd_tx.write().await = cmd_tx.clone();
+        cmd_tx
+            .send(HandlerCommand::SetClient(client))
+            .map_err(|e| AxOrdersWsClientError::ChannelError(e.to_string()))?;
 
-        self.send_cmd(HandlerCommand::SetClient(client)).await?;
+        cmd_tx
+            .send(HandlerCommand::SessionAuthenticated)
+            .map_err(|e| AxOrdersWsClientError::ChannelError(e.to_string()))?;
 
-        self.send_cmd(HandlerCommand::SessionAuthenticated).await?;
+        {
+            let mut command_sender = self.cmd_tx.write().await;
+            *command_sender = cmd_tx.clone();
+            self.connection_mode.store(connection_mode);
+        }
 
         let signal = Arc::clone(&self.signal);
         let auth_tracker = self.auth_tracker.clone();
         let orders_metadata = Arc::clone(&self.caches.orders_metadata);
         let venue_to_client_order_id = Arc::clone(&self.caches.venue_to_client_id);
-        let cid_to_client_order_id = Arc::clone(&self.caches.cid_to_client_order_id);
 
         if let Err(e) = self.task_handle.spawn(async move {
             let mut handler = AxOrdersWsFeedHandler::new(
@@ -521,7 +541,6 @@ impl AxOrdersWebSocketClient {
                 auth_tracker.clone(),
                 orders_metadata,
                 venue_to_client_order_id,
-                cid_to_client_order_id,
             );
 
             while let Some(msg) = handler.next().await {
@@ -552,8 +571,9 @@ impl AxOrdersWebSocketClient {
 
     /// Submits the AX priced order shape using Nautilus domain types.
     ///
-    /// This method handles conversion from Nautilus domain types to AX-specific
-    /// types and stores order metadata for event correlation.
+    /// Retains `order_init` for event correlation and the original order type and side.
+    /// The remaining arguments describe the current wire order, including a market order's
+    /// preview price and IOC time-in-force.
     ///
     /// # Errors
     ///
@@ -561,19 +581,19 @@ impl AxOrdersWebSocketClient {
     /// - The time-in-force is not supported.
     /// - The instrument is not found in the cache.
     /// - The order command cannot be sent.
-    #[expect(clippy::too_many_arguments)]
     pub async fn submit_order(
         &self,
-        trader_id: TraderId,
-        strategy_id: StrategyId,
-        instrument_id: InstrumentId,
-        client_order_id: ClientOrderId,
-        order_side: OrderSide,
+        order_init: &OrderInitialized,
         quantity: Quantity,
         time_in_force: TimeInForce,
         price: Price,
         post_only: bool,
     ) -> AxOrdersWsResult<i64> {
+        let trader_id = order_init.trader_id;
+        let strategy_id = order_init.strategy_id;
+        let instrument_id = order_init.instrument_id;
+        let client_order_id = order_init.client_order_id;
+        let order_side = order_init.order_side;
         // Get instrument from cache for precision
         let symbol = instrument_id.symbol.inner();
         let instrument = self.get_cached_instrument(&symbol).ok_or_else(|| {
@@ -599,6 +619,8 @@ impl AxOrdersWebSocketClient {
             strategy_id,
             instrument_id,
             client_order_id,
+            order_init: Some(order_init.clone()),
+            is_accepted: false,
             venue_order_id: None,
             ts_init: self.generate_ts_init(),
             size_precision: instrument.size_precision(),
@@ -636,27 +658,30 @@ impl AxOrdersWebSocketClient {
             })
             .await;
 
-        if result.is_err() {
-            self.caches.orders_metadata.remove(&client_order_id);
-            self.caches.cid_to_client_order_id.remove(&cid);
-        }
-
         result?;
         Ok(request_id)
     }
 
     /// Cancels an order via WebSocket.
     ///
-    /// Requires a known `venue_order_id`.
+    /// Uses the tracked venue order ID first, including a replacement ID.
+    /// The supplied `venue_order_id` is a fallback for orders without a tracked ID.
     ///
     /// # Errors
     ///
-    /// Returns an error if the cancel command cannot be sent.
+    /// Returns an error if no venue order ID is known or the cancel command cannot be sent.
     pub async fn cancel_order(
         &self,
         client_order_id: ClientOrderId,
         venue_order_id: Option<VenueOrderId>,
     ) -> AxOrdersWsResult<i64> {
+        let venue_order_id = self
+            .caches
+            .orders_metadata
+            .get(&client_order_id)
+            .and_then(|metadata| metadata.venue_order_id)
+            .or(venue_order_id);
+
         let order_id = venue_order_id.map(|v| v.to_string()).ok_or_else(|| {
             AxOrdersWsClientError::ClientError(format!(
                 "Cannot cancel order {client_order_id}: missing venue_order_id"
@@ -778,7 +803,7 @@ impl Drop for AxOrdersWebSocketClient {
     }
 }
 
-fn reserve_cid_mapping(
+pub(crate) fn reserve_cid_mapping(
     caches: &OrdersCaches,
     cid: u64,
     client_order_id: ClientOrderId,
@@ -799,9 +824,89 @@ fn reserve_cid_mapping(
 mod tests {
     use std::sync::Arc;
 
+    use futures_util::StreamExt;
+    use nautilus_model::{
+        enums::OrderType,
+        orders::{Order, builder::OrderTestBuilder},
+    };
+    use nautilus_testkit::connection::race_command_with_publication;
     use rstest::rstest;
 
     use super::*;
+
+    #[tokio::test]
+    async fn command_during_sender_publication_reaches_initialized_handler() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (received_tx, mut received_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                    let payload: serde_json::Value = serde_json::from_str(text.as_str()).unwrap();
+                    let _ = received_tx.send(payload);
+                }
+            }
+        });
+
+        let url = format!("ws://{addr}");
+
+        let mut ws_client = AxOrdersWebSocketClient::new(
+            url,
+            AccountId::from("AX-001"),
+            TraderId::from("TRADER-001"),
+            30,
+            TransportBackend::default(),
+            None,
+        );
+        let observer = ws_client.clone();
+        let command = HandlerCommand::GetOpenOrders { request_id: 72 };
+        race_command_with_publication(
+            Arc::clone(&ws_client.cmd_tx),
+            ws_client.connect("startup-token"),
+            move || command,
+            || observer.is_active(),
+        )
+        .await
+        .expect("connect failed");
+        let received = tokio::time::timeout(Duration::from_secs(2), received_rx.recv()).await;
+        ws_client.close().await.expect("disconnect failed");
+        server.abort();
+
+        let payload = received
+            .expect("startup command must reach server")
+            .unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "rid": 72,
+                "t": "o"
+            })
+        );
+    }
+
+    #[rstest]
+    #[case("wss://stream.example.com/feed", "wss://stream.example.com")]
+    #[case(
+        "wss://SYN-user:SYN-password@stream.example.com:9443/SYN-path?token=SYN-query#SYN-fragment",
+        "wss://stream.example.com:9443"
+    )]
+    fn test_debug_preserves_url_origin(#[case] url: &str, #[case] origin: &str) {
+        let client = AxOrdersWebSocketClient::new(
+            url.to_string(),
+            AccountId::from("AX-001"),
+            TraderId::from("TRADER-001"),
+            30,
+            TransportBackend::default(),
+            None,
+        );
+        let debug = format!("{client:?}");
+        assert!(debug.contains(&format!("url: {origin:?}")));
+        assert!(!debug.contains("SYN-"));
+        assert_eq!(client.url.expose(), url);
+    }
 
     #[tokio::test]
     async fn test_drop_aborts_handler_task() {
@@ -831,6 +936,65 @@ mod tests {
         })
         .await
         .expect("handler task aborted");
+    }
+
+    #[tokio::test]
+    async fn test_submit_channel_error_retains_context() {
+        let client = AxOrdersWebSocketClient::new(
+            "wss://example.com/orders/ws".to_string(),
+            AccountId::from("AX-001"),
+            TraderId::from("TRADER-001"),
+            30,
+            TransportBackend::default(),
+            None,
+        );
+        let response: crate::http::models::AxInstrumentsResponse =
+            serde_json::from_str(include_str!("../../../test_data/http_get_instruments.json"))
+                .unwrap();
+        let instrument = crate::http::parse::parse_instrument(
+            &response.instruments[0],
+            UnixNanos::from(11),
+            UnixNanos::from(12),
+        )
+        .unwrap();
+        let instrument_id = instrument.id();
+        client.cache_instrument(instrument);
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument_id)
+            .client_order_id(ClientOrderId::from("O-CHANNEL-ERROR"))
+            .quantity(Quantity::from("100"))
+            .price(Price::from("1.10"))
+            .build();
+        let result = client
+            .submit_order(
+                order.init_event(),
+                order.quantity(),
+                TimeInForce::Gtc,
+                Price::from("1.10"),
+                false,
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(AxOrdersWsClientError::ChannelError(_))
+        ));
+        let metadata = client
+            .caches
+            .orders_metadata
+            .get(&order.client_order_id())
+            .unwrap();
+        assert_eq!(metadata.order_init.as_ref(), Some(order.init_event()));
+        assert_eq!(metadata.venue_order_id, None);
+        assert!(!metadata.is_accepted);
+        assert_eq!(
+            *client
+                .caches
+                .cid_to_client_order_id
+                .get(&client_order_id_to_cid(&order.client_order_id()))
+                .unwrap(),
+            order.client_order_id()
+        );
     }
 
     #[rstest]

@@ -1089,7 +1089,8 @@ pub trait ExecutionAlgorithm: DataActor {
     ///
     /// # Errors
     ///
-    /// Returns an error if order modification fails.
+    /// Returns an error if all supplied values are absent or unchanged, or if
+    /// order modification fails.
     fn modify_order(
         &mut self,
         order: &mut OrderAny,
@@ -1106,12 +1107,11 @@ pub trait ExecutionAlgorithm: DataActor {
         let trigger_changing = trigger_price.is_some() && trigger_price != order.trigger_price();
 
         if !qty_changing && !price_changing && !trigger_changing {
-            log::error!(
+            anyhow::bail!(
                 "Cannot create command ModifyOrder: \
                 quantity, price, and trigger were either None \
                 or the same as existing values"
             );
-            return Ok(());
         }
 
         if order.is_closed() || order.is_pending_cancel() {
@@ -2460,10 +2460,12 @@ mod tests {
         }
         let (handler, events) = subscribe_order_topic(strategy_id);
 
-        let mut params = nautilus_core::Params::new();
-        params.insert(
-            "route".to_string(),
-            serde_json::Value::String("A".to_string()),
+        let params = nautilus_core::Params::new(
+            [(
+                "route".to_string(),
+                serde_json::Value::String("A".to_string()),
+            )]
+            .into(),
         );
         algo.core
             .remember_submit_params(order.client_order_id(), Some(params));
@@ -2508,10 +2510,12 @@ mod tests {
                 .unwrap();
         }
 
-        let mut params = nautilus_core::Params::new();
-        params.insert(
-            "route".to_string(),
-            serde_json::Value::String("A".to_string()),
+        let params = nautilus_core::Params::new(
+            [(
+                "route".to_string(),
+                serde_json::Value::String("A".to_string()),
+            )]
+            .into(),
         );
         algo.core
             .remember_submit_params(order.client_order_id(), Some(params));
@@ -3422,8 +3426,10 @@ mod tests {
             cache.add_order(primary.clone(), None, None, true).unwrap();
         }
 
-        let mut params = nautilus_core::Params::new();
-        params.insert("is_leverage".to_string(), serde_json::Value::Bool(true));
+        let params = nautilus_core::Params::new(
+            [("is_leverage".to_string(), serde_json::Value::Bool(true))].into(),
+        );
+
         let command = SubmitOrder::new(
             TraderId::from("TRADER-001"),
             None,
@@ -3619,8 +3625,10 @@ mod tests {
             0.into(),
         );
 
-        let mut params = nautilus_core::Params::new();
-        params.insert("is_leverage".to_string(), serde_json::Value::Bool(true));
+        let params = nautilus_core::Params::new(
+            [("is_leverage".to_string(), serde_json::Value::Bool(true))].into(),
+        );
+
         let command = SubmitOrderList::new(
             TraderId::from("TRADER-001"),
             None,

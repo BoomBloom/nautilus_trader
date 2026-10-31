@@ -15,23 +15,28 @@
 
 //! Provides the WebSocket client for the Polymarket CLOB API.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU8, Ordering},
+use std::{
+    num::NonZeroU32,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU8, Ordering},
+    },
+    time::Duration,
 };
 
+use nautilus_core::datetime::MILLISECONDS_IN_SECOND;
 use nautilus_live::{
     SocketControl,
     book::snapshot::SnapshotGate,
     task::{TaskJoinOutcome, TaskSlot, finish_task},
 };
 use nautilus_network::{
-    SocketStateSink,
+    ConnectionUrl, SocketStateSink,
     http::create_standard_nautilus_headers,
     mode::ConnectionMode,
     websocket::{
-        AuthTracker, SubscriptionState, TransportBackend, WebSocketClient, WebSocketConfig,
-        channel_epoch_message_handler, proxy::ProxyUrl,
+        AuthTracker, InitialConnectRetryPolicy, SubscriptionState, TransportBackend,
+        WebSocketClient, WebSocketConfig, channel_epoch_message_handler, proxy::ProxyUrl,
     },
 };
 
@@ -128,7 +133,7 @@ impl WsSubscriptionHandle {
 #[derive(Debug)]
 pub struct PolymarketWebSocketClient {
     channel: WsChannel,
-    url: String,
+    url: ConnectionUrl,
     connection_mode: Arc<AtomicU8>,
     signal: Arc<AtomicBool>,
     cmd_tx: Arc<tokio::sync::RwLock<tokio::sync::mpsc::UnboundedSender<HandlerCommand>>>,
@@ -143,6 +148,7 @@ pub struct PolymarketWebSocketClient {
     task_handle: TaskSlot<()>,
     subscribe_new_markets: bool,
     transport_backend: TransportBackend,
+    connect_timeout_ms: u64,
     proxy_url: Option<ProxyUrl>,
     socket_sink: Option<SocketStateSink>,
     socket_control: Option<SocketControl>,
@@ -233,7 +239,7 @@ impl PolymarketWebSocketClient {
         let (placeholder_tx, _) = tokio::sync::mpsc::unbounded_channel();
         Self {
             channel,
-            url,
+            url: url.into(),
             connection_mode: Arc::new(AtomicU8::new(ConnectionMode::Closed.as_u8())),
             signal: Arc::new(AtomicBool::new(false)),
             cmd_tx: Arc::new(tokio::sync::RwLock::new(placeholder_tx)),
@@ -246,10 +252,16 @@ impl PolymarketWebSocketClient {
             task_handle: TaskSlot::new(),
             subscribe_new_markets,
             transport_backend,
+            connect_timeout_ms: 15_000,
             proxy_url,
             socket_sink: None,
             socket_control: None,
         }
+    }
+
+    pub(crate) fn with_connect_timeout(mut self, timeout_secs: u64) -> Self {
+        self.connect_timeout_ms = timeout_secs.saturating_mul(MILLISECONDS_IN_SECOND);
+        self
     }
 
     /// Configures socket state reporting for the underlying transport.
@@ -289,6 +301,9 @@ impl PolymarketWebSocketClient {
         let client = WebSocketClient::epoch_builder()
             .config(cfg)
             .epoch_handler(message_handler)
+            .maybe_initial_connect_retry_policy(
+                (self.channel == WsChannel::Market).then(Self::initial_connect_retry_policy),
+            )
             .maybe_state_sink(
                 self.socket_control
                     .as_ref()
@@ -313,7 +328,7 @@ impl PolymarketWebSocketClient {
         let client_mode = client.connection_mode_atomic();
         self.connection_mode = client_mode;
 
-        log::debug!("Polymarket WebSocket connected: {}", self.url);
+        log::debug!("Polymarket WebSocket connected: {}", self.url.origin());
 
         // Replay retained state onto the new session. Unlike the RECONNECTED sentinel
         // path, a fresh connect() never fires resubscribe_all() inside the handler.
@@ -413,6 +428,16 @@ impl PolymarketWebSocketClient {
         Ok(())
     }
 
+    fn initial_connect_retry_policy() -> InitialConnectRetryPolicy {
+        InitialConnectRetryPolicy {
+            max_attempts: NonZeroU32::new(5).expect("initial connect attempts must be non-zero"),
+            delay_initial: Duration::from_millis(500),
+            delay_max: Duration::from_secs(5),
+            backoff_factor: 2.0,
+            jitter_ms: 250,
+        }
+    }
+
     fn websocket_config(&self) -> WebSocketConfig {
         // The market endpoint rejects text PING before its initial subscription. Protocol pings
         // keep an idle socket alive until FeedHandler starts the required text heartbeat.
@@ -424,11 +449,11 @@ impl PolymarketWebSocketClient {
         let headers = create_standard_nautilus_headers();
 
         WebSocketConfig {
-            url: self.url.clone(),
+            url: self.url.expose().to_owned(),
             headers,
             heartbeat_interval_secs: Some(POLYMARKET_HEARTBEAT_SECS),
             heartbeat_payload,
-            connect_timeout_ms: Some(15_000),
+            connect_timeout_ms: Some(self.connect_timeout_ms),
             reconnect_delay_initial_ms: Some(250),
             reconnect_delay_max_ms: Some(5_000),
             reconnect_backoff_factor: Some(2.0),
@@ -436,8 +461,11 @@ impl PolymarketWebSocketClient {
             reconnect_max_attempts: None,
             heartbeat_timeout_secs: Some(POLYMARKET_HEARTBEAT_TIMEOUT_SECS),
             idle_timeout_ms: None,
+            writer_capacity: None,
             backend: self.transport_backend,
             proxy_url: self.proxy_url.as_ref().map(|url| url.expose().to_string()),
+            max_message_size_bytes: None,
+            max_frame_size_bytes: None,
         }
     }
 
@@ -511,7 +539,7 @@ impl PolymarketWebSocketClient {
     /// Returns the URL this client connects to.
     #[must_use]
     pub fn url(&self) -> &str {
-        &self.url
+        self.url.expose()
     }
 
     /// Returns the number of active market asset subscriptions (pending + confirmed).
@@ -558,14 +586,20 @@ impl PolymarketWebSocketClient {
             .map_err(|e| anyhow::anyhow!("Failed to send SubscribeMarket: {e}"))
     }
 
-    /// Remove asset IDs from the active subscription set.
+    /// Queues removal of the given market asset subscriptions.
     ///
-    /// The IDs are dropped from the reconnect set so they will not be
-    /// re-subscribed after a reconnect. No wire message is sent.
+    /// The handler removes the IDs from reconnect replay and attempts a wire unsubscribe
+    /// on the current connection. If that connection changes before the write, the
+    /// unsubscribe is dropped rather than sent on the replacement connection.
+    ///
+    /// Success means the command was queued, not acknowledged by the venue. The handler
+    /// logs wire-send failures rather than returning them to the caller.
     ///
     /// # Errors
     ///
-    /// Returns an error if called on a user-channel client (incompatible channel).
+    /// Returns an error if:
+    /// - Called on a user-channel client.
+    /// - The command cannot be queued.
     pub async fn unsubscribe_market(&self, asset_ids: Vec<String>) -> anyhow::Result<()> {
         if self.channel != WsChannel::Market {
             anyhow::bail!(
@@ -693,6 +727,24 @@ mod tests {
         addr
     }
 
+    #[rstest]
+    #[case("wss://stream.example.com/feed", "wss://stream.example.com")]
+    #[case(
+        "wss://SYN-user:SYN-password@stream.example.com:9443/SYN-path?token=SYN-query#SYN-fragment",
+        "wss://stream.example.com:9443"
+    )]
+    fn test_debug_preserves_url_origin(#[case] url: &str, #[case] origin: &str) {
+        let client = PolymarketWebSocketClient::new_market(
+            Some(url.to_string()),
+            false,
+            TransportBackend::default(),
+        );
+        let debug = format!("{client:?}");
+        assert!(debug.contains(&format!("url: {origin:?}")));
+        assert!(!debug.contains("SYN-"));
+        assert_eq!(client.url.expose(), url);
+    }
+
     #[tokio::test]
     async fn cancelled_disconnect_retains_handler_task() {
         let mut client = PolymarketWebSocketClient::new_market(
@@ -744,6 +796,21 @@ mod tests {
             .disconnect()
             .await
             .expect("disconnect websocket client");
+    }
+
+    #[rstest]
+    #[case::default(30, 30_000)]
+    #[case::custom(41, 41_000)]
+    #[case::large(u64::MAX, u64::MAX)]
+    fn market_connection_timeout(#[case] timeout_secs: u64, #[case] expected_ms: u64) {
+        let client =
+            PolymarketWebSocketClient::new_market(None, false, TransportBackend::default())
+                .with_connect_timeout(timeout_secs);
+
+        assert_eq!(
+            client.websocket_config().connect_timeout_ms,
+            Some(expected_ms)
+        );
     }
 
     #[rstest]

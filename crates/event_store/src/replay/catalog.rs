@@ -18,7 +18,7 @@
 use nautilus_core::UnixNanos;
 use nautilus_model::data::{Bar, QuoteTick, TradeTick};
 use nautilus_persistence::{
-    backend::catalog::{ParquetDataCatalog, parse_filename_timestamps},
+    backend::parquet::{catalog::ParquetDataCatalog, paths::parse_filename_timestamps},
     catalog::types::{CatalogDataType, data_type_from_data_path_prefix},
 };
 
@@ -78,36 +78,30 @@ impl ReplayCatalog for ParquetReplayCatalog<'_> {
         let files = Some(plan.coverage.files.clone());
 
         match plan.query.data_cls.as_str() {
-            "quotes" => Ok(catalog_replay_records(
-                self.catalog.query_typed_data::<QuoteTick>(
-                    identifiers,
-                    start,
-                    end,
-                    None,
-                    files,
-                    false,
-                )?,
-            )),
-            "trades" => Ok(catalog_replay_records(
-                self.catalog.query_typed_data::<TradeTick>(
-                    identifiers,
-                    start,
-                    end,
-                    None,
-                    files,
-                    false,
-                )?,
-            )),
-            "bars" => Ok(catalog_replay_records(
-                self.catalog.query_typed_data::<Bar>(
-                    identifiers,
-                    start,
-                    end,
-                    None,
-                    files,
-                    false,
-                )?,
-            )),
+            "quotes" => Ok(catalog_replay_records(self.catalog.query::<QuoteTick>(
+                identifiers,
+                start,
+                end,
+                None,
+                files,
+                false,
+            )?)),
+            "trades" => Ok(catalog_replay_records(self.catalog.query::<TradeTick>(
+                identifiers,
+                start,
+                end,
+                None,
+                files,
+                false,
+            )?)),
+            "bars" => Ok(catalog_replay_records(self.catalog.query::<Bar>(
+                identifiers,
+                start,
+                end,
+                None,
+                files,
+                false,
+            )?)),
             data_cls => {
                 anyhow::bail!("catalog replay loading for {data_cls} is not supported")
             }
@@ -139,7 +133,9 @@ mod tests {
         identifiers::{InstrumentId, TradeId},
         types::{Price, Quantity},
     };
-    use nautilus_persistence::backend::catalog::{ParquetDataCatalog, timestamps_to_filename};
+    use nautilus_persistence::backend::parquet::{
+        catalog::ParquetDataCatalog, paths::timestamps_to_filename,
+    };
     use rstest::rstest;
     use tempfile::TempDir;
 

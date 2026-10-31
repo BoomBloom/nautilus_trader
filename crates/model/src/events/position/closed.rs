@@ -17,9 +17,11 @@ use nautilus_core::{
     UUID4,
     nanos::{DurationNanos, UnixNanos},
 };
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    data::InstrumentClose,
     enums::{OrderSide, PositionSide},
     events::OrderFilled,
     identifiers::{AccountId, ClientOrderId, InstrumentId, PositionId, StrategyId, TraderId},
@@ -58,7 +60,7 @@ pub struct PositionClosed {
     /// The position side.
     pub side: PositionSide,
     /// The current signed quantity (positive for position side `LONG`, negative for `SHORT`).
-    pub signed_qty: f64,
+    pub signed_qty: Decimal,
     /// The current open quantity.
     pub quantity: Quantity,
     /// The peak directional quantity reached by the position.
@@ -70,9 +72,9 @@ pub struct PositionClosed {
     /// The position quote currency.
     pub currency: Currency,
     /// The average open price.
-    pub avg_px_open: f64,
+    pub avg_px_open: Decimal,
     /// The average closing price.
-    pub avg_px_close: Option<f64>,
+    pub avg_px_close: Option<Decimal>,
     /// The realized return for the position.
     pub realized_return: f64,
     /// The realized PnL for the position (including commissions).
@@ -130,12 +132,51 @@ impl PositionClosed {
             ts_init,
         }
     }
+
+    #[must_use]
+    pub fn create_from_instrument_close(
+        position: &Position,
+        close: &InstrumentClose,
+        last_qty: Quantity,
+        event_id: UUID4,
+        ts_init: UnixNanos,
+    ) -> Self {
+        Self {
+            trader_id: position.trader_id,
+            strategy_id: position.strategy_id,
+            instrument_id: position.instrument_id,
+            position_id: position.id,
+            account_id: position.account_id,
+            opening_order_id: position.opening_order_id,
+            closing_order_id: None,
+            entry: position.entry,
+            side: position.side,
+            signed_qty: position.signed_qty,
+            quantity: position.quantity,
+            peak_quantity: position.peak_qty,
+            last_qty,
+            last_px: close.close_price,
+            currency: position.quote_currency,
+            avg_px_open: position.avg_px_open,
+            avg_px_close: position.avg_px_close,
+            realized_return: position.realized_return,
+            realized_pnl: position.realized_pnl,
+            unrealized_pnl: Money::zero(position.quote_currency),
+            duration: position.duration_ns,
+            event_id,
+            ts_opened: position.ts_opened,
+            ts_closed: position.ts_closed,
+            ts_event: close.ts_event,
+            ts_init,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use nautilus_core::UnixNanos;
     use rstest::*;
+    use rust_decimal_macros::dec;
 
     use super::*;
     use crate::{
@@ -161,14 +202,14 @@ mod tests {
             closing_order_id: Some(ClientOrderId::from("O-19700101-000000-001-001-2")),
             entry: OrderSide::Buy,
             side: PositionSide::Flat,
-            signed_qty: 0.0,
+            signed_qty: dec!(0.0),
             quantity: Quantity::from("0"),
             peak_quantity: Quantity::from("150"),
             last_qty: Quantity::from("150"),
             last_px: Price::from("1.0600"),
             currency: Currency::USD(),
-            avg_px_open: 1.0525,
-            avg_px_close: Some(1.0600),
+            avg_px_open: dec!(1.0525),
+            avg_px_close: Some(dec!(1.0600)),
             realized_return: 0.0071,
             realized_pnl: Some(Money::new(112.50, Currency::USD())),
             unrealized_pnl: Money::new(0.0, Currency::USD()),
@@ -258,7 +299,7 @@ mod tests {
         let position_closed = create_test_position_closed();
 
         assert_eq!(position_closed.side, PositionSide::Flat);
-        assert_eq!(position_closed.signed_qty, 0.0);
+        assert_eq!(position_closed.signed_qty, dec!(0.0));
         assert_eq!(position_closed.quantity, Quantity::from("0"));
         assert_eq!(
             position_closed.unrealized_pnl,
@@ -269,11 +310,11 @@ mod tests {
     #[rstest]
     fn test_position_closed_loss_scenario() {
         let mut position_closed = create_test_position_closed();
-        position_closed.avg_px_close = Some(1.0400); // Sold below open price
+        position_closed.avg_px_close = Some(dec!(1.0400)); // Sold below open price
         position_closed.realized_return = -0.0119;
         position_closed.realized_pnl = Some(Money::new(-187.50, Currency::USD()));
 
-        assert_eq!(position_closed.avg_px_close, Some(1.0400));
+        assert_eq!(position_closed.avg_px_close, Some(dec!(1.0400)));
         assert!(position_closed.realized_return < 0.0);
         assert_eq!(
             position_closed.realized_pnl,

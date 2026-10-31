@@ -75,7 +75,7 @@ def test_binance_futures_ticker_catalog_round_trip(tmp_path) -> None:
 
     catalog.write_custom_data([CustomData(data_type, ticker)])
     result = catalog.query_custom_data(
-        "BinanceFuturesTicker",
+        NautilusDataType.Custom("BinanceFuturesTicker"),
         identifiers=[str(BTCUSDT_PERP)],
     )
 
@@ -100,7 +100,7 @@ def test_binance_futures_open_interest_catalog_round_trip(tmp_path) -> None:
 
     catalog.write_custom_data([CustomData(data_type, open_interest)])
     result = catalog.query_custom_data(
-        "BinanceFuturesOpenInterest",
+        NautilusDataType.Custom("BinanceFuturesOpenInterest"),
         identifiers=[str(BTCUSDT_PERP)],
     )
 
@@ -128,7 +128,7 @@ def test_binance_futures_liquidation_catalog_round_trip(tmp_path) -> None:
 
     catalog.write_custom_data([CustomData(data_type, liquidation)])
     result = catalog.query_custom_data(
-        "BinanceFuturesLiquidation",
+        NautilusDataType.Custom("BinanceFuturesLiquidation"),
         identifiers=[str(BTCUSDT_PERP)],
     )
 
@@ -138,9 +138,9 @@ def test_binance_futures_liquidation_catalog_round_trip(tmp_path) -> None:
     assert result[0].data.accumulated_qty == Quantity.from_str("1.500")
 
 
-def test_binance_futures_ticker_list_parquet_files_discovers_legacy_layout(tmp_path) -> None:
+def test_binance_futures_ticker_list_parquet_files_ignores_legacy_layout(tmp_path) -> None:
     """
-    Verify binance futures ticker file listing discovers legacy layout.
+    Verify binance futures ticker file listing ignores the legacy layout.
     """
     catalog = ParquetDataCatalog(str(tmp_path))
     data_type = DataType("BinanceFuturesTicker", None, str(BTCUSDT_PERP))
@@ -162,5 +162,4 @@ def test_binance_futures_ticker_list_parquet_files_discovers_legacy_layout(tmp_p
         str(BTCUSDT_PERP),
     )
 
-    assert len(files) == 1
-    assert "custom_binance_futures_ticker" in files[0]
+    assert files == []

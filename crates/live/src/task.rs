@@ -212,7 +212,7 @@ impl TaskGroup {
     ///
     /// # Errors
     ///
-    /// Returns an error after shutdown begins.
+    /// Returns an error if shutdown has begun.
     pub fn spawner(&self) -> Result<TaskSpawner, TaskSpawnError> {
         let generation = self.inner.current();
         if !generation.is_open() {
@@ -232,7 +232,7 @@ impl TaskGroup {
     ///
     /// # Errors
     ///
-    /// Returns an error after shutdown begins.
+    /// Returns an error if shutdown has begun.
     pub fn spawn<F>(&self, future: F) -> Result<(), TaskSpawnError>
     where
         F: Future<Output = ()> + Send + 'static,
@@ -248,7 +248,7 @@ impl TaskGroup {
     ///
     /// # Errors
     ///
-    /// Returns an error after shutdown begins.
+    /// Returns an error if shutdown has begun.
     ///
     /// # Panics
     ///
@@ -343,7 +343,7 @@ impl TaskGroup {
     ///
     /// # Errors
     ///
-    /// Returns an error while the current generation remains open or owns tasks.
+    /// Returns an error if the current generation remains open or owns tasks.
     pub fn start_generation(&self) -> Result<(), TaskGenerationError> {
         self.inner.start_generation()
     }
@@ -396,7 +396,7 @@ impl TaskSpawner {
     ///
     /// # Errors
     ///
-    /// Returns an error when this spawner no longer belongs to the open generation.
+    /// Returns an error if this spawner no longer belongs to the open generation.
     pub fn spawn<F>(&self, future: F) -> Result<(), TaskSpawnError>
     where
         F: Future<Output = ()> + Send + 'static,
@@ -412,7 +412,7 @@ impl TaskSpawner {
     ///
     /// # Errors
     ///
-    /// Returns an error when this spawner no longer belongs to the open generation.
+    /// Returns an error if this spawner no longer belongs to the open generation.
     ///
     /// # Panics
     ///
@@ -647,7 +647,7 @@ impl<T> TaskSlot<T> {
     ///
     /// # Panics
     ///
-    /// Aborts `handle` and panics if the slot already owns a task.
+    /// Panics if the slot already owns a task. Aborts `handle` before panicking.
     pub fn insert(&mut self, handle: JoinHandle<T>) {
         if self.handle.is_some() {
             handle.abort();
@@ -663,6 +663,23 @@ impl<T> TaskSlot<T> {
         if let Some(handle) = self.handle.as_ref() {
             handle.abort();
             self.abort_requested = true;
+        }
+    }
+
+    /// Polls the owned task to termination without borrowing its owner across an await.
+    ///
+    /// A pending or canceled poll retains ownership. A ready poll consumes the terminal handle.
+    pub fn poll_join(
+        &mut self,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<TaskJoinOutcome<T>>> {
+        let Some(handle) = self.handle.as_mut() else {
+            return std::task::Poll::Ready(None);
+        };
+
+        match std::pin::Pin::new(handle).poll(context) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready(result) => std::task::Poll::Ready(Some(self.complete(result))),
         }
     }
 
@@ -767,7 +784,7 @@ impl<T> SharedTaskSlot<T> {
     ///
     /// # Panics
     ///
-    /// Aborts `handle` and panics if the slot already owns a task or is draining one.
+    /// Panics if the slot already owns a task or is draining one. Aborts `handle` before panicking.
     pub fn insert(&self, handle: JoinHandle<T>) {
         self.insert_slot(TaskSlot::from_handle(handle));
     }
@@ -807,7 +824,8 @@ impl<T> SharedTaskSlot<T> {
     ///
     /// # Errors
     ///
-    /// Returns the input slot when this owner already has a task or is draining one.
+    /// Returns an error if this owner already has a task or is draining one. The error contains the
+    /// input slot.
     pub fn try_insert_slot(&self, slot: TaskSlot<T>) -> Result<(), TaskSlot<T>> {
         if slot.is_none() {
             return Ok(());
@@ -2505,6 +2523,7 @@ mod tests {
         let slot = Arc::new(SharedTaskSlot::new());
         slot.insert(task::spawn(std::future::pending::<u32>()));
         let finishing_slot = Arc::clone(&slot);
+
         let finish =
             task::spawn(async move { finishing_slot.finish(TEST_TIMEOUT, TEST_TIMEOUT).await });
 
@@ -2624,6 +2643,7 @@ mod tests {
         let slot = Arc::new(SharedTaskSlot::new());
         slot.insert(task::spawn(std::future::pending::<()>()));
         let finishing_slot = Arc::clone(&slot);
+
         let finish =
             task::spawn(async move { finishing_slot.finish(TEST_TIMEOUT, TEST_TIMEOUT).await });
 

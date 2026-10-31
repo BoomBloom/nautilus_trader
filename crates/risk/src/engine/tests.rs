@@ -28,7 +28,11 @@ use super::*;
 fn engine() -> RiskEngine {
     let cache = Rc::new(RefCell::new(Cache::default()));
     let clock = Rc::new(RefCell::new(VirtualClock::new()));
-    let portfolio = Portfolio::new(clock.clone(), cache.clone(), None);
+    let portfolio = Portfolio::new(
+        Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
+        Rc::clone(&cache),
+        None,
+    );
     RiskEngine::new(RiskEngineConfig::default(), portfolio, clock, cache)
 }
 
@@ -162,12 +166,12 @@ fn test_cash_sell_accumulation_rejects_overflow(engine: RiskEngine) {
         true,
         &order,
         quantity,
-        Currency::USD(),
+        Money::zero(Currency::USD()),
         &mut total,
     );
 
     let events = saved.get_messages();
-    assert!(!accepted);
+    assert!(accepted.is_err());
     assert_eq!(total, initial);
     assert_eq!(events.len(), 1);
 
@@ -215,10 +219,10 @@ fn test_submit_orders_reject_invalid_notional_limit(mut engine: RiskEngine) {
     let (handler, saved) = get_typed_into_message_saving_handler::<OrderEventAny>(None);
     msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), handler);
 
-    let accepted = engine.check_orders_risk(&instrument, &orders, false, RiskCheck::Submit);
+    let accepted = engine.check_orders_risk(&instrument, &orders, false, RiskCheck::Submit, None);
 
     let events = saved.get_messages();
-    assert!(!accepted);
+    assert!(accepted.is_none());
     assert_eq!(events.len(), 2);
 
     for (event, order) in events.iter().zip(&orders) {

@@ -36,16 +36,24 @@ use nautilus_common::{
 };
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_execution::{
+    engine::ExecutionEngine,
     matching_engine::{OrderMatchingEngine, config::OrderMatchingEngineConfig},
-    models::{fee::FeeModelAny, fill::FillModelHandle},
+    models::{
+        fee::{FeeModelAny, MakerTakerFeeModel},
+        fill::FillModelHandle,
+    },
 };
 use nautilus_model::{
-    data::{BookOrder, OrderBookDelta, QuoteTick, TradeTick, stubs::OrderBookDeltaTestBuilder},
-    enums::{
-        AccountType, AggressorSide, BookAction, BookType, OmsType, OrderSide, OrderStatus,
-        OrderType,
+    accounts::MarginAccount,
+    data::{
+        Bar, BarType, BookOrder, OrderBookDelta, QuoteTick, TradeTick,
+        stubs::OrderBookDeltaTestBuilder,
     },
-    events::OrderEventAny,
+    enums::{
+        AccountType, AggressorSide, BookAction, BookType, ContingencyType, OmsType, OrderSide,
+        OrderStatus, OrderType, PositionSide,
+    },
+    events::{OrderEventAny, account::stubs::margin_account_state},
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TradeId, TraderId,
     },
@@ -95,11 +103,19 @@ struct CommandScenario<T> {
     commands: Vec<T>,
 }
 
+struct ContingentScenario {
+    state: BenchEngine,
+    execution: Rc<RefCell<ExecutionEngine>>,
+    pending: Rc<RefCell<Vec<OrderEventAny>>>,
+    order_ids: Vec<[ClientOrderId; 3]>,
+}
+
 fn bench_market_data(c: &mut Criterion) {
     let instrument_id = crypto_perpetual_ethusdt().id();
     let quotes = generate_quotes(instrument_id, MARKET_DATA_COUNT);
     let trades = generate_trades(instrument_id, MARKET_DATA_COUNT);
     let deltas = generate_deltas(instrument_id, MARKET_DATA_COUNT);
+    let bars = generate_bars(instrument_id, MARKET_DATA_COUNT);
     let mut group = c.benchmark_group("matching_engine/market_data");
 
     group.throughput(Throughput::Elements(MARKET_DATA_COUNT as u64));
@@ -108,11 +124,7 @@ fn bench_market_data(c: &mut Criterion) {
             run_iterations(
                 iters,
                 || build_engine(BookType::L1_MBP),
-                |state| {
-                    for quote in &quotes {
-                        state.engine.process_quote_tick(black_box(quote));
-                    }
-                },
+                |state| process_quotes(state, &quotes),
                 |state| {
                     assert_eq!(
                         state.engine.get_book().update_count,
@@ -133,11 +145,7 @@ fn bench_market_data(c: &mut Criterion) {
             run_iterations(
                 iters,
                 || build_engine(BookType::L1_MBP),
-                |state| {
-                    for trade in &trades {
-                        state.engine.process_trade_tick(black_box(trade));
-                    }
-                },
+                |state| process_trades(state, &trades),
                 |state| {
                     assert_eq!(
                         state.engine.get_book().update_count,
@@ -153,18 +161,42 @@ fn bench_market_data(c: &mut Criterion) {
         });
     });
 
+    group.bench_function(BenchmarkId::new("bar_l1", MARKET_DATA_COUNT), |b| {
+        b.iter_custom(|iters| {
+            run_iterations(
+                iters,
+                || {
+                    build_engine_with_config(
+                        BookType::L1_MBP,
+                        OrderMatchingEngineConfig {
+                            bar_execution: true,
+                            ..Default::default()
+                        },
+                    )
+                },
+                |state| {
+                    for bar in &bars {
+                        state.engine.process_bar(black_box(bar));
+                    }
+                },
+                |state| {
+                    assert_eq!(
+                        state.engine.get_book().ts_last,
+                        bars.last().unwrap().ts_init
+                    );
+                    assert_events(state, EventCounts::default());
+                },
+            )
+        });
+    });
+
     group.bench_function(BenchmarkId::new("delta_l2", MARKET_DATA_COUNT), |b| {
         b.iter_custom(|iters| {
             run_iterations(
                 iters,
                 || build_engine(BookType::L2_MBP),
                 |state| {
-                    for delta in &deltas {
-                        state
-                            .engine
-                            .process_order_book_delta(black_box(delta))
-                            .expect("L2 delta should be processed");
-                    }
+                    process_deltas(state, &deltas);
                 },
                 |state| {
                     assert_eq!(
@@ -219,11 +251,7 @@ fn bench_queue_position(c: &mut Criterion) {
                 run_iterations(
                     iters,
                     || build_queue_engine(BookType::L2_MBP, &orders, Some(&bid), None),
-                    |state| {
-                        for trade in &trades {
-                            state.engine.process_trade_tick(black_box(trade));
-                        }
-                    },
+                    |state| process_trades(state, &trades),
                     |state| {
                         assert_events(state, EventCounts::default());
                         assert_order_status(state, OrderStatus::Accepted, order_count);
@@ -298,11 +326,7 @@ fn bench_queue_position(c: &mut Criterion) {
                         );
                         build_queue_engine(BookType::L1_MBP, &orders, None, Some(&quote))
                     },
-                    |state| {
-                        for quote in &quotes {
-                            state.engine.process_quote_tick(black_box(quote));
-                        }
-                    },
+                    |state| process_quotes(state, &quotes),
                     |state| {
                         assert_eq!(
                             state.engine.get_book().update_count,
@@ -310,6 +334,34 @@ fn bench_queue_position(c: &mut Criterion) {
                         );
                         assert_events(state, EventCounts::default());
                         assert_order_status(state, OrderStatus::Accepted, order_count);
+                    },
+                )
+            });
+        });
+
+        // Trades away from pending L1 prices expose deferred queue scan cost
+        group.bench_function(BenchmarkId::new("trade_l1_pending", order_count), |b| {
+            b.iter_custom(|iters| {
+                run_iterations(
+                    iters,
+                    || {
+                        let quote = quote(
+                            instrument_id,
+                            Price::from("1490.00"),
+                            Price::from("1500.00"),
+                            0,
+                        );
+                        build_queue_engine(BookType::L1_MBP, &orders, None, Some(&quote))
+                    },
+                    |state| process_trades(state, &trades),
+                    |state| {
+                        assert_eq!(
+                            state.engine.get_book().update_count,
+                            (MARKET_DATA_COUNT + 1) as u64,
+                        );
+                        assert_events(state, EventCounts::default());
+                        assert_order_status(state, OrderStatus::Accepted, order_count);
+                        assert_eq!(state.engine.get_open_orders().len(), order_count);
                     },
                 )
             });
@@ -384,11 +436,7 @@ fn bench_liquidity_consumption(c: &mut Criterion) {
                 run_iterations(
                     iters,
                     || build_liquidity_engine(level_count, MARKET_DATA_COUNT),
-                    |state| {
-                        for trade in &trades {
-                            state.engine.process_trade_tick(black_box(trade));
-                        }
-                    },
+                    |state| process_trades(state, &trades),
                     |state| {
                         assert_eq!(state.engine.get_core().last, Some(worst_price));
                         assert_events(state, EventCounts::default());
@@ -623,6 +671,117 @@ fn bench_resting_fill(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_reduce_only_contingencies(c: &mut Criterion) {
+    let instrument_id = crypto_perpetual_ethusdt().id();
+    let mut group = c.benchmark_group("matching_engine/reduce_only_contingencies");
+
+    for (name, oms_type, deferred, side, size, filled, updated, canceled) in [
+        (
+            "parent_refill_netting",
+            OmsType::Netting,
+            false,
+            OrderSide::Sell,
+            "1.000",
+            2,
+            4,
+            0,
+        ),
+        (
+            "parent_refill_hedging_deferred",
+            OmsType::Hedging,
+            true,
+            OrderSide::Sell,
+            "1.000",
+            2,
+            4,
+            0,
+        ),
+        (
+            "partial_exit_hedging",
+            OmsType::Hedging,
+            false,
+            OrderSide::Buy,
+            "1.000",
+            1,
+            1,
+            0,
+        ),
+        (
+            "full_exit_hedging",
+            OmsType::Hedging,
+            false,
+            OrderSide::Buy,
+            "2.000",
+            1,
+            0,
+            1,
+        ),
+    ] {
+        for bracket_count in [1, 16] {
+            let price = Price::from(if side == OrderSide::Sell {
+                "1500.00"
+            } else {
+                "3000.00"
+            });
+
+            let deltas: Vec<_> = (0..filled)
+                .flat_map(|index| {
+                    [BookAction::Add, BookAction::Delete].map(|action| {
+                        book_delta(
+                            instrument_id,
+                            action,
+                            side,
+                            price,
+                            Quantity::from(size),
+                            3,
+                            index + 3,
+                        )
+                    })
+                })
+                .collect();
+
+            group.throughput(Throughput::Elements(
+                (filled as usize * bracket_count) as u64,
+            ));
+
+            // Later fills exercise linked resizing; deferred fills retain both capacity updates
+            group.bench_function(BenchmarkId::new(name, bracket_count), |b| {
+                b.iter_custom(|iters| {
+                    run_iterations(
+                        iters,
+                        || build_contingent_scenario(oms_type, deferred, bracket_count),
+                        |scenario| process_deltas(&mut scenario.state, &deltas),
+                        |scenario| {
+                            for event in scenario.pending.borrow_mut().drain(..) {
+                                scenario.execution.borrow_mut().process(&event);
+                            }
+
+                            assert_events(
+                                &scenario.state,
+                                EventCounts {
+                                    filled: filled as usize * bracket_count,
+                                    updated: updated * bracket_count,
+                                    canceled: canceled * bracket_count,
+                                    ..Default::default()
+                                },
+                            );
+
+                            assert_contingent_positions(
+                                scenario,
+                                oms_type,
+                                side,
+                                Quantity::from(size),
+                            );
+                        },
+                    )
+                });
+            });
+        }
+    }
+
+    group.finish();
+}
+
 fn bench_commands(c: &mut Criterion) {
     let instrument_id = crypto_perpetual_ethusdt().id();
     let orders = generate_orders(
@@ -731,11 +890,40 @@ where
     elapsed
 }
 
+fn process_deltas(state: &mut BenchEngine, deltas: &[OrderBookDelta]) {
+    for delta in deltas {
+        state
+            .engine
+            .process_order_book_delta(black_box(delta))
+            .expect("L2 delta should be processed");
+    }
+}
+
+fn process_quotes(state: &mut BenchEngine, quotes: &[QuoteTick]) {
+    for quote in quotes {
+        state.engine.process_quote_tick(black_box(quote));
+    }
+}
+
+fn process_trades(state: &mut BenchEngine, trades: &[TradeTick]) {
+    for trade in trades {
+        state.engine.process_trade_tick(black_box(trade));
+    }
+}
+
 fn build_engine(book_type: BookType) -> BenchEngine {
     build_engine_with_config(book_type, OrderMatchingEngineConfig::default())
 }
 
 fn build_engine_with_config(book_type: BookType, config: OrderMatchingEngineConfig) -> BenchEngine {
+    build_engine_with_oms(book_type, OmsType::Netting, config)
+}
+
+fn build_engine_with_oms(
+    book_type: BookType,
+    oms_type: OmsType,
+    config: OrderMatchingEngineConfig,
+) -> BenchEngine {
     let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
     let cache = Rc::new(RefCell::new(Cache::default()));
     let events = Rc::new(RefCell::new(EventCounts::default()));
@@ -745,9 +933,9 @@ fn build_engine_with_config(book_type: BookType, config: OrderMatchingEngineConf
         instrument,
         1,
         FillModelHandle::default(),
-        FeeModelAny::default().into(),
+        FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into(),
         book_type,
-        OmsType::Netting,
+        oms_type,
         AccountType::Margin,
         Rc::new(RefCell::new(VirtualClock::new())),
         cache.clone(),
@@ -758,23 +946,265 @@ fn build_engine_with_config(book_type: BookType, config: OrderMatchingEngineConf
             .borrow_mut()
             .update_order(&event)
             .expect("benchmark order event should update the cache");
-        let mut counts = event_counts.borrow_mut();
-        match event {
-            OrderEventAny::Accepted(_) => counts.accepted += 1,
-            OrderEventAny::Filled(_) => counts.filled += 1,
-            OrderEventAny::Rejected(_)
-            | OrderEventAny::ModifyRejected(_)
-            | OrderEventAny::CancelRejected(_) => counts.rejected += 1,
-            OrderEventAny::Updated(_) => counts.updated += 1,
-            OrderEventAny::Canceled(_) => counts.canceled += 1,
-            _ => counts.unexpected += 1,
-        }
+        record_event(&event_counts, &event);
     }));
 
     BenchEngine {
         engine,
         cache,
         events,
+    }
+}
+
+fn build_contingent_scenario(
+    oms_type: OmsType,
+    deferred: bool,
+    bracket_count: usize,
+) -> ContingentScenario {
+    let mut state = build_engine_with_oms(
+        BookType::L2_MBP,
+        oms_type,
+        OrderMatchingEngineConfig {
+            support_contingent_orders: true,
+            use_reduce_only: true,
+            ..Default::default()
+        },
+    );
+
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+    let instrument_id = instrument.id();
+    let account_id = AccountId::from(ACCOUNT_ID);
+    let mut account_state = margin_account_state();
+    account_state.account_id = account_id;
+    state.cache.borrow_mut().add_instrument(instrument).unwrap();
+    state
+        .cache
+        .borrow_mut()
+        .add_account(MarginAccount::new(account_state, false).into())
+        .unwrap();
+
+    let mut execution = ExecutionEngine::new(
+        Rc::new(RefCell::new(VirtualClock::new())),
+        state.cache.clone(),
+        None,
+    );
+    execution.register_oms_type(StrategyId::test_default(), oms_type);
+    let execution = Rc::new(RefCell::new(execution));
+    let event_execution = execution.clone();
+    let event_counts = state.events.clone();
+    state.engine.set_event_handler(Rc::new(move |event| {
+        record_event(&event_counts, &event);
+        event_execution.borrow_mut().process(&event);
+    }));
+
+    for (side, price, order_id) in [
+        (OrderSide::Buy, "1490.00", 1),
+        (OrderSide::Sell, "1500.00", 2),
+    ] {
+        state
+            .engine
+            .process_order_book_delta(&book_delta(
+                instrument_id,
+                BookAction::Add,
+                side,
+                Price::from(price),
+                Quantity::from("2.000"),
+                order_id,
+                1,
+            ))
+            .unwrap();
+    }
+
+    let mut order_ids = Vec::with_capacity(bracket_count);
+    for index in 0..bracket_count {
+        let ids =
+            ["ENTRY", "SL", "TP"].map(|leg| ClientOrderId::from(format!("BENCH-{index}-{leg}")));
+        let mut orders = [
+            OrderTestBuilder::new(OrderType::Limit)
+                .instrument_id(instrument_id)
+                .client_order_id(ids[0])
+                .side(OrderSide::Buy)
+                .price(Price::from("1500.00"))
+                .quantity(Quantity::from("10.000"))
+                .contingency_type(ContingencyType::Oto)
+                .linked_order_ids(vec![ids[1], ids[2]])
+                .submit(true)
+                .build(),
+            OrderTestBuilder::new(OrderType::StopMarket)
+                .instrument_id(instrument_id)
+                .client_order_id(ids[1])
+                .side(OrderSide::Sell)
+                .trigger_price(Price::from("1000.00"))
+                .quantity(Quantity::from("2.000"))
+                .reduce_only(true)
+                .contingency_type(ContingencyType::Ouo)
+                .parent_order_id(ids[0])
+                .linked_order_ids(vec![ids[2]])
+                .submit(true)
+                .build(),
+            OrderTestBuilder::new(OrderType::Limit)
+                .instrument_id(instrument_id)
+                .client_order_id(ids[2])
+                .side(OrderSide::Sell)
+                .price(Price::from("3000.00"))
+                .quantity(Quantity::from("2.000"))
+                .reduce_only(true)
+                .contingency_type(ContingencyType::Ouo)
+                .parent_order_id(ids[0])
+                .linked_order_ids(vec![ids[1]])
+                .submit(true)
+                .build(),
+        ];
+
+        // Pre-sized exits isolate later-fill costs from first-fill sizing
+        add_orders_to_cache(&state, &orders);
+        for order in &mut orders {
+            state.engine.process_order(order, account_id);
+        }
+
+        order_ids.push(ids);
+    }
+
+    state
+        .engine
+        .process_order_book_delta(&book_delta(
+            instrument_id,
+            BookAction::Delete,
+            OrderSide::Sell,
+            Price::from("1500.00"),
+            Quantity::from("2.000"),
+            2,
+            2,
+        ))
+        .unwrap();
+    clear_events(&state);
+    let pending = Rc::new(RefCell::new(Vec::new()));
+    if deferred {
+        let event_pending = pending.clone();
+        let event_counts = state.events.clone();
+        state.engine.set_event_handler(Rc::new(move |event| {
+            record_event(&event_counts, &event);
+            event_pending.borrow_mut().push(event);
+        }));
+    }
+
+    ContingentScenario {
+        state,
+        execution,
+        pending,
+        order_ids,
+    }
+}
+
+fn assert_contingent_positions(
+    scenario: &ContingentScenario,
+    oms_type: OmsType,
+    side: OrderSide,
+    size: Quantity,
+) {
+    let cache = scenario.state.cache.borrow();
+    let refilling = side == OrderSide::Sell;
+
+    let expected_quantity = if refilling {
+        Quantity::from("4.000")
+    } else {
+        Quantity::from("2.000").saturating_sub(size)
+    };
+
+    let closed = expected_quantity.is_zero();
+
+    let position_side = if closed {
+        PositionSide::Flat
+    } else {
+        PositionSide::Long
+    };
+
+    let position_quantity = if oms_type == OmsType::Netting {
+        Quantity::from_decimal_dp(
+            expected_quantity.as_decimal() * rust_decimal::Decimal::from(scenario.order_ids.len()),
+            expected_quantity.precision,
+        )
+        .unwrap()
+    } else {
+        expected_quantity
+    };
+
+    let (entry_filled, exits) = match (refilling, closed) {
+        (true, _) => (
+            Quantity::from("4.000"),
+            [(
+                OrderStatus::Accepted,
+                Quantity::from("4.000"),
+                Quantity::from("0.000"),
+            ); 2],
+        ),
+        (false, true) => (
+            Quantity::from("2.000"),
+            [
+                (
+                    OrderStatus::Canceled,
+                    Quantity::from("2.000"),
+                    Quantity::from("0.000"),
+                ),
+                (
+                    OrderStatus::Filled,
+                    Quantity::from("2.000"),
+                    Quantity::from("2.000"),
+                ),
+            ],
+        ),
+        (false, false) => (
+            Quantity::from("2.000"),
+            [
+                (
+                    OrderStatus::Accepted,
+                    Quantity::from("1.000"),
+                    Quantity::from("0.000"),
+                ),
+                (
+                    OrderStatus::PartiallyFilled,
+                    Quantity::from("2.000"),
+                    Quantity::from("1.000"),
+                ),
+            ],
+        ),
+    };
+
+    assert_eq!(
+        scenario.state.engine.get_open_orders().len(),
+        scenario.order_ids.len() * if closed { 1 } else { 3 }
+    );
+    assert_eq!(
+        cache.positions_total_count(None, None, None, None, None),
+        if oms_type == OmsType::Netting {
+            1
+        } else {
+            scenario.order_ids.len()
+        }
+    );
+
+    for &[entry_id, sl_id, tp_id] in &scenario.order_ids {
+        let entry = cache.order(&entry_id).unwrap();
+        assert_eq!(entry.status(), OrderStatus::PartiallyFilled);
+        assert_eq!(entry.quantity(), Quantity::from("10.000"));
+        assert_eq!(entry.filled_qty(), entry_filled);
+        assert_eq!(
+            entry.leaves_qty(),
+            Quantity::from("10.000").saturating_sub(entry_filled)
+        );
+        let position_id = entry.position_id().unwrap();
+        let position = cache.position(&position_id).unwrap();
+        assert_eq!(position.side, position_side);
+        assert_eq!(position.quantity, position_quantity);
+
+        for (id, (status, quantity, filled)) in [sl_id, tp_id].into_iter().zip(exits) {
+            let order = cache.order(&id).unwrap();
+            assert_eq!(order.status(), status);
+            assert_eq!(order.quantity(), quantity);
+            assert_eq!(order.filled_qty(), filled);
+            assert_eq!(order.leaves_qty(), quantity.saturating_sub(filled));
+            assert_eq!(cache.position_id(&id), Some(&position_id));
+        }
     }
 }
 
@@ -889,6 +1319,20 @@ fn add_orders_to_cache(state: &BenchEngine, orders: &[OrderAny]) {
     }
 }
 
+fn record_event(events: &RefCell<EventCounts>, event: &OrderEventAny) {
+    let mut counts = events.borrow_mut();
+    match event {
+        OrderEventAny::Accepted(_) => counts.accepted += 1,
+        OrderEventAny::Filled(_) => counts.filled += 1,
+        OrderEventAny::Rejected(_)
+        | OrderEventAny::ModifyRejected(_)
+        | OrderEventAny::CancelRejected(_) => counts.rejected += 1,
+        OrderEventAny::Updated(_) => counts.updated += 1,
+        OrderEventAny::Canceled(_) => counts.canceled += 1,
+        _ => counts.unexpected += 1,
+    }
+}
+
 fn clear_events(state: &BenchEngine) {
     *state.events.borrow_mut() = EventCounts::default();
 }
@@ -947,6 +1391,26 @@ fn generate_trades(instrument_id: InstrumentId, count: usize) -> Vec<TradeTick> 
                     AggressorSide::Sell
                 },
                 TradeId::from(format!("T-{i}").as_str()),
+                ts,
+                ts,
+            )
+        })
+        .collect()
+}
+
+fn generate_bars(instrument_id: InstrumentId, count: usize) -> Vec<Bar> {
+    let bar_type = BarType::from(format!("{instrument_id}-1-MINUTE-LAST-EXTERNAL").as_str());
+    (0..count)
+        .map(|i| {
+            let open_cents = 149_000 + i as i64 % 100;
+            let ts = UnixNanos::from(BASE_TS_NS + i as u64 * 60_000_000_000);
+            Bar::new(
+                bar_type,
+                price_from_cents(open_cents),
+                price_from_cents(open_cents + 20),
+                price_from_cents(open_cents - 20),
+                price_from_cents(open_cents + 5),
+                Quantity::from("4.000"),
                 ts,
                 ts,
             )
@@ -1187,6 +1651,7 @@ criterion_group!(
     bench_submit,
     bench_iterate,
     bench_resting_fill,
+    bench_reduce_only_contingencies,
     bench_commands,
 );
 criterion_main!(benches);

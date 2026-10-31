@@ -12,6 +12,10 @@ jobs:
   performance-benchmarks:
     if: github.ref == 'refs/heads/nightly'
     runs-on: [self-hosted, Linux, X64, self-hosted-linux-x86]
+    permissions:
+      contents: read
+      actions: read
+      packages: read # Required for pulling service images from GHCR
     env:
       RUST_BACKTRACE: 1
       # Outside the workspace so it survives actions/checkout's git clean -ffdx,
@@ -21,7 +25,10 @@ jobs:
     # yamllint disable rule:line-length
     services:
       redis:
-        image: public.ecr.aws/docker/library/redis:7.4.5-alpine3.21@sha256:bb186d083732f669da90be8b0f975a37812b15e913465bb14d845db72a4e3e08
+        image: ghcr.io/nautechsystems/redis:8.10.2-alpine3.23@sha256:16b124a2d3eacd620d917ead6fd26cbf1f1d7117fa94122398971931cfe2d403
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
         ports:
           - 6379:6379
         options: >-
@@ -30,7 +37,10 @@ jobs:
           --health-timeout 5s
           --health-retries 5
       postgres:
-        image: public.ecr.aws/docker/library/postgres:16.4-alpine@sha256:5660c2cbfea50c7a9127d17dc4e48543eedd3d7a41a595a2dfa572471e37e64c
+        image: ghcr.io/nautechsystems/postgres:18.6-alpine3.23@sha256:dd504ba15d335bb17f83ed48a75899501be82726126a691f597fb91e1e505373
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: pass
@@ -42,7 +52,7 @@ jobs:
     # yamllint enable rule:line-length
     steps:
       # https://github.com/step-security/harden-runner
-      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
           egress-policy: ${{ vars.STEP_SECURITY_EGRESS_POLICY || 'block' }}
           allowed-endpoints: >-
@@ -59,9 +69,6 @@ jobs:
       # Temporary: fail fast on rare runner worktree corruption while we isolate the root cause
       - name: Verify immutable CI inputs (post-checkout)
         run: bash scripts/ci/verify-ci-inputs.sh post-checkout
-
-      - name: Remove obsolete Python performance cache
-        run: rm -rf /home/runner/.cache/cargo-target/performance-py3.12
 
       - name: Aggressive disk cleanup (pre-setup)
         if: runner.os == 'Linux' && !startsWith(runner.name, 'nautilus-ci-runner-')
@@ -144,7 +151,6 @@ jobs:
           rm -rf ~/.cargo/registry ~/.cargo/git || true
 
   codspeed-benchmarks:
-    if: github.ref != 'refs/heads/nightly'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -154,7 +160,7 @@ jobs:
       RUST_BACKTRACE: 1
     steps:
       # https://github.com/step-security/harden-runner
-      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
           egress-policy: ${{ vars.STEP_SECURITY_EGRESS_POLICY || 'block' }}
           allowed-endpoints: >-
@@ -196,7 +202,7 @@ jobs:
 
       - name: Run CodSpeed benchmarks
         # https://github.com/CodSpeedHQ/action
-        uses: CodSpeedHQ/action@373d6868929f444bc08d901fd0eb0ad52a8875ea # v5.2.1
+        uses: CodSpeedHQ/action@821a40cd6c80e3cfe387caf55668287addd808da # v5.5.0
         with:
           mode: simulation
           run: make cargo-codspeed-run

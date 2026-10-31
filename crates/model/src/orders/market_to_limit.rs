@@ -385,6 +385,10 @@ impl Order for MarketToLimitOrder {
         self.voided_qty
     }
 
+    fn non_reopened_voided_qty(&self) -> Quantity {
+        self.non_reopened_voided_qty
+    }
+
     fn leaves_qty(&self) -> Quantity {
         self.leaves_qty
     }
@@ -429,6 +433,12 @@ impl Order for MarketToLimitOrder {
         self.events.iter().collect()
     }
 
+    fn last_event(&self) -> &OrderEventAny {
+        self.events
+            .last()
+            .expect("Order invariant violated: no events")
+    }
+
     fn venue_order_ids(&self) -> Vec<&VenueOrderId> {
         self.venue_order_ids.iter().collect()
     }
@@ -471,8 +481,7 @@ impl Order for MarketToLimitOrder {
             self.price = Some(price);
         }
 
-        self.quantity = event.quantity;
-        self.leaves_qty = self.quantity.saturating_sub(self.filled_qty);
+        self.core.apply_updated_quantity(event.quantity);
     }
 
     fn is_triggered(&self) -> Option<bool> {

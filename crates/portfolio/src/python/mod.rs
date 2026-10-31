@@ -33,7 +33,10 @@ use nautilus_model::{
 use pyo3::{prelude::*, types::PyDict};
 use rust_decimal::Decimal;
 
-use crate::{config::PortfolioConfig, portfolio::Portfolio};
+use crate::{
+    config::PortfolioConfig,
+    portfolio::{Portfolio, resolve_account},
+};
 
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 #[pymethods]
@@ -138,7 +141,7 @@ impl PyPortfolio {
     /// Returns the inner shared [`Portfolio`].
     #[must_use]
     pub fn portfolio_rc(&self) -> Rc<RefCell<Portfolio>> {
-        self.0.clone()
+        Rc::clone(&self.0)
     }
 }
 
@@ -161,7 +164,12 @@ impl PyPortfolio {
         venue: Option<Venue>,
         account_id: Option<AccountId>,
     ) -> PyResult<Option<Py<PyAny>>> {
-        match self.account_for_required_query(venue.as_ref(), account_id.as_ref())? {
+        // The only query that returns the account itself, so it copies it
+        match self.with_account_for_required_query(
+            venue.as_ref(),
+            account_id.as_ref(),
+            AccountAny::clone,
+        )? {
             Some(account) => Ok(Some(account_any_to_pyobject(py, account)?)),
             None => Ok(None),
         }
@@ -174,11 +182,12 @@ impl PyPortfolio {
         venue: Option<Venue>,
         account_id: Option<AccountId>,
     ) -> PyResult<Option<Py<PyDict>>> {
-        match self.account_for_required_query(venue.as_ref(), account_id.as_ref())? {
-            Some(account) => Ok(Some(currency_money_map_to_pydict(
-                py,
-                account.balances_locked(),
-            )?)),
+        match self.with_account_for_required_query(
+            venue.as_ref(),
+            account_id.as_ref(),
+            AccountAny::balances_locked,
+        )? {
+            Some(balances) => Ok(Some(currency_money_map_to_pydict(py, balances)?)),
             None => Ok(None),
         }
     }
@@ -190,14 +199,17 @@ impl PyPortfolio {
         venue: Option<Venue>,
         account_id: Option<AccountId>,
     ) -> PyResult<Option<Py<PyDict>>> {
-        match self.account_for_required_query(venue.as_ref(), account_id.as_ref())? {
-            Some(AccountAny::Margin(account)) => Ok(Some(instrument_money_map_to_pydict(
-                py,
-                account.initial_margins(),
-            )?)),
-            Some(AccountAny::Cash(_) | AccountAny::Betting(_) | AccountAny::Wallet(_)) | None => {
-                Ok(None)
-            }
+        let margins =
+            self.with_account_for_required_query(venue.as_ref(), account_id.as_ref(), |account| {
+                match account {
+                    AccountAny::Margin(account) => Some(account.initial_margins()),
+                    AccountAny::Cash(_) | AccountAny::Betting(_) | AccountAny::Wallet(_) => None,
+                }
+            })?;
+
+        match margins.flatten() {
+            Some(margins) => Ok(Some(instrument_money_map_to_pydict(py, margins)?)),
+            None => Ok(None),
         }
     }
 
@@ -208,14 +220,17 @@ impl PyPortfolio {
         venue: Option<Venue>,
         account_id: Option<AccountId>,
     ) -> PyResult<Option<Py<PyDict>>> {
-        match self.account_for_required_query(venue.as_ref(), account_id.as_ref())? {
-            Some(AccountAny::Margin(account)) => Ok(Some(instrument_money_map_to_pydict(
-                py,
-                account.maintenance_margins(),
-            )?)),
-            Some(AccountAny::Cash(_) | AccountAny::Betting(_) | AccountAny::Wallet(_)) | None => {
-                Ok(None)
-            }
+        let margins =
+            self.with_account_for_required_query(venue.as_ref(), account_id.as_ref(), |account| {
+                match account {
+                    AccountAny::Margin(account) => Some(account.maintenance_margins()),
+                    AccountAny::Cash(_) | AccountAny::Betting(_) | AccountAny::Wallet(_) => None,
+                }
+            })?;
+
+        match margins.flatten() {
+            Some(margins) => Ok(Some(instrument_money_map_to_pydict(py, margins)?)),
+            None => Ok(None),
         }
     }
 
@@ -533,7 +548,7 @@ impl PyPortfolio {
 ///
 /// # Errors
 ///
-/// Returns a `PyErr` if registering any module components fails.
+/// Returns an error if registering any module components fails.
 #[pymodule]
 pub fn portfolio(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PortfolioConfig>()?;
@@ -542,21 +557,24 @@ pub fn portfolio(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 impl PyPortfolio {
-    fn account_for_query(
+    // Borrows the resolved account instead of copying its whole event history, and runs `read`
+    // under the portfolio and cache borrows, so `read` must not call back into either.
+    fn with_account_for_query<R>(
         &self,
         venue: Option<&Venue>,
         account_id: Option<&AccountId>,
-    ) -> PyResult<Option<AccountAny>> {
+        read: impl FnOnce(&AccountAny) -> R,
+    ) -> PyResult<Option<R>> {
         self.validate_query_scope(venue, account_id)?;
         let portfolio = self.0.borrow();
         let cache = portfolio.cache().borrow();
-        if let Some(account_id) = account_id {
-            Ok(cache.account_owned(account_id))
-        } else if let Some(venue) = venue {
-            Ok(cache.account_for_venue_owned(venue))
-        } else {
-            Ok(None)
-        }
+        Ok(resolve_account(&cache, venue, account_id).map(|account| read(&account)))
+    }
+
+    fn account_exists(&self, account_id: AccountId) -> PyResult<bool> {
+        Ok(self
+            .with_account_for_query(None, Some(&account_id), |_| ())?
+            .is_some())
     }
 
     fn validate_query_scope(
@@ -570,13 +588,13 @@ impl PyPortfolio {
 
         let portfolio = self.0.borrow();
         let cache = portfolio.cache().borrow();
-        let venue_account_id = cache.account_id(venue);
         let account_exists = cache.account(account_id).is_some();
+        let account_issued_under_venue = account_id.get_issuer() == *venue;
         let account_has_venue_position = !cache
             .positions(Some(venue), None, None, Some(account_id), None)
             .is_empty();
 
-        if account_exists && (venue_account_id == Some(account_id) || account_has_venue_position) {
+        if account_exists && (account_issued_under_venue || account_has_venue_position) {
             return Ok(());
         }
 
@@ -585,16 +603,17 @@ impl PyPortfolio {
         )))
     }
 
-    fn account_for_required_query(
+    fn with_account_for_required_query<R>(
         &self,
         venue: Option<&Venue>,
         account_id: Option<&AccountId>,
-    ) -> PyResult<Option<AccountAny>> {
+        read: impl FnOnce(&AccountAny) -> R,
+    ) -> PyResult<Option<R>> {
         if venue.is_none() && account_id.is_none() {
             return Err(to_pyvalue_err("venue or account_id must be provided"));
         }
 
-        self.account_for_query(venue, account_id)
+        self.with_account_for_query(venue, account_id, read)
     }
 
     fn position_venues(&self, open_only: bool, account_id: Option<&AccountId>) -> Vec<Venue> {
@@ -646,7 +665,7 @@ impl PyPortfolio {
         let venues = self.position_venues(true, account_id);
         if venues.is_empty() {
             let valid_scope = match account_id {
-                Some(account_id) => self.account_for_query(None, Some(account_id))?.is_some(),
+                Some(account_id) => self.account_exists(*account_id)?,
                 None => !self
                     .0
                     .borrow()
@@ -684,7 +703,7 @@ impl PyPortfolio {
             return Err(to_pyvalue_err("account_id must be provided"));
         };
 
-        if self.account_for_query(None, Some(account_id))?.is_none() {
+        if !self.account_exists(*account_id)? {
             return currency_money_map_to_pydict(py, IndexMap::new());
         }
 
@@ -794,16 +813,19 @@ mod tests {
     use nautilus_common::{cache::Cache, clock::VirtualClock};
     use nautilus_core::{UUID4, UnixNanos};
     use nautilus_model::{
+        accounts::AccountAny,
         enums::{AccountType, OmsType, OrderSide},
-        events::{AccountState, order::spec::OrderFilledSpec},
+        events::{
+            AccountState, account::stubs::margin_account_state, order::spec::OrderFilledSpec,
+        },
         identifiers::{AccountId, ClientOrderId, PositionId, Symbol, TradeId, Venue, VenueOrderId},
         instruments::{Instrument, InstrumentAny, stubs::default_fx_ccy},
         position::Position,
         types::{AccountBalance, Currency, Money, Price, Quantity, money::MONEY_MAX},
     };
     use pyo3::{
-        Python,
-        exceptions::PyRuntimeError,
+        Py, PyAny, Python,
+        exceptions::{PyRuntimeError, PyValueError},
         types::{PyAnyMethods, PyDictMethods},
     };
     use rstest::rstest;
@@ -811,17 +833,14 @@ mod tests {
     use super::PyPortfolio;
     use crate::portfolio::Portfolio;
 
-    fn cash_account_state(account_id: AccountId) -> AccountState {
+    fn cash_account_state(account_id: AccountId, locked: Money) -> AccountState {
         let total = Money::from("1000000.00 USD");
+        let balance = AccountBalance::new(total, locked, total - locked);
 
         AccountState::new(
             account_id,
             AccountType::Cash,
-            vec![AccountBalance::new(
-                total,
-                Money::zero(Currency::USD()),
-                total,
-            )],
+            vec![balance],
             vec![],
             true,
             UUID4::new(),
@@ -829,6 +848,160 @@ mod tests {
             UnixNanos::default(),
             Some(Currency::USD()),
         )
+    }
+
+    #[rstest]
+    fn test_python_account_queries_match_the_cached_account() {
+        Python::initialize();
+        let margin_state = margin_account_state();
+        let margin_id = margin_state.account_id;
+        let margin_venue = margin_id.get_issuer();
+        let cash_id = AccountId::from("CASH-001");
+        let unknown_id = AccountId::from("OTHER-001");
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::new(None, None)));
+        let mut portfolio = Portfolio::new(clock, cache, None);
+        portfolio.update_account(&margin_state);
+        portfolio.update_account(&cash_account_state(cash_id, Money::from("100.00 USD")));
+        let expected = portfolio
+            .cache()
+            .borrow()
+            .account(&margin_id)
+            .map(|account| account.cloned())
+            .unwrap();
+        let AccountAny::Margin(expected_margin) = &expected else {
+            panic!("expected a margin account");
+        };
+        assert!(!expected_margin.initial_margins().is_empty());
+        assert!(!expected_margin.maintenance_margins().is_empty());
+        assert!(!expected.balances_locked().is_empty());
+        let portfolio = PyPortfolio::from_rc(Rc::new(RefCell::new(portfolio)));
+
+        Python::attach(|py| {
+            for (venue, account_id) in [(None, Some(margin_id)), (Some(margin_venue), None)] {
+                let initial = portfolio
+                    .py_instrument_initial_margins(py, venue, account_id)
+                    .unwrap()
+                    .unwrap();
+                let maintenance = portfolio
+                    .py_instrument_maintenance_margins(py, venue, account_id)
+                    .unwrap()
+                    .unwrap();
+                let locked = portfolio
+                    .py_balances_locked(py, venue, account_id)
+                    .unwrap()
+                    .unwrap();
+
+                assert_eq!(
+                    initial.bind(py).len(),
+                    expected_margin.initial_margins().len()
+                );
+
+                for (instrument_id, margin) in expected_margin.initial_margins() {
+                    let value = initial.bind(py).get_item(instrument_id).unwrap().unwrap();
+                    assert_eq!(value.extract::<Money>().unwrap(), margin);
+                }
+                assert_eq!(
+                    maintenance.bind(py).len(),
+                    expected_margin.maintenance_margins().len()
+                );
+
+                for (instrument_id, margin) in expected_margin.maintenance_margins() {
+                    let value = maintenance
+                        .bind(py)
+                        .get_item(instrument_id)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(value.extract::<Money>().unwrap(), margin);
+                }
+                assert_eq!(locked.bind(py).len(), expected.balances_locked().len());
+
+                for (currency, balance) in expected.balances_locked() {
+                    let value = locked.bind(py).get_item(currency).unwrap().unwrap();
+                    assert_eq!(value.extract::<Money>().unwrap(), balance);
+                }
+            }
+
+            assert!(
+                portfolio
+                    .py_instrument_initial_margins(py, None, Some(cash_id))
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                portfolio
+                    .py_instrument_maintenance_margins(py, None, Some(cash_id))
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                portfolio
+                    .py_balances_locked(py, None, Some(unknown_id))
+                    .unwrap()
+                    .is_none()
+            );
+
+            let exposures = portfolio
+                .py_net_exposures(py, None, Some(margin_id), None)
+                .unwrap()
+                .unwrap();
+            assert!(exposures.bind(py).is_empty());
+            assert!(
+                portfolio
+                    .py_net_exposures(py, None, Some(unknown_id), None)
+                    .unwrap()
+                    .is_none()
+            );
+
+            let equity = portfolio.py_equity(py, None, Some(margin_id)).unwrap();
+            assert!(!equity.bind(py).is_empty());
+            let unknown_equity = portfolio.py_equity(py, None, Some(unknown_id)).unwrap();
+            assert!(unknown_equity.bind(py).is_empty());
+        });
+    }
+
+    #[rstest]
+    fn test_python_account_returns_a_detached_copy() {
+        Python::initialize();
+        let margin_state = margin_account_state();
+        let margin_id = margin_state.account_id;
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::new(None, None)));
+        let mut portfolio = Portfolio::new(clock, cache, None);
+        portfolio.update_account(&margin_state);
+        let portfolio = PyPortfolio::from_rc(Rc::new(RefCell::new(portfolio)));
+
+        Python::attach(|py| {
+            let account = portfolio
+                .py_account(py, None, Some(margin_id))
+                .unwrap()
+                .unwrap();
+            let event_count = |account: &Py<PyAny>| {
+                account
+                    .bind(py)
+                    .getattr("event_count")
+                    .unwrap()
+                    .extract::<usize>()
+                    .unwrap()
+            };
+            let count_before = event_count(&account);
+
+            let mut next_state = margin_state.clone();
+            next_state.event_id = UUID4::new();
+            next_state.ts_event = UnixNanos::from(1);
+            next_state.ts_init = UnixNanos::from(1);
+            portfolio
+                .portfolio_rc()
+                .borrow_mut()
+                .update_account(&next_state);
+
+            let cached = portfolio
+                .py_account(py, None, Some(margin_id))
+                .unwrap()
+                .unwrap();
+            assert_eq!(event_count(&cached), count_before + 1);
+            assert_eq!(event_count(&account), count_before);
+        });
     }
 
     fn position_with_realized_pnl(
@@ -885,7 +1058,10 @@ mod tests {
                 PositionId::from("P-PY-OVERFLOW-OTHER"),
             ),
         ] {
-            portfolio.update_account(&cash_account_state(account_id));
+            portfolio.update_account(&cash_account_state(
+                account_id,
+                Money::zero(Currency::USD()),
+            ));
             portfolio
                 .cache()
                 .borrow_mut()
@@ -928,10 +1104,10 @@ mod tests {
             Rc::new(RefCell::new(cache)),
             None,
         );
-        let secondary = AccountId::from("SIM-002");
+        let secondary = AccountId::from("OTHER-002");
         let primary = AccountId::from("SIM-001");
-        portfolio.update_account(&cash_account_state(secondary));
-        portfolio.update_account(&cash_account_state(primary));
+        portfolio.update_account(&cash_account_state(secondary, Money::zero(Currency::USD())));
+        portfolio.update_account(&cash_account_state(primary, Money::zero(Currency::USD())));
         portfolio
             .cache()
             .borrow_mut()
@@ -960,6 +1136,65 @@ mod tests {
                 .unwrap();
 
             assert_eq!(money, Money::from("7.00 USD"));
+        });
+    }
+
+    #[rstest]
+    #[case::first_added_first(false)]
+    #[case::second_added_first(true)]
+    fn test_python_balances_locked_selects_same_issuer_accounts_by_account_id(
+        #[case] reversed: bool,
+    ) {
+        Python::initialize();
+        let venue = Venue::from("SIM");
+        let other_venue = Venue::from("OTHER");
+        let account_a = AccountId::from("SIM-001");
+        let account_b = AccountId::from("SIM-002");
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::new(None, None)));
+        let mut portfolio = Portfolio::new(clock, cache, None);
+        let state_a = cash_account_state(account_a, Money::from("100.00 USD"));
+        let state_b = cash_account_state(account_b, Money::from("250.00 USD"));
+        let mut states = vec![state_a, state_b];
+
+        if reversed {
+            states.reverse();
+        }
+
+        for state in &states {
+            portfolio.update_account(state);
+        }
+
+        let portfolio = PyPortfolio::from_rc(Rc::new(RefCell::new(portfolio)));
+
+        Python::attach(|py| {
+            let locked_usd = |account_id: Option<AccountId>| {
+                portfolio
+                    .py_balances_locked(py, Some(venue), account_id)
+                    .expect("same-issuer account must match its venue scope")
+                    .map(|locked| {
+                        locked
+                            .bind(py)
+                            .get_item(Currency::USD())
+                            .unwrap()
+                            .unwrap()
+                            .extract::<Money>()
+                            .unwrap()
+                    })
+            };
+
+            let mismatch = portfolio
+                .py_balances_locked(py, Some(other_venue), Some(account_a))
+                .expect_err("account issued under another venue must not match the venue scope");
+
+            assert_eq!(locked_usd(Some(account_a)), Some(Money::from("100.00 USD")));
+            assert_eq!(locked_usd(Some(account_b)), Some(Money::from("250.00 USD")));
+            assert_eq!(locked_usd(None), None);
+            assert!(mismatch.is_instance_of::<PyValueError>(py));
+            assert_eq!(
+                mismatch.to_string(),
+                "ValueError: venue OTHER and account_id SIM-001 do not resolve to the same account"
+            );
         });
     }
 }

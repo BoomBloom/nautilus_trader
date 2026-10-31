@@ -15,16 +15,26 @@
 
 //! Configuration structures for the Derive adapter.
 
+use nautilus_common::config::{ConfigResult, check_unique_values};
 use nautilus_core::string::secret::SecretString;
+use nautilus_live::book::DEFAULT_BOOK_SNAPSHOT_TIMEOUT_SECS;
 use nautilus_model::identifiers::AccountId;
 use nautilus_network::websocket::TransportBackend;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use crate::common::{enums::DeriveEnvironment, urls};
+use crate::{
+    common::{
+        consts::{HTTP_MAX_RETRIES, HTTP_RETRY_DELAY_INITIAL_MS, HTTP_RETRY_DELAY_MAX_MS},
+        enums::DeriveEnvironment,
+        urls,
+    },
+    providers::normalize_currency,
+};
 
 /// Configuration for the Derive data client.
 #[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[builder(on(SecretString, into))]
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
@@ -39,9 +49,9 @@ pub struct DeriveDataClientConfig {
     #[builder(default)]
     pub environment: DeriveEnvironment,
     /// Override for the REST API base URL.
-    pub base_url_rest: Option<String>,
+    pub base_url_rest: Option<SecretString>,
     /// Override for the WebSocket URL.
-    pub base_url_ws: Option<String>,
+    pub base_url_ws: Option<SecretString>,
     /// Optional proxy URL for HTTP and WebSocket transports.
     pub proxy_url: Option<SecretString>,
     /// HTTP timeout in seconds.
@@ -50,7 +60,16 @@ pub struct DeriveDataClientConfig {
     /// Optional per-operation WebSocket timeout in seconds (login, subscribe,
     /// reads, writes). When unset, the low-level `WS_REQUEST_TIMEOUT` applies.
     pub ws_timeout_secs: Option<u64>,
-    /// Interval for refreshing instruments in minutes.
+    /// Maximum wait for an initial, post-reconnect, or recovery book snapshot, in seconds.
+    /// A zero value disables snapshot deadlines.
+    #[builder(default = DEFAULT_BOOK_SNAPSHOT_TIMEOUT_SECS)]
+    pub book_snapshot_timeout_secs: u64,
+    /// Maximum receive age of advancing book snapshots before recovery, in seconds.
+    /// Empty snapshots count as updates; a zero value disables stale book recovery.
+    #[builder(default = 120)]
+    pub book_stale_threshold_secs: u64,
+    /// Interval in minutes for refreshing instruments of configured currencies.
+    /// A zero value disables periodic refresh.
     #[builder(default = 60)]
     pub update_instruments_interval_mins: u64,
     /// Underlying currencies to load on connect. Empty means lazy-load by
@@ -64,7 +83,7 @@ pub struct DeriveDataClientConfig {
     /// WebSocket request.
     #[builder(default = true)]
     pub auto_load_missing_instruments: bool,
-    /// WebSocket transport backend (defaults to `Sockudo` when that feature is enabled).
+    /// WebSocket transport backend (defaults to `Sockudo`).
     #[builder(default)]
     pub transport_backend: TransportBackend,
 }
@@ -72,10 +91,10 @@ pub struct DeriveDataClientConfig {
 #[cfg(feature = "python")]
 nautilus_core::impl_pyo3_config_getters!(DeriveDataClientConfig {
     environment: DeriveEnvironment,
-    base_url_rest: Option<String>,
-    base_url_ws: Option<String>,
     http_timeout_secs: u64,
     ws_timeout_secs: Option<u64>,
+    book_snapshot_timeout_secs: u64,
+    book_stale_threshold_secs: u64,
     update_instruments_interval_mins: u64,
     currencies: Vec<String>,
     include_expired: bool,
@@ -95,25 +114,45 @@ impl DeriveDataClientConfig {
         Self::default()
     }
 
+    /// Validates that configured currency entries contain no duplicates.
+    ///
+    /// Nonblank currencies must also be distinct after trimming.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if currency entries repeat or nonblank entries match after trimming.
+    pub fn validate(&self) -> ConfigResult<()> {
+        check_unique_values("currencies", &self.currencies)?;
+        let normalized: Vec<_> = self
+            .currencies
+            .iter()
+            .filter_map(|currency| normalize_currency(currency))
+            .collect();
+        check_unique_values("currencies", &normalized)
+    }
+
     /// Returns the REST API base URL, respecting environment and overrides.
     #[must_use]
     pub fn rest_url(&self) -> String {
-        self.base_url_rest
-            .clone()
-            .unwrap_or_else(|| urls::rest_url(self.environment).to_string())
+        self.base_url_rest.as_ref().map_or_else(
+            || urls::rest_url(self.environment).to_string(),
+            |url| url.expose_secret().to_string(),
+        )
     }
 
     /// Returns the WebSocket URL, respecting environment and overrides.
     #[must_use]
     pub fn ws_url(&self) -> String {
-        self.base_url_ws
-            .clone()
-            .unwrap_or_else(|| urls::ws_url(self.environment).to_string())
+        self.base_url_ws.as_ref().map_or_else(
+            || urls::ws_url(self.environment).to_string(),
+            |url| url.expose_secret().to_string(),
+        )
     }
 }
 
 /// Configuration for the Derive execution client.
 #[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[builder(on(SecretString, into))]
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
@@ -127,7 +166,7 @@ pub struct DeriveExecutionClientConfig {
     /// Account identifier for the execution client.
     #[builder(default = AccountId::from("DERIVE-001"))]
     pub account_id: AccountId,
-    /// Derive Chain smart-contract wallet address (`X-LYRAWALLET`). Falls back
+    /// Owner's EOA or multisig address (`X-DeriveWallet`). Falls back
     /// to `DERIVE_WALLET_ADDRESS` (or `DERIVE_TESTNET_WALLET_ADDRESS` on
     /// testnet) when unset.
     pub wallet_address: Option<String>,
@@ -142,22 +181,22 @@ pub struct DeriveExecutionClientConfig {
     #[builder(default)]
     pub environment: DeriveEnvironment,
     /// Override for the REST API base URL.
-    pub base_url_rest: Option<String>,
+    pub base_url_rest: Option<SecretString>,
     /// Override for the WebSocket URL.
-    pub base_url_ws: Option<String>,
+    pub base_url_ws: Option<SecretString>,
     /// Optional proxy URL for HTTP and WebSocket transports.
     pub proxy_url: Option<SecretString>,
     /// HTTP timeout in seconds.
     #[builder(default = 10)]
     pub http_timeout_secs: u64,
     /// Maximum number of retry attempts for HTTP requests.
-    #[builder(default = 3)]
+    #[builder(default = HTTP_MAX_RETRIES)]
     pub max_retries: u32,
     /// Initial retry delay in milliseconds.
-    #[builder(default = 100)]
+    #[builder(default = HTTP_RETRY_DELAY_INITIAL_MS)]
     pub retry_delay_initial_ms: u64,
     /// Maximum retry delay in milliseconds.
-    #[builder(default = 5000)]
+    #[builder(default = HTTP_RETRY_DELAY_MAX_MS)]
     pub retry_delay_max_ms: u64,
     /// Optional per-operation WebSocket timeout in seconds (login, subscribe,
     /// reads, writes). When unset, the low-level `WS_REQUEST_TIMEOUT` applies.
@@ -165,12 +204,11 @@ pub struct DeriveExecutionClientConfig {
     /// Per-contract USDC fee cap signed into every order. Required for
     /// execution and must be greater than zero.
     pub max_fee_per_contract: Option<Decimal>,
-    /// WebSocket transport backend (defaults to `Sockudo` when that feature is enabled).
+    /// WebSocket transport backend (defaults to `Sockudo`).
     #[builder(default)]
     pub transport_backend: TransportBackend,
-    /// Override for the EIP-712 domain separator. Falls back to the constant
-    /// for the configured environment when unset. The shipped constants are
-    /// placeholders that must be replaced or overridden before signing.
+    /// Override for the EIP-712 domain separator. Falls back to the shipped
+    /// v3 constant for the configured environment when unset.
     pub domain_separator: Option<String>,
     /// Override for the EIP-712 action typehash. Falls back to the shipped
     /// [`crate::common::consts::ACTION_TYPEHASH`] when unset.
@@ -180,7 +218,7 @@ pub struct DeriveExecutionClientConfig {
     pub trade_module_address: Option<String>,
     /// Signature expiry TTL in seconds for normal orders and replaces (added
     /// to the wall clock before signing). Must be greater than the venue
-    /// minimum ([`crate::common::consts::MIN_SIGNATURE_TTL`], 300s).
+    /// minimum ([`crate::common::consts::MIN_SIGNATURE_TTL`], 10s) and at most 120 days.
     #[builder(default = 600)]
     pub signature_expiry_secs: u64,
     /// Slippage bound applied to market orders when deriving a worst-acceptable
@@ -188,18 +226,24 @@ pub struct DeriveExecutionClientConfig {
     /// (1 bp = 0.01%). Defaults to 50 bp = 0.5%.
     #[builder(default = 50)]
     pub market_order_slippage_bps: u32,
-    /// Maximum matching-engine requests per second for order writes sent over
-    /// the WebSocket (create/cancel/replace). Defaults to the Trader-tier limit
-    /// of 1 when unset; raise it for Market Maker accounts with higher
-    /// negotiated limits. See <https://docs.derive.xyz/reference/rate-limits>.
+    /// Maximum wallet matching requests per second across HTTP, WebSocket,
+    /// session keys, and subaccounts on the same API host. Defaults to 1 when
+    /// unset. The first explicit setting for a wallet is shared by all clients;
+    /// the limiter ignores conflicting later settings. Verify deployed budgets with
+    /// `public/getRateLimits`. See <https://docs.derive.xyz/rate-limits>.
     pub max_matching_requests_per_second: Option<u32>,
-    /// Maximum per-instrument matching requests per second for instrument-
-    /// scoped order writes sent over the WebSocket. Defaults to the Trader-tier
-    /// limit of 1 when unset; raise it for Market Maker accounts with higher
-    /// negotiated per-instrument limits. This allowance is independent of
-    /// `max_matching_requests_per_second`, which never inflates it. See
-    /// <https://docs.derive.xyz/reference/rate-limits>.
+    /// Per-wallet/instrument token refill rate for perpetuals, spot, and options.
+    /// Defaults to 1 token per second; capacity is five times the configured rate.
+    /// Clients for the same wallet on the same API host share the first explicit
+    /// setting, independently of the wallet matching allowance. Instrument budgets
+    /// are absent from `public/getRateLimits`.
+    /// See <https://docs.derive.xyz/rate-limits>.
     pub max_per_instrument_matching_requests_per_second: Option<u32>,
+    /// Enables wallet-wide cancel-on-disconnect before accepting orders and tags resting limit orders
+    /// with `mmp: true`. Requires `Trade(All)` across all subaccounts and signature expiry at most
+    /// 15 minutes. False leaves the wallet setting unchanged. Shutdown never disables the setting.
+    #[builder(default)]
+    pub cancel_on_disconnect: bool,
 }
 
 #[cfg(feature = "python")]
@@ -208,14 +252,13 @@ nautilus_core::impl_pyo3_config_getters!(DeriveExecutionClientConfig {
     wallet_address: Option<String>,
     subaccount_id: Option<u64>,
     environment: DeriveEnvironment,
-    base_url_rest: Option<String>,
-    base_url_ws: Option<String>,
     http_timeout_secs: u64,
     max_retries: u32,
     retry_delay_initial_ms: u64,
     retry_delay_max_ms: u64,
     ws_timeout_secs: Option<u64>,
     max_fee_per_contract: Option<Decimal>,
+    transport_backend: TransportBackend,
     domain_separator: Option<String>,
     action_typehash: Option<String>,
     trade_module_address: Option<String>,
@@ -223,7 +266,7 @@ nautilus_core::impl_pyo3_config_getters!(DeriveExecutionClientConfig {
     market_order_slippage_bps: u32,
     max_matching_requests_per_second: Option<u32>,
     max_per_instrument_matching_requests_per_second: Option<u32>,
-    transport_backend: TransportBackend,
+    cancel_on_disconnect: bool,
 });
 
 impl Default for DeriveExecutionClientConfig {
@@ -260,8 +303,9 @@ impl DeriveExecutionClientConfig {
     ///
     /// # Errors
     ///
-    /// Returns an error when `max_fee_per_contract` is missing or not greater
-    /// than zero.
+    /// Returns an error if:
+    /// - `max_fee_per_contract` is missing or not greater than zero.
+    /// - Cancel-on-disconnect uses a signature expiry greater than 15 minutes.
     pub fn validate(&self) -> anyhow::Result<()> {
         let Some(max_fee_per_contract) = self.max_fee_per_contract else {
             anyhow::bail!("max_fee_per_contract is required");
@@ -270,31 +314,193 @@ impl DeriveExecutionClientConfig {
         if max_fee_per_contract <= Decimal::ZERO {
             anyhow::bail!("max_fee_per_contract must be greater than zero");
         }
+
+        if self.cancel_on_disconnect && self.signature_expiry_secs > 15 * 60 {
+            anyhow::bail!(
+                "cancel_on_disconnect requires signature_expiry_secs at most 900 seconds"
+            );
+        }
+
         Ok(())
     }
 
     /// Returns the REST API base URL, respecting environment and overrides.
     #[must_use]
     pub fn rest_url(&self) -> String {
-        self.base_url_rest
-            .clone()
-            .unwrap_or_else(|| urls::rest_url(self.environment).to_string())
+        self.base_url_rest.as_ref().map_or_else(
+            || urls::rest_url(self.environment).to_string(),
+            |url| url.expose_secret().to_string(),
+        )
     }
 
     /// Returns the WebSocket URL, respecting environment and overrides.
     #[must_use]
     pub fn ws_url(&self) -> String {
-        self.base_url_ws
-            .clone()
-            .unwrap_or_else(|| urls::ws_url(self.environment).to_string())
+        self.base_url_ws.as_ref().map_or_else(
+            || urls::ws_url(self.environment).to_string(),
+            |url| url.expose_secret().to_string(),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use nautilus_common::config::ConfigError;
+    use nautilus_core::string::secret::REDACTED;
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    fn test_config_builders_accept_plain_strings() {
+        let data = DeriveDataClientConfig::builder()
+            .base_url_rest("https://literal-rest.example/data")
+            .base_url_ws("wss://literal-ws.example/data")
+            .proxy_url("http://literal-proxy.example")
+            .build();
+
+        let execution = DeriveExecutionClientConfig::builder()
+            .base_url_rest("https://owned-rest.example/execution".to_string())
+            .base_url_ws("wss://owned-ws.example/execution".to_string())
+            .proxy_url("http://owned-proxy.example".to_string())
+            .session_key("SESSION_KEY_SENTINEL".to_string())
+            .build();
+
+        assert_eq!(data.rest_url(), "https://literal-rest.example/data");
+        assert_eq!(data.ws_url(), "wss://literal-ws.example/data");
+        assert_eq!(
+            data.proxy_url.as_ref().map(SecretString::expose_secret),
+            Some("http://literal-proxy.example")
+        );
+        assert_eq!(execution.rest_url(), "https://owned-rest.example/execution");
+        assert_eq!(execution.ws_url(), "wss://owned-ws.example/execution");
+        assert_eq!(
+            execution
+                .proxy_url
+                .as_ref()
+                .map(SecretString::expose_secret),
+            Some("http://owned-proxy.example")
+        );
+        assert_eq!(
+            execution
+                .session_key
+                .as_ref()
+                .map(SecretString::expose_secret),
+            Some("SESSION_KEY_SENTINEL")
+        );
+    }
+
+    #[rstest]
+    #[case::credentials(
+        "https://REST_USER:REST_PASSWORD@rest.example:8443/REST_PATH?token=REST_QUERY#REST_FRAGMENT",
+        "wss://WS_USER:WS_PASSWORD@stream.example:9443/WS_PATH?token=WS_QUERY#WS_FRAGMENT"
+    )]
+    #[case::invalid("REST_PATH", "WS_PATH")]
+    #[case::unsupported("file:///REST_PATH", "file:///WS_PATH")]
+    fn test_config_debug_redacts_endpoint_overrides(#[case] rest: &str, #[case] ws: &str) {
+        let proxy = "http://PROXY_USER:PROXY_PASSWORD@proxy.example:8080";
+        let session_key = "SESSION_KEY_SENTINEL";
+
+        let data = DeriveDataClientConfig {
+            base_url_rest: Some(rest.into()),
+            base_url_ws: Some(ws.into()),
+            proxy_url: Some(proxy.into()),
+            ..Default::default()
+        };
+
+        let execution = DeriveExecutionClientConfig {
+            base_url_rest: Some(rest.into()),
+            base_url_ws: Some(ws.into()),
+            proxy_url: Some(proxy.into()),
+            session_key: Some(session_key.into()),
+            ..Default::default()
+        };
+
+        let data_roundtrip: DeriveDataClientConfig =
+            serde_json::from_value(serde_json::to_value(&data).unwrap()).unwrap();
+        let execution_roundtrip: DeriveExecutionClientConfig =
+            serde_json::from_value(serde_json::to_value(&execution).unwrap()).unwrap();
+
+        assert_eq!(data.rest_url(), rest);
+        assert_eq!(data.ws_url(), ws);
+        assert_eq!(execution.rest_url(), rest);
+        assert_eq!(execution.ws_url(), ws);
+        assert_eq!(
+            data_roundtrip
+                .base_url_rest
+                .as_ref()
+                .map(SecretString::expose_secret),
+            Some(rest)
+        );
+        assert_eq!(
+            data_roundtrip
+                .base_url_ws
+                .as_ref()
+                .map(SecretString::expose_secret),
+            Some(ws)
+        );
+        assert_eq!(
+            execution_roundtrip
+                .base_url_rest
+                .as_ref()
+                .map(SecretString::expose_secret),
+            Some(rest)
+        );
+        assert_eq!(
+            execution_roundtrip
+                .base_url_ws
+                .as_ref()
+                .map(SecretString::expose_secret),
+            Some(ws)
+        );
+
+        for debug in [format!("{data:?}"), format!("{execution:?}")] {
+            assert!(debug.contains(&format!("base_url_rest: Some({REDACTED})")));
+            assert!(debug.contains(&format!("base_url_ws: Some({REDACTED})")));
+            assert!(debug.contains(&format!("proxy_url: Some({REDACTED})")));
+        }
+
+        for debug in [
+            format!("{data:?}"),
+            format!("{data:#?}"),
+            format!("{execution:?}"),
+            format!("{execution:#?}"),
+        ] {
+            for marker in [
+                "rest.example",
+                "stream.example",
+                "REST_USER",
+                "REST_PASSWORD",
+                "REST_PATH",
+                "REST_QUERY",
+                "REST_FRAGMENT",
+                "WS_USER",
+                "WS_PASSWORD",
+                "WS_PATH",
+                "WS_QUERY",
+                "WS_FRAGMENT",
+                "PROXY_USER",
+                "PROXY_PASSWORD",
+                "proxy.example",
+                session_key,
+            ] {
+                assert!(!debug.contains(marker), "Debug disclosed {marker}");
+            }
+        }
+    }
+
+    #[rstest]
+    #[case("currencies")]
+    fn test_data_config_rejects_duplicate_selections(#[case] field: &str) {
+        let mut input = serde_json::to_value(DeriveDataClientConfig::default()).unwrap();
+        input[field] = serde_json::json!(["first", "second", "first"]);
+        let config: DeriveDataClientConfig = serde_json::from_value(input).unwrap();
+        let original = serde_json::to_value(&config).unwrap();
+        let result = config.validate();
+
+        assert_eq!(result, Err(ConfigError::duplicate(field, None)));
+        assert_eq!(serde_json::to_value(&config).unwrap(), original);
+    }
 
     #[rstest]
     fn test_data_config_defaults() {
@@ -311,8 +517,8 @@ mod tests {
     #[rstest]
     fn test_data_config_urls_mainnet() {
         let config = DeriveDataClientConfig::default();
-        assert!(config.rest_url().contains("api.lyra.finance"));
-        assert!(config.ws_url().contains("api.lyra.finance"));
+        assert_eq!(config.rest_url(), "https://api.derive.xyz/v3");
+        assert_eq!(config.ws_url(), "wss://api.derive.xyz/v3/ws");
     }
 
     #[rstest]
@@ -321,13 +527,67 @@ mod tests {
             environment: DeriveEnvironment::Testnet,
             ..DeriveDataClientConfig::default()
         };
-        assert!(config.rest_url().contains("demo"));
-        assert!(config.ws_url().contains("demo"));
+
+        assert_eq!(config.rest_url(), "https://testnet.api.derive.xyz/v3");
+        assert_eq!(config.ws_url(), "wss://testnet.api.derive.xyz/v3/ws");
+    }
+
+    #[rstest]
+    #[case(
+        DeriveEnvironment::Mainnet,
+        "https://api.derive.xyz/v3",
+        "wss://api.derive.xyz/v3/ws"
+    )]
+    #[case(
+        DeriveEnvironment::Testnet,
+        "https://testnet.api.derive.xyz/v3",
+        "wss://testnet.api.derive.xyz/v3/ws"
+    )]
+    fn test_exec_config_urls(
+        #[case] environment: DeriveEnvironment,
+        #[case] rest: &str,
+        #[case] ws: &str,
+    ) {
+        let config = DeriveExecutionClientConfig {
+            environment,
+            ..DeriveExecutionClientConfig::default()
+        };
+
+        assert_eq!(config.rest_url(), rest);
+        assert_eq!(config.ws_url(), ws);
+    }
+
+    #[rstest]
+    #[case(DeriveEnvironment::Mainnet)]
+    #[case(DeriveEnvironment::Testnet)]
+    fn test_config_url_overrides(#[case] environment: DeriveEnvironment) {
+        let rest = "https://dedicated.example.com";
+        let ws = "wss://dedicated.example.com/ws";
+
+        let data = DeriveDataClientConfig {
+            environment,
+            base_url_rest: Some(rest.into()),
+            base_url_ws: Some(ws.into()),
+            ..DeriveDataClientConfig::default()
+        };
+
+        let execution = DeriveExecutionClientConfig {
+            environment,
+            base_url_rest: Some(rest.into()),
+            base_url_ws: Some(ws.into()),
+            ..DeriveExecutionClientConfig::default()
+        };
+
+        assert_eq!(data.rest_url(), rest);
+        assert_eq!(data.ws_url(), ws);
+        assert_eq!(execution.rest_url(), rest);
+        assert_eq!(execution.ws_url(), ws);
     }
 
     #[rstest]
     fn test_exec_config_defaults() {
         let config = DeriveExecutionClientConfig::default();
+        assert!(!config.cancel_on_disconnect);
         assert_eq!(config.environment, DeriveEnvironment::Mainnet);
         assert_eq!(config.http_timeout_secs, 10);
         assert_eq!(config.max_retries, 3);
@@ -341,11 +601,42 @@ mod tests {
     }
 
     #[rstest]
+    #[case::enabled_maximum(true, 900, true)]
+    #[case::enabled_too_long(true, 901, false)]
+    #[case::disabled_long_expiry(false, 901, true)]
+    fn test_exec_config_cancel_on_disconnect_signature_expiry(
+        #[case] enabled: bool,
+        #[case] expiry_secs: u64,
+        #[case] valid: bool,
+    ) {
+        let config = DeriveExecutionClientConfig::builder()
+            .cancel_on_disconnect(enabled)
+            .signature_expiry_secs(expiry_secs)
+            .max_fee_per_contract(Decimal::ONE)
+            .build();
+        let result = config.validate();
+        let decoded: DeriveExecutionClientConfig =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+
+        assert_eq!(decoded.cancel_on_disconnect, enabled);
+        assert_eq!(decoded.signature_expiry_secs, expiry_secs);
+        assert_eq!(result.is_ok(), valid);
+
+        if !valid {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "cancel_on_disconnect requires signature_expiry_secs at most 900 seconds"
+            );
+        }
+    }
+
+    #[rstest]
     fn test_exec_config_has_credentials_requires_all_three_fields() {
         let mut config = DeriveExecutionClientConfig {
             wallet_address: Some("0x1234".to_string()),
             ..DeriveExecutionClientConfig::default()
         };
+
         assert!(!config.has_credentials());
 
         config.session_key = Some("0xabcd".into());
@@ -363,6 +654,7 @@ mod tests {
             subaccount_id: Some(1),
             ..DeriveExecutionClientConfig::default()
         };
+
         assert!(!config.has_credentials());
     }
 
@@ -373,12 +665,14 @@ mod tests {
         // scanner on a synthetic test value. The redaction logic is
         // string-content-agnostic.
         let session_key = "FAKE_SESSION_KEY_SENTINEL";
+
         let config = DeriveExecutionClientConfig {
             wallet_address: Some("0xWALLET".to_string()),
             session_key: Some(session_key.into()),
             subaccount_id: Some(42),
             ..DeriveExecutionClientConfig::default()
         };
+
         let debug = format!("{config:?}");
         assert!(debug.contains("redacted"));
         assert!(!debug.contains(session_key));
@@ -392,5 +686,28 @@ mod tests {
         let debug = format!("{config:?}");
         assert!(!debug.contains("redacted"));
         assert!(debug.contains("session_key: None"));
+    }
+
+    #[rstest]
+    #[case::trimmed(vec!["BTC", "ETH", " BTC "], true)]
+    #[case::blank(vec!["", ""], true)]
+    #[case::distinct(vec![" ETH ", "BTC"], false)]
+    fn test_currencies_normalized_uniqueness(#[case] values: Vec<&str>, #[case] duplicate: bool) {
+        let currencies: Vec<_> = values.into_iter().map(str::to_string).collect();
+
+        let config = DeriveDataClientConfig {
+            currencies: currencies.clone(),
+            ..Default::default()
+        };
+
+        let expected = if duplicate {
+            Err(ConfigError::duplicate("currencies", None))
+        } else {
+            Ok(())
+        };
+
+        let result = config.validate();
+        assert_eq!(result, expected);
+        assert_eq!(config.currencies, currencies);
     }
 }

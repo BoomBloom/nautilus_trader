@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::{cmp::max, collections::HashSet};
+use std::{cmp::max, collections::HashSet, sync::Arc};
 
 use alloy::primitives::Address;
 use futures_util::StreamExt;
@@ -104,10 +104,10 @@ impl<'a> PoolDiscoveryService<'a> {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - HyperSync streaming fails
-    /// - Token RPC calls fail
-    /// - Database operations fail
-    /// - Sync is cancelled
+    /// - HyperSync streaming fails.
+    /// - Token RPC calls fail.
+    /// - Database operations fail.
+    /// - Sync is cancelled.
     pub async fn sync_pools(
         &mut self,
         dex: &DexExtended,
@@ -397,7 +397,7 @@ impl<'a> PoolDiscoveryService<'a> {
                     let sanitized_symbol = sanitize_string(&token_info.symbol);
 
                     let token = Token::new(
-                        self.chain.clone(),
+                        Arc::clone(&self.chain),
                         token_address,
                         sanitized_name,
                         sanitized_symbol,
@@ -433,10 +433,8 @@ impl<'a> PoolDiscoveryService<'a> {
     ///
     /// Assumes all required tokens are already in the in-memory cache.
     ///
-    /// # Errors
-    ///
-    /// Logs errors for pools that cannot be constructed (missing tokens),
-    /// but does not fail the entire batch.
+    /// Logs errors for pools that cannot be constructed (missing tokens), but does not fail the
+    /// entire batch.
     async fn construct_pools_batch(
         &self,
         pool_events: &mut Vec<PoolCreatedEvent>,
@@ -481,8 +479,8 @@ impl<'a> PoolDiscoveryService<'a> {
                 .unwrap_or_default();
 
             let mut pool = Pool::new(
-                self.chain.clone(),
-                dex.clone(),
+                Arc::clone(&self.chain),
+                Arc::clone(dex),
                 pool_event.pool_address,
                 pool_event.pool_identifier,
                 pool_event.block_number,

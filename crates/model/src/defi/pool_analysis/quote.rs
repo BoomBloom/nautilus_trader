@@ -142,12 +142,17 @@ impl SwapQuote {
         Ok(())
     }
 
-    /// Determines swap direction from amount signs.
+    /// Determines swap direction from amount signs, or from price movement when both amounts are
+    /// zero.
     ///
     /// Returns `true` if swapping token0 for token1 (`zero_for_one`).
     #[must_use]
     pub fn zero_for_one(&self) -> bool {
-        self.amount0.is_positive()
+        if self.amount0.is_zero() && self.amount1.is_zero() {
+            self.sqrt_price_after_x96 < self.sqrt_price_before_x96
+        } else {
+            self.amount0.is_positive()
+        }
     }
 
     /// Returns the total fees paid in input token(LP fees + protocol fees).
@@ -212,7 +217,7 @@ impl SwapQuote {
     /// Price impact in basis points (10000 = 100%)
     ///
     /// # Errors
-    /// Returns error if price calculations fail
+    /// Returns an error if price calculations fail.
     pub fn get_price_impact_bps(&mut self) -> anyhow::Result<u32> {
         match self.check_if_trade_info_initialized() {
             Ok(trade_info) => trade_info.get_price_impact_bps(),
@@ -230,7 +235,7 @@ impl SwapQuote {
     /// Total slippage in basis points (10000 = 100%)
     ///
     /// # Errors
-    /// Returns error if price calculations fail
+    /// Returns an error if price calculations fail.
     pub fn get_slippage_bps(&mut self) -> anyhow::Result<u32> {
         match self.check_if_trade_info_initialized() {
             Ok(trade_info) => trade_info.get_slippage_bps(),
@@ -254,7 +259,7 @@ impl SwapQuote {
     /// Validates that the quote satisfied an exact output request.
     ///
     /// # Errors
-    /// Returns error if the actual output is less than the requested amount.
+    /// Returns an error if the actual output is less than the requested amount.
     pub fn validate_exact_output(&self, amount_out_requested: U256) -> anyhow::Result<()> {
         let actual_out = self.get_output_amount();
         if actual_out < amount_out_requested {

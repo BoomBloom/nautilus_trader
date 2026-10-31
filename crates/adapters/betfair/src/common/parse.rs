@@ -16,6 +16,7 @@
 //! Parsing utilities that convert Betfair payloads into Nautilus domain models.
 
 use anyhow::Context;
+use indexmap::IndexMap;
 use jiff::Timestamp;
 use nautilus_core::{Params, UUID4, UnixNanos, datetime::NANOSECONDS_IN_MILLISECOND};
 use nautilus_model::{
@@ -207,16 +208,14 @@ pub fn parse_market_catalogue(
         None => (0, Ustr::from(""), Ustr::from(""), UnixNanos::default()),
     };
 
-    let (betting_type, market_type, market_base_rate) = match &catalogue.description {
+    let (betting_type, market_type) = match &catalogue.description {
         Some(desc) => (
             Ustr::from(&format!("{}", desc.betting_type)),
             desc.market_type,
-            desc.market_base_rate,
         ),
         None => (
             Ustr::from(DEFAULT_BETTING_TYPE),
             Ustr::from(DEFAULT_MARKET_TYPE),
-            Decimal::ZERO,
         ),
     };
 
@@ -226,9 +225,6 @@ pub fn parse_market_catalogue(
         .as_deref()
         .and_then(|t| parse_betfair_timestamp(t).ok())
         .unwrap_or_default();
-
-    // Convert market base rate from percentage to decimal fraction
-    let fee_rate = market_base_rate / Decimal::ONE_HUNDRED;
 
     let tick = Decimal::new(1, 2); // 0.01
     let price_increment = parse_betfair_price(tick)?;
@@ -269,8 +265,6 @@ pub fn parse_market_catalogue(
             // margin_init (pre-funded)
             .margin_init(Decimal::ONE)
             .margin_maint(Decimal::ONE)
-            .maker_fee(fee_rate)
-            .taker_fee(fee_rate)
             .ts_event(ts_init)
             .ts_init(ts_init)
             .build()
@@ -350,11 +344,6 @@ pub fn parse_market_definition(
         .and_then(|t| parse_betfair_timestamp(t).ok())
         .unwrap_or_default();
 
-    let fee_rate = def
-        .market_base_rate
-        .map(|r| r / Decimal::ONE_HUNDRED)
-        .unwrap_or_default();
-
     let tick = Decimal::new(1, 2); // 0.01
     let price_increment = parse_betfair_price(tick)?;
     let size_increment = parse_betfair_quantity(tick)?;
@@ -397,8 +386,6 @@ pub fn parse_market_definition(
             .maybe_min_notional(min_notional)
             .margin_init(Decimal::ONE)
             .margin_maint(Decimal::ONE)
-            .maker_fee(fee_rate)
-            .taker_fee(fee_rate)
             .ts_event(ts_event)
             .ts_init(ts_init)
             .build()
@@ -433,7 +420,8 @@ pub fn parse_account_state(
 
     let balance = AccountBalance::from_total_and_locked(total, exposure, currency)?;
 
-    let mut info = Params::new();
+    let mut info = IndexMap::new();
+
     let mut push_decimal = |key: &str, val: Option<Decimal>| {
         if let Some(decimal) = val {
             info.insert(
@@ -460,7 +448,12 @@ pub fn parse_account_state(
             serde_json::Value::from(wallet.to_string()),
         );
     }
-    let info = if info.is_empty() { None } else { Some(info) };
+
+    let info = if info.is_empty() {
+        None
+    } else {
+        Some(Params::new(info))
+    };
 
     Ok(AccountState::new(
         account_id,

@@ -83,10 +83,7 @@ impl IdentityClass {
 
 /// Results from a completed backtest run.
 #[derive(Debug, Serialize)]
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.backtest", skip_from_py_object)
-)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "nautilus_trader.backtest"))]
 #[cfg_attr(
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.backtest")
@@ -139,6 +136,7 @@ pub(crate) struct CanonicalDiagnostic {
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum CanonicalDiagnosticCode {
     FundingSettlementFailed,
+    AccountBalanceRejected,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -410,7 +408,10 @@ fn validate_diagnostics(value: &Value) -> anyhow::Result<()> {
             .ok_or_else(|| anyhow::anyhow!("canonical diagnostic must be an object"))?;
         validate_fields(object, &["code"], "canonical diagnostic")?;
         anyhow::ensure!(
-            object.get("code").and_then(Value::as_str) == Some("funding-settlement-failed"),
+            matches!(
+                object.get("code").and_then(Value::as_str),
+                Some("funding-settlement-failed" | "account-balance-rejected")
+            ),
             "unsupported canonical diagnostic code"
         );
     }
@@ -567,11 +568,10 @@ fn canonical_position(position: &Position) -> anyhow::Result<Value> {
         "position_id".to_string(),
         Value::String(position.id.to_string()),
     );
-    set_f64(object, "avg_px_close", position.avg_px_close);
-    set_f64(object, "avg_px_open", Some(position.avg_px_open));
+    set_decimal(object, "avg_px_close", position.avg_px_close);
+    set_decimal(object, "avg_px_open", Some(position.avg_px_open));
     set_f64(object, "realized_return", Some(position.realized_return));
-    set_f64(object, "signed_qty", Some(position.signed_qty));
-
+    set_decimal(object, "signed_qty", Some(position.signed_qty));
     if let Some(adjustments) = object.get_mut("adjustments").and_then(Value::as_array_mut) {
         for (source, encoded) in position.adjustments.iter().zip(adjustments) {
             patch_position_adjustment(source, encoded)?;

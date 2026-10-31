@@ -641,6 +641,9 @@ pub enum HyperliquidOrderStatus {
     /// Order canceled due to liquidation.
     #[serde(rename = "liquidatedCanceled")]
     LiquidatedCanceled,
+    /// Order canceled because its HIP-4 outcome settled.
+    #[serde(rename = "outcomeSettledCanceled")]
+    OutcomeSettledCanceled,
     /// Order was scheduled for cancel.
     #[serde(rename = "scheduledCancel")]
     ScheduledCancel,
@@ -711,6 +714,7 @@ impl From<HyperliquidOrderStatus> for OrderStatus {
             | HyperliquidOrderStatus::SiblingFilledCanceled
             | HyperliquidOrderStatus::DelistedCanceled
             | HyperliquidOrderStatus::LiquidatedCanceled
+            | HyperliquidOrderStatus::OutcomeSettledCanceled
             | HyperliquidOrderStatus::ScheduledCancel => Self::Canceled,
             // All reject variants map to REJECTED
             HyperliquidOrderStatus::Rejected
@@ -932,6 +936,8 @@ pub enum HyperliquidInfoRequestType {
     PerpDexs,
     /// Get metadata for all perp dexes (standard + HIP-3).
     AllPerpMetas,
+    /// Get the account abstraction mode for a user.
+    UserAbstraction,
 }
 
 impl HyperliquidInfoRequestType {
@@ -970,7 +976,34 @@ impl HyperliquidInfoRequestType {
             Self::UserFees => "userFees",
             Self::PerpDexs => "perpDexs",
             Self::AllPerpMetas => "allPerpMetas",
+            Self::UserAbstraction => "userAbstraction",
         }
+    }
+}
+
+/// Hyperliquid account abstraction mode, as returned by the `userAbstraction` info request.
+///
+/// Under a unified or portfolio margin account, every balance and hold is reported in the spot
+/// clearinghouse state and the per-dex perp states do not describe account collateral. Under
+/// the other modes USDC collateral stays in the perp clearinghouse.
+#[derive(Clone, Copy, Debug, Display, PartialEq, Eq, Hash, Serialize, Deserialize, AsRefStr)]
+#[serde(rename_all = "camelCase")]
+#[strum(serialize_all = "camelCase")]
+pub enum HyperliquidAccountAbstraction {
+    UnifiedAccount,
+    PortfolioMargin,
+    Disabled,
+    Default,
+    DexAbstraction,
+    #[serde(other)]
+    Unknown,
+}
+
+impl HyperliquidAccountAbstraction {
+    /// Returns true if account balances and holds are reported in the spot clearinghouse state.
+    #[must_use]
+    pub fn uses_spot_collateral(self) -> bool {
+        matches!(self, Self::UnifiedAccount | Self::PortfolioMargin)
     }
 }
 
@@ -1034,7 +1067,7 @@ impl HyperliquidProductType {
     ///
     /// # Errors
     ///
-    /// Returns error if symbol doesn't match any expected format.
+    /// Returns an error if symbol doesn't match any expected format.
     pub fn from_symbol(symbol: &str) -> anyhow::Result<Self> {
         if symbol.ends_with("-PERP") {
             Ok(Self::Perp)
@@ -1396,6 +1429,14 @@ mod tests {
             OrderStatus::from(HyperliquidOrderStatus::ReduceOnlyCanceled),
             OrderStatus::Canceled
         );
+        assert_eq!(
+            OrderStatus::from(HyperliquidOrderStatus::OutcomeSettledCanceled),
+            OrderStatus::Canceled
+        );
+        assert_eq!(
+            OrderStatus::from(HyperliquidOrderStatus::ScheduledCancel),
+            OrderStatus::Canceled
+        );
 
         // Test specific reject reasons map to Rejected
         assert_eq!(
@@ -1434,6 +1475,17 @@ mod tests {
             reduce_only_canceled,
             HyperliquidOrderStatus::ReduceOnlyCanceled
         );
+
+        let outcome_settled_canceled: HyperliquidOrderStatus =
+            serde_json::from_str(r#""outcomeSettledCanceled""#).unwrap();
+        assert_eq!(
+            outcome_settled_canceled,
+            HyperliquidOrderStatus::OutcomeSettledCanceled
+        );
+
+        let scheduled_cancel: HyperliquidOrderStatus =
+            serde_json::from_str(r#""scheduledCancel""#).unwrap();
+        assert_eq!(scheduled_cancel, HyperliquidOrderStatus::ScheduledCancel);
 
         let tick_rejected: HyperliquidOrderStatus =
             serde_json::from_str(r#""tickRejected""#).unwrap();
@@ -1800,5 +1852,34 @@ mod tests {
     #[case("25-YES-outcome")]
     fn test_product_type_from_symbol_rejects_invalid(#[case] symbol: &str) {
         assert!(HyperliquidProductType::from_symbol(symbol).is_err());
+    }
+
+    #[rstest]
+    #[case("\"unifiedAccount\"", HyperliquidAccountAbstraction::UnifiedAccount)]
+    #[case("\"portfolioMargin\"", HyperliquidAccountAbstraction::PortfolioMargin)]
+    #[case("\"disabled\"", HyperliquidAccountAbstraction::Disabled)]
+    #[case("\"default\"", HyperliquidAccountAbstraction::Default)]
+    #[case("\"dexAbstraction\"", HyperliquidAccountAbstraction::DexAbstraction)]
+    #[case("\"someFutureMode\"", HyperliquidAccountAbstraction::Unknown)]
+    fn test_account_abstraction_deserialize(
+        #[case] json: &str,
+        #[case] expected: HyperliquidAccountAbstraction,
+    ) {
+        let parsed: HyperliquidAccountAbstraction = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed, expected);
+    }
+
+    #[rstest]
+    #[case(HyperliquidAccountAbstraction::UnifiedAccount, true)]
+    #[case(HyperliquidAccountAbstraction::PortfolioMargin, true)]
+    #[case(HyperliquidAccountAbstraction::Disabled, false)]
+    #[case(HyperliquidAccountAbstraction::Default, false)]
+    #[case(HyperliquidAccountAbstraction::DexAbstraction, false)]
+    #[case(HyperliquidAccountAbstraction::Unknown, false)]
+    fn test_account_abstraction_uses_spot_collateral(
+        #[case] abstraction: HyperliquidAccountAbstraction,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(abstraction.uses_spot_collateral(), expected);
     }
 }

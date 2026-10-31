@@ -79,8 +79,8 @@ rstest = { workspace = true }
 serde_json = { workspace = true }
 
 [[bench]]
-name = "matching_core"
-path = "benches/matching_core.rs"
+name = "matching"
+path = "benches/matching.rs"
 harness = false
 
 [[bench]]
@@ -91,4 +91,9 @@ harness = false
 [[bench]]
 name = "position_replay"
 path = "benches/position_replay.rs"
+harness = false
+
+[[bench]]
+name = "reconciliation"
+path = "benches/reconciliation.rs"
 harness = false

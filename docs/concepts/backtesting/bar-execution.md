@@ -1,8 +1,8 @@
 # Bar-Based Execution
 
-Bar data records the open, high, low, close, and volume for an interval. It does not record when
-each price occurred within that interval or whether the high preceded the low. Bar-based execution
-therefore simulates a plausible intrabar path rather than reconstructing the original trades.
+Bar data records the open, high, low, close, and volume for an interval. It does not record when each price
+occurred within that interval or whether the high preceded the low. Bar-based execution thus simulates a
+plausible intrabar path rather than reconstructing the original trades.
 
 NautilusTrader converts each execution bar into synthetic market updates for an L1 order book.
 Resting orders match as those updates move through the bar.
@@ -20,11 +20,13 @@ The event timestamp (`ts_event`) may represent the open or close, depending on t
 - For bars timestamped at the open, set `ts_init = ts_event + interval_ns`. For example, add
   `60_000_000_000` nanoseconds for one-minute bars.
 
-Where an adapter provides a setting such as `bars_timestamp_on_close=True`, prefer that setting so
-the stored data uses the expected convention. For custom data, populate `ts_event` and `ts_init`
-before constructing `Bar` objects, encoding Arrow record batches, writing a catalog, or calling
-`add_data()`. The `BarDataWrangler` consumes explicit timestamp fields and does not expose a
-`ts_init_delta` argument. Verify the result on a small sample before running a backtest.
+If an adapter provides a setting such as `bars_timestamp_on_close=True`, prefer it so stored data
+uses the expected convention.
+
+For custom data, populate `ts_event` and `ts_init` before constructing `Bar` objects, encoding Arrow
+record batches, writing a catalog, or calling `add_data()`. The `BarDataWrangler` consumes explicit
+timestamp fields and does not expose a `ts_init_delta` argument. Verify the result on a small sample
+before running a backtest.
 
 ## Processing bar data
 
@@ -34,8 +36,17 @@ Bar execution applies only when:
 - The venue uses `BookType.L1_MBP`.
 - The bar has an external aggregation source.
 
-Internally aggregated bars and bars sent to L2 or L3 venues still reach subscribed strategies, but
-they do not update the matching engine's book or trigger matching.
+Internally aggregated bars and bars sent to L2 or L3 venues still reach subscribed strategies. These bars do
+not update the matching engine's book or trigger matching.
+
+:::warning[Time bars required for bar execution]
+For L1 venues with `bar_execution=True`, `BacktestEngine.run()` raises `RuntimeError` if a non-`MARK`
+external bar uses a non-time aggregation, such as `TICK`, `VOLUME`, or `VALUE`.
+Set `bar_execution=False` to use these bars without bar-based fills.
+
+For `BacktestNode`, set `BacktestRunConfig.raise_exception=True` to propagate the error.
+Otherwise, the node logs the error and omits the failed run's result.
+:::
 
 For each applicable bar, the engine:
 
@@ -45,8 +56,8 @@ For each applicable bar, the engine:
 1. Matches orders after each synthetic update.
 1. Dispatches the complete bar to actors and strategies.
 
-Orders already resting at the start of the bar can therefore fill at an intermediate OHLC point.
-Orders submitted from `on_bar` arrive only after all four points for that bar have been processed.
+Orders already resting at the start of the bar can thus fill at an intermediate OHLC point. Orders submitted
+from `on_bar` arrive only after all four points for that bar have been processed.
 
 ## OHLC price simulation
 
@@ -56,7 +67,7 @@ instrument's minimum `size_increment`, each point uses the minimum increment.
 
 The venue's `bar_adaptive_high_low_ordering` option controls the intrabar path:
 
-- With `False` (the default), every bar uses `Open -> High -> Low -> Close`.
+- With `False` (the default), each bar uses `Open -> High -> Low -> Close`.
 - With `True`, the engine visits the extreme closest to the open first:
   - If the open is closer to the high, it uses `Open -> High -> Low -> Close`.
   - If the open is closer to the low, it uses `Open -> Low -> High -> Close`.
@@ -66,14 +77,17 @@ Its accuracy depends on the market, interval, and data source. An
 [exploratory EUR/USD analysis](https://gist.github.com/stefansimik/d387e1d9ff784a8973feca0cde51e363)
 motivates the distance heuristic but does not establish a general accuracy rate.
 
-The path matters when both a protective stop and a profit target lie inside the same bar because
-the first visited level determines which order can fill first.
+The first visited level determines which order can fill first. Thus, the path matters when a protective stop
+and a profit target lie inside the same bar.
 
 Configure adaptive ordering on the venue:
 
 ```python
+from decimal import Decimal
+
 from nautilus_trader.backtest import BacktestEngine
 from nautilus_trader.config import BacktestEngineConfig
+from nautilus_trader.execution import MakerTakerFeeModel
 from nautilus_trader.model import AccountType
 from nautilus_trader.model import Money
 from nautilus_trader.model import OmsType
@@ -86,6 +100,10 @@ engine.add_venue(
     account_type=AccountType.CASH,
     starting_balances=[Money.from_str("10_000 USDT")],
     bar_adaptive_high_low_ordering=True,
+    fee_model=MakerTakerFeeModel(
+        maker_rate=Decimal("0"),
+        taker_rate=Decimal("0"),
+    ),
 )
 ```
 
@@ -97,16 +115,21 @@ Bar N's OHLC sequence runs before `on_bar(N)`. Without a latency model, an order
 A latency model delays the order's effective arrival. Once the command reaches its arrival
 timestamp, the engine can release it from the venue's latency queue in two ways:
 
-- Exchange-routed market data for the order's instrument. With bar-only data and no intervening
-  timer events, the first bar at or after the arrival timestamp completes its OHLC sweep before the
-  order settles, so the order sees that bar's close. Quote or trade ticks can release it earlier
+- **Instrument market data**: Exchange-routed data for the order's instrument releases the command. With
+  bar-only data and no intervening timer events, the first bar at or after arrival completes its OHLC sweep
+  before the order settles. Thus, the order sees that bar's close. Quote or trade ticks can release it earlier
   against the book state they establish.
-- An unrestricted settlement point, such as a timer, funding-rate settlement, or shutdown drain.
-  These points release all commands due at that time.
+- **Unrestricted settlement**: Points such as actor or strategy timers, funding-rate settlement,
+  or shutdown drains release all commands due at that time.
 
 Market data for another instrument does not release the delayed command against stale book state.
+Portfolio snapshot timers for daily equity curves and `PortfolioConfig.snapshot_interval_ms` samples
+do not release older delayed commands.
 
 ```python
+from decimal import Decimal
+
+from nautilus_trader.execution import MakerTakerFeeModel
 from nautilus_trader.execution import StaticLatencyModel
 
 engine.add_venue(
@@ -114,15 +137,19 @@ engine.add_venue(
     oms_type=OmsType.NETTING,
     account_type=AccountType.CASH,
     starting_balances=[Money.from_str("10_000 USDT")],
+    fee_model=MakerTakerFeeModel(
+        maker_rate=Decimal("0"),
+        taker_rate=Decimal("0"),
+    ),
     latency_model=StaticLatencyModel(base_latency_nanos=1_000_000_000),
 )
 ```
 
 :::warning[Next-bar-open fills and look-ahead]
-The engine does not provide a native next-bar-open fill mode. A strategy can form a signal from a
-completed prior bar without look-ahead, but the next bar's open is processed before that next bar
-is dispatched. Using the current bar's open from its `on_bar` callback would introduce look-ahead;
-using latency with bar-only data normally settles against a later book state, not the next open.
+The engine does not provide a native next-bar-open fill mode. A strategy can form a signal from a completed
+prior bar without look-ahead. But the engine processes the next bar's open before it dispatches that bar. If a
+strategy uses the current bar's open from its `on_bar` callback, it introduces look-ahead. With bar-only data,
+latency normally causes settlement against a later book state, not the next open.
 :::
 
 ## Internal bar aggregation timing
@@ -144,4 +171,4 @@ config = BacktestEngineConfig(
 ```
 
 The value is in microseconds. A small delay, such as one microsecond, lets boundary data arrive
-before the bar closes. It affects only internally aggregated bars.
+before the bar closes. It affects **only internally aggregated bars**.

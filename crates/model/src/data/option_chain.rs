@@ -22,7 +22,7 @@ use std::{
 };
 
 use nautilus_core::{UnixNanos, serialization::Serializable};
-use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::{Deserialize, Serialize};
 
 use super::HasTsInit;
@@ -40,8 +40,124 @@ use crate::{
 /// fallback when Greeks are not yet available for delta resolution.
 pub(crate) const DEFAULT_DELTA_FALLBACK_STRIKES: usize = 5;
 
+/// An ordered set of strike grids and a bound on definition candidates per slot.
+///
+/// Increments express discovery preference. They do not prove that a strike is listed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct StrikeSearchProfile {
+    increments: Vec<Decimal>,
+    origin: Decimal,
+    max_candidates_per_slot: usize,
+}
+
+impl StrikeSearchProfile {
+    /// Creates a checked strike-search profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The increments are empty, non-positive, or duplicated.
+    /// - The origin is negative.
+    /// - The candidate bound is zero.
+    pub fn new(
+        increments: Vec<Decimal>,
+        origin: Decimal,
+        max_candidates_per_slot: usize,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !increments.is_empty(),
+            "strike search profile requires at least one increment"
+        );
+        anyhow::ensure!(
+            increments.iter().all(|value| *value > Decimal::ZERO),
+            "strike search profile increments must be positive"
+        );
+        let mut seen = HashSet::with_capacity(increments.len());
+        for increment in &increments {
+            anyhow::ensure!(
+                seen.insert(increment.normalize()),
+                "strike search profile increments must be unique (duplicate {increment})"
+            );
+        }
+
+        anyhow::ensure!(
+            origin >= Decimal::ZERO,
+            "strike search profile origin must be non-negative"
+        );
+        anyhow::ensure!(
+            max_candidates_per_slot > 0,
+            "strike search profile requires a positive candidate bound"
+        );
+        Ok(Self {
+            increments,
+            origin,
+            max_candidates_per_slot,
+        })
+    }
+
+    /// Returns strike increments in discovery preference order.
+    #[must_use]
+    pub fn increments(&self) -> &[Decimal] {
+        &self.increments
+    }
+
+    /// Returns the origin shared by the strike grids.
+    #[must_use]
+    pub const fn origin(&self) -> Decimal {
+        self.origin
+    }
+
+    /// Returns the maximum number of candidates probed per strike slot.
+    #[must_use]
+    pub const fn max_candidates_per_slot(&self) -> usize {
+        self.max_candidates_per_slot
+    }
+}
+
+impl<'de> Deserialize<'de> for StrikeSearchProfile {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Fields {
+            increments: Vec<Decimal>,
+            origin: Decimal,
+            max_candidates_per_slot: usize,
+        }
+        let fields = Fields::deserialize(deserializer)?;
+        Self::new(
+            fields.increments,
+            fields.origin,
+            fields.max_candidates_per_slot,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
 /// Defines which strikes to include in an option chain subscription.
+///
+/// Existing variants support direct construction. Downstream matches require a
+/// wildcard arm so new selection modes can be added without changing those matches.
+/// Use [`Self::resolve`] for model-level selection, or reject unsupported modes
+/// explicitly when implementing a custom selector.
+///
+/// An exhaustive match outside this crate does not compile:
+///
+/// ```compile_fail,E0004
+/// use nautilus_model::data::StrikeRange;
+///
+/// fn is_fixed(range: &StrikeRange) -> bool {
+///     match range {
+///         StrikeRange::Fixed(_) => true,
+///         StrikeRange::AtmRelative { .. } => false,
+///         StrikeRange::AtmPercent { .. } => false,
+///         StrikeRange::Delta { .. } => false,
+///     }
+/// }
+/// ```
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum StrikeRange {
     /// Subscribe to a fixed set of strike prices.
     Fixed(Vec<Price>),
@@ -168,11 +284,11 @@ pub struct OptionGreeks {
     pub convention: GreeksConvention,
     /// Core Greek sensitivity values.
     pub greeks: OptionGreekValues,
-    /// Mark implied volatility.
+    /// Mark implied volatility as a fraction (0.552 represents 55.2%).
     pub mark_iv: Option<f64>,
-    /// Bid implied volatility.
+    /// Bid implied volatility as a fraction (0.552 represents 55.2%).
     pub bid_iv: Option<f64>,
-    /// Ask implied volatility.
+    /// Ask implied volatility as a fraction (0.552 represents 55.2%).
     pub ask_iv: Option<f64>,
     /// Underlying price at time of Greeks calculation.
     pub underlying_price: Option<f64>,
@@ -403,7 +519,7 @@ mod tests {
     }
 
     fn make_series_id() -> OptionSeriesId {
-        OptionSeriesId::new(
+        OptionSeriesId::new_derived(
             Venue::new("DERIBIT"),
             ustr::Ustr::from("BTC"),
             ustr::Ustr::from("BTC"),
@@ -830,5 +946,42 @@ mod tests {
         let strikes = vec![Price::from("50000"), Price::from("55000")];
         // No ATM -> deferred (empty), matching ATM-relative behavior.
         assert!(delta.resolve(None, &strikes).is_empty());
+    }
+
+    #[rstest]
+    fn test_strike_search_profile_roundtrip() {
+        let profile = StrikeSearchProfile::new(
+            vec![Decimal::from(5), Decimal::from(25)],
+            Decimal::from(2),
+            7,
+        )
+        .unwrap();
+        let encoded = serde_json::to_value(&profile).unwrap();
+        let restored: StrikeSearchProfile = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(restored, profile);
+        assert_eq!(profile.increments(), &[Decimal::from(5), Decimal::from(25)]);
+        assert_eq!(profile.origin(), Decimal::from(2));
+        assert_eq!(profile.max_candidates_per_slot(), 7);
+        assert_eq!(encoded["max_candidates_per_slot"], serde_json::json!(7));
+    }
+
+    #[rstest]
+    #[case(vec![], Decimal::ZERO, 7, "at least one increment")]
+    #[case(vec![Decimal::ZERO], Decimal::ZERO, 7, "increments must be positive")]
+    #[case(vec![Decimal::from(-1)], Decimal::ZERO, 7, "increments must be positive")]
+    #[case(vec![Decimal::from(5), Decimal::new(50, 1)], Decimal::ZERO, 7, "increments must be unique")]
+    #[case(vec![Decimal::from(5)], Decimal::from(-1), 7, "origin must be non-negative")]
+    #[case(vec![Decimal::from(5)], Decimal::ZERO, 0, "positive candidate bound")]
+    fn test_strike_search_profile_invalid(
+        #[case] increments: Vec<Decimal>,
+        #[case] origin: Decimal,
+        #[case] candidates: usize,
+        #[case] expected: &str,
+    ) {
+        let encoded = serde_json::json!({"increments": increments, "origin": origin, "max_candidates_per_slot": candidates});
+        let error = StrikeSearchProfile::new(increments, origin, candidates).unwrap_err();
+        let decoded_error = serde_json::from_value::<StrikeSearchProfile>(encoded).unwrap_err();
+        assert!(error.to_string().contains(expected));
+        assert!(decoded_error.to_string().contains(expected));
     }
 }

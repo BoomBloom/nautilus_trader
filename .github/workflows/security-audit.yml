@@ -96,7 +96,7 @@ jobs:
       audit_needed: ${{ steps.filter.outputs.audit_needed }}
     steps:
       # https://github.com/step-security/harden-runner
-      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
           egress-policy: ${{ env.EGRESS_POLICY }}
           allowed-endpoints: >-
@@ -139,7 +139,7 @@ jobs:
       security-events: write
     steps:
       # https://github.com/step-security/harden-runner
-      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
           egress-policy: ${{ env.EGRESS_POLICY }}
           allowed-endpoints: >-
@@ -152,13 +152,19 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Set up Python
+        # https://github.com/actions/setup-python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
       - name: Get uv version from pyproject.toml
         id: uv-version
         run: echo "uv_version=$(bash scripts/uv-version.sh)" >> "$GITHUB_OUTPUT"
 
       - name: Install uv
         # https://github.com/astral-sh/setup-uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           version: ${{ steps.uv-version.outputs.uv_version }}
           enable-cache: true
@@ -179,7 +185,7 @@ jobs:
           (github.event_name != 'pull_request' ||
           !github.event.pull_request.head.repo.fork)
         # https://github.com/github/codeql-action
-        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
         with:
           sarif_file: zizmor.sarif
           category: zizmor
@@ -191,7 +197,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       # https://github.com/step-security/harden-runner
-      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
           egress-policy: ${{ env.EGRESS_POLICY }}
           allowed-endpoints: >-
@@ -210,10 +216,12 @@ jobs:
 
       - name: Set up Rust toolchain
         # https://github.com/actions-rust-lang/setup-rust-toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           toolchain: ${{ steps.rust-toolchain.outputs.toolchain }}
           override: true
+          rustflags: -D warnings
+          build-warnings: ""
 
       - name: Cache supply-chain tools
         # https://github.com/actions/cache
@@ -234,7 +242,7 @@ jobs:
 
       - name: Install uv
         # https://github.com/astral-sh/setup-uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           version: ${{ steps.uv-version.outputs.version }}
           prune-cache: true
@@ -263,7 +271,7 @@ jobs:
       SUPPLY_CHAIN_RESULT: ${{ needs.supply-chain.result }}
     steps:
       # https://github.com/step-security/harden-runner
-      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
           egress-policy: ${{ env.EGRESS_POLICY }}
           allowed-endpoints: >-

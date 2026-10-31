@@ -21,6 +21,7 @@ crate-type = ["rlib"]
 
 [features]
 default = ["high-precision"]
+arrow = ["dep:arrow", "nautilus-serialization"]
 examples = [
   "nautilus-live/node",
   "nautilus-network/transport-sockudo",
@@ -47,11 +48,14 @@ extension-module = [
   "python",
   "pyo3/extension-module",
 ]
-high-precision = ["nautilus-model/high-precision"]
+high-precision = [
+  "nautilus-model/high-precision",
+  "nautilus-serialization?/high-precision",
+]
 
 [package.metadata.docs.rs]
 # Python docs depend on the local pyo3-stub-gen patch for now, which published crates do not carry
-features = ["examples", "high-precision"]
+features = ["arrow", "examples", "high-precision"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
@@ -60,6 +64,9 @@ nautilus-core = { workspace = true }
 nautilus-live = { workspace = true }
 nautilus-model = { workspace = true }
 nautilus-network = { workspace = true, features = ["transport-sockudo"] }
+nautilus-serialization = { workspace = true, features = [
+  "arrow",
+], optional = true }
 nautilus-system = { workspace = true, optional = true }
 
 ahash = { workspace = true }
@@ -73,6 +80,7 @@ dashmap = { workspace = true }
 derive_builder = { workspace = true }
 dotenvy = { workspace = true }
 futures-util = { workspace = true }
+indexmap = { workspace = true }
 jiff = { workspace = true }
 log = { workspace = true }
 parking_lot = { workspace = true }
@@ -89,11 +97,14 @@ tokio-util = { workspace = true }
 ustr = { workspace = true }
 zeroize = { workspace = true }
 
+arrow = { workspace = true, optional = true }
 pyo3 = { workspace = true, optional = true }
 pyo3-async-runtimes = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
+nautilus-live = { workspace = true, features = ["test-support"] }
+nautilus-persistence = { workspace = true }
 nautilus-testkit = { workspace = true, default-features = false, features = [
   "testers",
 ] }
@@ -103,12 +114,17 @@ axum = { workspace = true }
 criterion = { workspace = true }
 rstest = { workspace = true }
 rust_decimal_macros = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 toml = { workspace = true }
 
 # Run with `cargo bench -p nautilus-bybit --bench websocket`
 [[bench]]
 name = "websocket"
+harness = false
+
+[[bench]]
+name = "market_data"
 harness = false
 
 # Run with `cargo run -p nautilus-bybit --bin bybit-http`.
@@ -166,3 +182,12 @@ name = "bybit-delta-neutral"
 path = "examples/node_delta_neutral.rs"
 required-features = ["examples"]
 doc = false
+
+# Public market-data validation; explicitly connects to Bybit mainnet.
+# Run with `cargo test --package nautilus-bybit --features examples --test bybit-book-stress -- --timeout 10 --rounds 21`
+[[test]]
+name = "bybit-book-stress"
+path = "tests/stress/book_stress.rs"
+harness = false
+test = false
+required-features = ["examples"]

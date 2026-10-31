@@ -257,13 +257,15 @@ impl WalletAccount {
         balances
             .iter()
             .map(|balance| {
-                check_predicate_true(
-                    currencies.insert(balance.currency),
-                    &format!(
-                        "Wallet account balances had duplicate currency {}",
-                        balance.currency
-                    ),
-                )?;
+                if !currencies.insert(balance.currency) {
+                    return Err(CorrectnessError::PredicateViolation {
+                        message: format!(
+                            "Wallet account balances had duplicate currency {}",
+                            balance.currency
+                        ),
+                    });
+                }
+
                 check_predicate_false(
                     balance.total.is_negative(),
                     "Wallet account balance total was negative",
@@ -279,17 +281,20 @@ impl WalletAccount {
     }
 
     fn validate_observed_balance(balance: AccountBalance) -> CorrectnessResult<()> {
-        check_predicate_true(
-            balance.currency == balance.total.currency
-                && balance.currency.precision == balance.total.currency.precision,
-            &format!(
-                "Wallet account balance currency {} precision {} differed from total currency {} precision {}",
-                balance.currency,
-                balance.currency.precision,
-                balance.total.currency,
-                balance.total.currency.precision,
-            ),
-        )?;
+        if !(balance.currency == balance.total.currency
+            && balance.currency.precision == balance.total.currency.precision)
+        {
+            return Err(CorrectnessError::PredicateViolation {
+                message: format!(
+                    "Wallet account balance currency {} precision {} differed from total currency {} precision {}",
+                    balance.currency,
+                    balance.currency.precision,
+                    balance.total.currency,
+                    balance.total.currency.precision,
+                ),
+            });
+        }
+
         Self::validate_money(balance.total)
     }
 
@@ -341,10 +346,12 @@ impl WalletAccount {
         reason = "the raw width differs when high-precision is disabled"
     )]
     fn normalize_reservation(locked: Money, currency: Currency) -> CorrectnessResult<Money> {
-        check_predicate_false(
-            locked.is_negative(),
-            &format!("locked balance was negative: {locked}"),
-        )?;
+        if locked.is_negative() {
+            return Err(CorrectnessError::PredicateViolation {
+                message: format!("locked balance was negative: {locked}"),
+            });
+        }
+
         Self::validate_money(locked)?;
 
         Money::from_rescaled_raw(
@@ -438,28 +445,35 @@ impl WalletAccount {
             .iter()
             .filter(|((_, key), locked)| *key == currency || locked.currency == currency)
         {
-            check_predicate_true(
-                *key_currency == locked.currency
-                    && key_currency.precision == locked.currency.precision,
-                &format!(
-                    "wallet reservation key currency {} precision {} differed from value currency {} precision {}",
-                    key_currency,
-                    key_currency.precision,
-                    locked.currency,
-                    locked.currency.precision,
-                ),
-            )?;
-            check_predicate_true(
-                locked.currency.precision == currency.precision,
-                &format!(
-                    "locked balance precision {} differed from balance precision {} for {currency}",
-                    locked.currency.precision, currency.precision
-                ),
-            )?;
-            check_predicate_false(
-                locked.is_negative(),
-                &format!("locked balance was negative: {locked}"),
-            )?;
+            if !(*key_currency == locked.currency
+                && key_currency.precision == locked.currency.precision)
+            {
+                return Err(CorrectnessError::PredicateViolation {
+                    message: format!(
+                        "wallet reservation key currency {} precision {} differed from value currency {} precision {}",
+                        key_currency,
+                        key_currency.precision,
+                        locked.currency,
+                        locked.currency.precision,
+                    ),
+                });
+            }
+
+            if locked.currency.precision != currency.precision {
+                return Err(CorrectnessError::PredicateViolation {
+                    message: format!(
+                        "locked balance precision {} differed from balance precision {} for {currency}",
+                        locked.currency.precision, currency.precision
+                    ),
+                });
+            }
+
+            if locked.is_negative() {
+                return Err(CorrectnessError::PredicateViolation {
+                    message: format!("locked balance was negative: {locked}"),
+                });
+            }
+
             Self::validate_money(*locked)?;
             total_locked = total_locked.checked_add(*locked).ok_or_else(|| {
                 CorrectnessError::PredicateViolation {
@@ -482,7 +496,7 @@ impl WalletAccount {
         )?;
         check_predicate_false(base.events.is_empty(), "Wallet account had no events")?;
 
-        for event in &base.events {
+        for event in base.events.iter() {
             Self::validate_event(event)?;
             Self::normalize_balances(&event.balances)?;
             check_predicate_true(
@@ -566,6 +580,7 @@ impl Account for WalletAccount {
             base_currency
         } else {
             match side {
+                OrderSide::Buy if !instrument.is_inverse() => instrument.cost_currency(),
                 OrderSide::Buy => instrument.quote_currency(),
                 OrderSide::Sell => base_currency,
             }
@@ -659,13 +674,15 @@ mod tests {
     use ahash::AHashMap;
     use indexmap::IndexMap;
     use rstest::rstest;
+    use rust_decimal_macros::dec;
 
     use crate::{
         accounts::{Account, WalletAccount, stubs::*},
         enums::{AccountType, LiquiditySide, OrderSide},
         events::{AccountState, account::stubs::*},
+        fees::MakerTakerFeeRates,
         identifiers::{AccountId, InstrumentId, stubs::uuid4},
-        instruments::{CryptoPerpetual, CurrencyPair, Instrument, stubs::*},
+        instruments::{CryptoFuture, CryptoPerpetual, CurrencyPair, Instrument, stubs::*},
         orders::{builder::OrderTestBuilder, stubs::TestOrderEventStubs},
         types::{
             AccountBalance, Currency, MarginBalance, Money, Price, Quantity,
@@ -746,7 +763,7 @@ mod tests {
             Some(wallet_account_state_changed.clone())
         );
         assert_eq!(
-            wallet_account.events,
+            *wallet_account.events,
             vec![wallet_account_state, wallet_account_state_changed]
         );
         assert_eq!(wallet_account.event_count(), 2);
@@ -1559,12 +1576,12 @@ mod tests {
 
     #[rstest]
     fn test_calculate_balance_locked_buy_inverse_locks_base_currency(
-        xbtusd_bitmex: CryptoPerpetual,
+        btcusd_bybit: CryptoPerpetual,
     ) {
         let wallet_account = wallet_with_total(Currency::BTC(), Money::from("100 BTC").raw());
         let balance_locked = wallet_account
             .calculate_balance_locked(
-                &xbtusd_bitmex.into_any(),
+                &btcusd_bybit.into_any(),
                 OrderSide::Buy,
                 Quantity::from("100000"),
                 Price::from("10000.0"),
@@ -1573,6 +1590,24 @@ mod tests {
             .unwrap();
 
         assert_eq!(balance_locked, Money::from("10 BTC"));
+    }
+
+    #[rstest]
+    fn test_calculate_balance_locked_buy_quanto_locks_settlement_currency(
+        ethbtc_quanto: CryptoFuture,
+    ) {
+        let wallet_account = wallet_with_total(Currency::USDT(), Money::from("100 USDT").raw());
+        let balance_locked = wallet_account
+            .calculate_balance_locked(
+                &ethbtc_quanto.into_any(),
+                OrderSide::Buy,
+                Quantity::from("5"),
+                Price::from("0.036"),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(balance_locked, Money::from("0.18 USDT"));
     }
 
     #[rstest]
@@ -1663,12 +1698,14 @@ mod tests {
 
     #[rstest]
     fn test_calculate_commission(wallet_account: WalletAccount, audusd_sim: CurrencyPair) {
+        let fee_rates = MakerTakerFeeRates::new(dec!(0.00002), dec!(0.00002));
         let commission = wallet_account
             .calculate_commission(
                 &audusd_sim.into_any(),
                 Quantity::from("100000"),
                 Price::from("0.8"),
                 LiquiditySide::Taker,
+                fee_rates,
                 None,
             )
             .unwrap();
@@ -1686,6 +1723,7 @@ mod tests {
             Quantity::from("1"),
             Price::from("1"),
             LiquiditySide::NoLiquiditySide,
+            MakerTakerFeeRates::zero(),
             None,
         );
 

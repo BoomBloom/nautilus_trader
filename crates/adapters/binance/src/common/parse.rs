@@ -38,7 +38,7 @@ use nautilus_model::{
         perpetual_contract::PerpetualContract,
     },
     reports::{FillReport, OrderStatusReport},
-    types::{Currency, Money, Price, Quantity},
+    types::{AccountBalance, Currency, Money, Price, Quantity},
 };
 use rust_decimal::Decimal;
 use serde_json::Value;
@@ -294,13 +294,11 @@ pub fn parse_usdm_instrument(
     ts_event: UnixNanos,
     ts_init: UnixNanos,
 ) -> anyhow::Result<InstrumentAny> {
-    parse_usdm_instrument_with_fees(symbol, None, None, ts_event, ts_init)
+    parse_usdm_instrument_with_fees(symbol, ts_event, ts_init)
 }
 
 pub(crate) fn parse_usdm_instrument_with_fees(
     symbol: &BinanceFuturesUsdSymbol,
-    maker_fee: Option<Decimal>,
-    taker_fee: Option<Decimal>,
     ts_event: UnixNanos,
     ts_init: UnixNanos,
 ) -> anyhow::Result<InstrumentAny> {
@@ -387,8 +385,6 @@ pub(crate) fn parse_usdm_instrument_with_fees(
                 .maybe_min_price(min_price)
                 .margin_init(default_margin)
                 .margin_maint(default_margin)
-                .maybe_maker_fee(maker_fee)
-                .maybe_taker_fee(taker_fee)
                 .ts_event(ts_event)
                 .ts_init(ts_init)
                 .build()?;
@@ -414,8 +410,6 @@ pub(crate) fn parse_usdm_instrument_with_fees(
                 .maybe_min_price(min_price)
                 .margin_init(default_margin)
                 .margin_maint(default_margin)
-                .maybe_maker_fee(maker_fee)
-                .maybe_taker_fee(taker_fee)
                 .ts_event(ts_event)
                 .ts_init(ts_init)
                 .build()
@@ -446,8 +440,6 @@ pub(crate) fn parse_usdm_instrument_with_fees(
                 .maybe_min_price(min_price)
                 .margin_init(default_margin)
                 .margin_maint(default_margin)
-                .maybe_maker_fee(maker_fee)
-                .maybe_taker_fee(taker_fee)
                 .ts_event(ts_event)
                 .ts_init(ts_init)
                 .build()
@@ -473,13 +465,11 @@ pub fn parse_coinm_instrument(
     ts_event: UnixNanos,
     ts_init: UnixNanos,
 ) -> anyhow::Result<InstrumentAny> {
-    parse_coinm_instrument_with_fees(symbol, None, None, ts_event, ts_init)
+    parse_coinm_instrument_with_fees(symbol, ts_event, ts_init)
 }
 
 pub(crate) fn parse_coinm_instrument_with_fees(
     symbol: &BinanceFuturesCoinSymbol,
-    maker_fee: Option<Decimal>,
-    taker_fee: Option<Decimal>,
     ts_event: UnixNanos,
     ts_init: UnixNanos,
 ) -> anyhow::Result<InstrumentAny> {
@@ -563,8 +553,6 @@ pub(crate) fn parse_coinm_instrument_with_fees(
             .maybe_min_price(min_price)
             .margin_init(default_margin)
             .margin_maint(default_margin)
-            .maybe_maker_fee(maker_fee)
-            .maybe_taker_fee(taker_fee)
             .ts_event(ts_event)
             .ts_init(ts_init)
             .build()
@@ -595,8 +583,6 @@ pub(crate) fn parse_coinm_instrument_with_fees(
             .maybe_min_price(min_price)
             .margin_init(default_margin)
             .margin_maint(default_margin)
-            .maybe_maker_fee(maker_fee)
-            .maybe_taker_fee(taker_fee)
             .ts_event(ts_event)
             .ts_init(ts_init)
             .build()
@@ -607,6 +593,50 @@ pub(crate) fn parse_coinm_instrument_with_fees(
 
 /// SBE status value for Trading.
 const SBE_STATUS_TRADING: u8 = 0;
+
+/// Converts an SBE `mantissa * 10^exponent` pair to a [`Decimal`] with exact integer scaling.
+///
+/// # Errors
+///
+/// Returns an error if the magnitude of a negative `exponent` exceeds [`Decimal`]'s maximum scale of 28, or if
+/// scaling by a positive exponent overflows. The conversion does not wrap and does not replace a
+/// nonzero mantissa with zero.
+pub(crate) fn sbe_mantissa_to_decimal(mantissa: i64, exponent: i8) -> anyhow::Result<Decimal> {
+    if exponent >= 0 {
+        let mut value = Decimal::from(mantissa);
+        for _ in 0..exponent {
+            value = value.checked_mul(Decimal::TEN).ok_or_else(|| {
+                anyhow::anyhow!("decimal overflow for mantissa {mantissa}, exponent {exponent}")
+            })?;
+        }
+
+        Ok(value)
+    } else {
+        let scale = u32::from(exponent.unsigned_abs());
+        Decimal::try_new(mantissa, scale).map_err(|e| {
+            anyhow::anyhow!("invalid decimal for mantissa {mantissa}, exponent {exponent}: {e}")
+        })
+    }
+}
+
+/// Builds an account balance from free and locked decimals.
+///
+/// # Errors
+///
+/// Returns an error if `free + locked` overflows, or if the total, locked, or derived free amount
+/// cannot be represented as [`Money`] for `currency`.
+pub(crate) fn account_balance_from_free_locked(
+    asset: &str,
+    free: Decimal,
+    locked: Decimal,
+    currency: Currency,
+) -> anyhow::Result<AccountBalance> {
+    let total = free
+        .checked_add(locked)
+        .ok_or_else(|| anyhow::anyhow!("decimal overflow adding free and locked for {asset}"))?;
+    AccountBalance::from_total_and_locked(total, locked, currency)
+        .with_context(|| format!("failed to build account balance for {asset}"))
+}
 
 /// Derives the number of significant decimal places from an SBE mantissa/exponent pair.
 ///
@@ -714,13 +744,11 @@ pub fn parse_spot_instrument_sbe(
     ts_event: UnixNanos,
     ts_init: UnixNanos,
 ) -> anyhow::Result<InstrumentAny> {
-    parse_spot_instrument_sbe_with_fees(symbol, None, None, ts_event, ts_init)
+    parse_spot_instrument_sbe_with_fees(symbol, ts_event, ts_init)
 }
 
 pub(crate) fn parse_spot_instrument_sbe_with_fees(
     symbol: &BinanceSymbolSbe,
-    maker_fee: Option<Decimal>,
-    taker_fee: Option<Decimal>,
     ts_event: UnixNanos,
     ts_init: UnixNanos,
 ) -> anyhow::Result<InstrumentAny> {
@@ -781,8 +809,6 @@ pub(crate) fn parse_spot_instrument_sbe_with_fees(
         .maybe_min_price(min_price)
         .margin_init(default_margin)
         .margin_maint(default_margin)
-        .maybe_maker_fee(maker_fee)
-        .maybe_taker_fee(taker_fee)
         .ts_event(ts_event)
         .ts_init(ts_init)
         .build()
@@ -793,8 +819,6 @@ pub(crate) fn parse_spot_instrument_sbe_with_fees(
 
 pub(crate) fn parse_spot_instrument_json_with_fees(
     symbol: &BinanceSymbolJson,
-    maker_fee: Option<Decimal>,
-    taker_fee: Option<Decimal>,
     ts_event: UnixNanos,
     ts_init: UnixNanos,
 ) -> anyhow::Result<InstrumentAny> {
@@ -914,8 +938,6 @@ pub(crate) fn parse_spot_instrument_json_with_fees(
         )?)
         .margin_init(Decimal::ONE)
         .margin_maint(Decimal::ONE)
-        .maybe_maker_fee(maker_fee)
-        .maybe_taker_fee(taker_fee)
         .ts_event(ts_event)
         .ts_init(ts_init)
         .build()
@@ -1050,7 +1072,7 @@ pub fn parse_spot_trades_sbe(
 ///
 /// # Errors
 ///
-/// Returns an error for an unknown or absent venue value.
+/// Returns an error if the venue value is unknown or absent.
 pub fn map_order_status_sbe(status: SbeOrderStatus) -> anyhow::Result<OrderStatus> {
     Ok(match status {
         SbeOrderStatus::New => OrderStatus::Accepted,
@@ -1071,13 +1093,15 @@ pub fn map_order_status_sbe(status: SbeOrderStatus) -> anyhow::Result<OrderStatu
 ///
 /// # Errors
 ///
-/// Returns an error for an unknown or absent venue value.
+/// Returns an error if the venue value is unknown or absent.
 pub fn map_order_type_sbe(order_type: SbeOrderType) -> anyhow::Result<OrderType> {
     Ok(match order_type {
         SbeOrderType::Market => OrderType::Market,
         SbeOrderType::Limit | SbeOrderType::LimitMaker => OrderType::Limit,
-        SbeOrderType::StopLoss | SbeOrderType::TakeProfit => OrderType::StopMarket,
-        SbeOrderType::StopLossLimit | SbeOrderType::TakeProfitLimit => OrderType::StopLimit,
+        SbeOrderType::StopLoss => OrderType::StopMarket,
+        SbeOrderType::StopLossLimit => OrderType::StopLimit,
+        SbeOrderType::TakeProfit => OrderType::MarketIfTouched,
+        SbeOrderType::TakeProfitLimit => OrderType::LimitIfTouched,
         SbeOrderType::NonRepresentable | SbeOrderType::NullVal => {
             anyhow::bail!("unknown Binance SBE order type")
         }
@@ -1098,7 +1122,7 @@ pub const fn map_order_side_sbe(side: SbeOrderSide) -> Option<OrderSide> {
 ///
 /// # Errors
 ///
-/// Returns an error for an unknown or absent venue value.
+/// Returns an error if the venue value is unknown or absent.
 pub fn map_time_in_force_sbe(tif: SbeTimeInForce) -> anyhow::Result<TimeInForce> {
     Ok(match tif {
         SbeTimeInForce::Gtc => TimeInForce::Gtc,
@@ -1641,10 +1665,51 @@ mod tests {
     use ustr::Ustr;
 
     use super::*;
-    use crate::common::{
-        consts::BINANCE_NAUTILUS_SPOT_BROKER_ID,
-        enums::{BinanceContractStatus, BinanceTradingStatus},
+    use crate::{
+        common::{
+            consts::BINANCE_NAUTILUS_SPOT_BROKER_ID,
+            enums::{BinanceContractStatus, BinanceTradingStatus},
+            testing::load_fixture_string,
+        },
+        spot::websocket::trading::{
+            parse::parse_spot_exec_report_to_order_status, user_data::BinanceSpotExecutionReport,
+        },
     };
+
+    #[rstest]
+    #[case(SbeOrderType::TakeProfit, "TAKE_PROFIT", OrderType::MarketIfTouched)]
+    #[case(
+        SbeOrderType::TakeProfitLimit,
+        "TAKE_PROFIT_LIMIT",
+        OrderType::LimitIfTouched
+    )]
+    #[case(SbeOrderType::StopLoss, "STOP_LOSS", OrderType::StopMarket)]
+    #[case(SbeOrderType::StopLossLimit, "STOP_LOSS_LIMIT", OrderType::StopLimit)]
+    fn test_sbe_order_type_matches_json_report(
+        #[case] sbe_order_type: SbeOrderType,
+        #[case] json_order_type: &str,
+        #[case] expected: OrderType,
+    ) {
+        let json = load_fixture_string("spot/user_data_json/execution_report_new.json");
+        let mut msg: BinanceSpotExecutionReport = serde_json::from_str(&json).unwrap();
+        msg.order_type = json_order_type.to_string();
+        let report = parse_spot_exec_report_to_order_status(
+            &msg,
+            InstrumentId::from("ETHUSDT.BINANCE"),
+            2,
+            5,
+            sample_account_id(),
+            false,
+            UnixNanos::default(),
+        )
+        .unwrap();
+
+        assert_eq!(report.order_type, expected);
+        assert_eq!(
+            map_order_type_sbe(sbe_order_type).unwrap(),
+            report.order_type
+        );
+    }
 
     #[rstest]
     fn test_sbe_order_mappings_reject_unknown_values() {
@@ -1959,26 +2024,13 @@ mod tests {
         let symbol: BinanceSymbolJson = serde_json::from_str(json).unwrap();
         let ts_event = UnixNanos::from(123u64);
         let ts_init = UnixNanos::from(456u64);
-        let maker = Some(dec!(0.00013));
-        let taker = Some(dec!(0.00027));
-        let sbe = parse_spot_instrument_sbe_with_fees(
-            &decoded.symbols[0],
-            maker,
-            taker,
-            ts_event,
-            ts_init,
-        )
-        .unwrap();
-        let json =
-            parse_spot_instrument_json_with_fees(&symbol, maker, taker, ts_event, ts_init).unwrap();
-        let InstrumentAny::CurrencyPair(mut expected) = parse_spot_instrument_sbe_with_fees(
-            &sample_spot_symbol_sbe(),
-            maker,
-            taker,
-            ts_event,
-            ts_init,
-        )
-        .unwrap() else {
+        let sbe =
+            parse_spot_instrument_sbe_with_fees(&decoded.symbols[0], ts_event, ts_init).unwrap();
+        let json = parse_spot_instrument_json_with_fees(&symbol, ts_event, ts_init).unwrap();
+        let InstrumentAny::CurrencyPair(mut expected) =
+            parse_spot_instrument_sbe_with_fees(&sample_spot_symbol_sbe(), ts_event, ts_init)
+                .unwrap()
+        else {
             panic!("Expected CurrencyPair")
         };
         let rules = decoded.symbols[0].filters.notional_filters.clone();
@@ -2041,8 +2093,6 @@ mod tests {
         let symbol = serde_json::from_value(value).unwrap();
         let result = parse_spot_instrument_json_with_fees(
             &symbol,
-            None,
-            None,
             UnixNanos::default(),
             UnixNanos::default(),
         );
@@ -2108,25 +2158,6 @@ mod tests {
             }
             other => panic!("Expected CryptoPerpetual, was {other:?}"),
         }
-    }
-
-    #[rstest]
-    fn test_parse_usdm_perpetual_populates_fees() {
-        let ts = UnixNanos::from(1_700_000_000_000_000_000u64);
-        let instrument = parse_usdm_instrument_with_fees(
-            &sample_usdm_symbol(),
-            Some(dec!(0.00016)),
-            Some(dec!(0.0004)),
-            ts,
-            ts,
-        )
-        .unwrap();
-        let InstrumentAny::CryptoPerpetual(perpetual) = instrument else {
-            panic!("expected CryptoPerpetual, was {instrument:?}");
-        };
-
-        assert_eq!(perpetual.maker_fee, dec!(0.00016));
-        assert_eq!(perpetual.taker_fee, dec!(0.0004));
     }
 
     #[rstest]
@@ -2303,28 +2334,6 @@ mod tests {
     }
 
     #[rstest]
-    fn test_parse_coinm_delivery_populates_fees() {
-        let mut symbol = sample_coinm_symbol();
-        symbol.symbol = Ustr::from("BTCUSD_260925");
-        symbol.contract_type = CONTRACT_TYPE_CURRENT_QUARTER.to_string();
-        let ts = UnixNanos::from(1_700_000_000_000_000_000u64);
-        let instrument = parse_coinm_instrument_with_fees(
-            &symbol,
-            Some(dec!(0.00014)),
-            Some(dec!(0.00035)),
-            ts,
-            ts,
-        )
-        .unwrap();
-        let InstrumentAny::CryptoFuture(future) = instrument else {
-            panic!("expected CryptoFuture, was {instrument:?}");
-        };
-
-        assert_eq!(future.maker_fee, dec!(0.00014));
-        assert_eq!(future.taker_fee, dec!(0.00035));
-    }
-
-    #[rstest]
     #[case::current_quarter(CONTRACT_TYPE_CURRENT_QUARTER)]
     #[case::next_quarter(CONTRACT_TYPE_NEXT_QUARTER)]
     fn test_parse_coinm_delivery(#[case] contract_type: &str) {
@@ -2402,25 +2411,6 @@ mod tests {
     }
 
     #[rstest]
-    fn test_parse_spot_instrument_populates_fees() {
-        let ts = UnixNanos::from(1_700_000_000_000_000_000u64);
-        let instrument = parse_spot_instrument_sbe_with_fees(
-            &sample_spot_symbol_sbe(),
-            Some(dec!(0.0008)),
-            Some(dec!(0.0011)),
-            ts,
-            ts,
-        )
-        .unwrap();
-        let InstrumentAny::CurrencyPair(pair) = instrument else {
-            panic!("expected CurrencyPair, was {instrument:?}");
-        };
-
-        assert_eq!(pair.maker_fee, dec!(0.0008));
-        assert_eq!(pair.taker_fee, dec!(0.0011));
-    }
-
-    #[rstest]
     fn test_not_trading_parse_errors_stay_debug_for_bulk_loads() {
         let mut symbol = sample_spot_symbol_sbe();
         symbol.status = 3;
@@ -2449,7 +2439,7 @@ mod tests {
             quote_asset_precision: 8,
             filters: Vec::new(),
         };
-        let json_err = parse_spot_instrument_json_with_fees(&json, None, None, ts, ts).unwrap_err();
+        let json_err = parse_spot_instrument_json_with_fees(&json, ts, ts).unwrap_err();
 
         let mut usdm = sample_usdm_symbol();
         usdm.status = BinanceTradingStatus::Halt;
@@ -2519,7 +2509,16 @@ mod tests {
     }
 
     #[rstest]
-    fn test_parse_order_status_report_sbe() {
+    #[case(SbeOrderType::LimitMaker, OrderType::Limit, None)]
+    #[case(SbeOrderType::TakeProfit, OrderType::MarketIfTouched, Some(12_000))]
+    #[case(SbeOrderType::TakeProfitLimit, OrderType::LimitIfTouched, Some(12_000))]
+    #[case(SbeOrderType::StopLoss, OrderType::StopMarket, Some(12_000))]
+    #[case(SbeOrderType::StopLossLimit, OrderType::StopLimit, Some(12_000))]
+    fn test_parse_order_status_report_sbe(
+        #[case] order_type: SbeOrderType,
+        #[case] expected: OrderType,
+        #[case] stop_price_mantissa: Option<i64>,
+    ) {
         let instrument = sample_spot_instrument();
         let order = BinanceOrderResponse {
             price_exponent: -2,
@@ -2532,9 +2531,9 @@ mod tests {
             cummulative_quote_qty_mantissa: 123_450_000,
             status: SbeOrderStatus::PartiallyFilled,
             time_in_force: SbeTimeInForce::Gtc,
-            order_type: SbeOrderType::LimitMaker,
+            order_type,
             side: SbeOrderSide::Buy,
-            stop_price_mantissa: None,
+            stop_price_mantissa,
             iceberg_qty_mantissa: None,
             time: 1_700_000_000_000_000,
             update_time: 1_700_000_000_100_000,
@@ -2566,14 +2565,22 @@ mod tests {
         );
         assert_eq!(report.venue_order_id, VenueOrderId::new("42"));
         assert_eq!(report.order_side, OrderSide::Buy.into());
-        assert_eq!(report.order_type, OrderType::Limit);
+        assert_eq!(report.order_type, expected);
         assert_eq!(report.order_status, OrderStatus::PartiallyFilled);
         assert_eq!(report.quantity.as_f64(), 2.5);
         assert_eq!(report.filled_qty.as_f64(), 1.0);
         assert_eq!(report.order_list_id, Some(OrderListId::new("77")));
         assert_eq!(report.price, Some(Price::new(123.45, 2)));
         assert_eq!(report.avg_px.unwrap().to_string(), "123.45");
-        assert!(report.post_only);
+        assert_eq!(report.post_only, order_type == SbeOrderType::LimitMaker);
+        assert_eq!(
+            report.trigger_price,
+            stop_price_mantissa.map(|_| Price::from("120.00"))
+        );
+        assert_eq!(
+            report.trigger_type,
+            stop_price_mantissa.map(|_| TriggerType::LastPrice)
+        );
         assert_eq!(
             report.ts_accepted,
             UnixNanos::from(1_700_000_000_000_000_000u64)
@@ -2586,7 +2593,14 @@ mod tests {
     }
 
     #[rstest]
-    fn test_parse_new_order_response_sbe() {
+    #[case(SbeOrderType::TakeProfit, OrderType::MarketIfTouched)]
+    #[case(SbeOrderType::TakeProfitLimit, OrderType::LimitIfTouched)]
+    #[case(SbeOrderType::StopLoss, OrderType::StopMarket)]
+    #[case(SbeOrderType::StopLossLimit, OrderType::StopLimit)]
+    fn test_parse_new_order_response_sbe(
+        #[case] order_type: SbeOrderType,
+        #[case] expected: OrderType,
+    ) {
         let instrument = sample_spot_instrument();
         let response = BinanceNewOrderResponse {
             price_exponent: -2,
@@ -2600,7 +2614,7 @@ mod tests {
             cummulative_quote_qty_mantissa: 60_500_000,
             status: SbeOrderStatus::New,
             time_in_force: SbeTimeInForce::Gtc,
-            order_type: SbeOrderType::StopLossLimit,
+            order_type,
             side: SbeOrderSide::Sell,
             stop_price_mantissa: Some(12_000),
             working_time: Some(1_700_000_000_000_000),
@@ -2630,7 +2644,7 @@ mod tests {
         );
         assert_eq!(report.venue_order_id, VenueOrderId::new("99"));
         assert_eq!(report.order_side, OrderSide::Sell.into());
-        assert_eq!(report.order_type, OrderType::StopLimit);
+        assert_eq!(report.order_type, expected);
         assert_eq!(report.order_status, OrderStatus::Accepted);
         assert_eq!(report.quantity.as_f64(), 2.0);
         assert_eq!(report.filled_qty.as_f64(), 0.5);

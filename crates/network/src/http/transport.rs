@@ -18,6 +18,7 @@
 use std::{
     error::Error,
     future::Future,
+    path::Path,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -26,7 +27,7 @@ use std::{
 
 use bytes::Bytes;
 use http::{
-    Request, Response,
+    HeaderValue, Request, Response,
     header::{AUTHORIZATION, COOKIE, PROXY_AUTHORIZATION, REFERER, WWW_AUTHENTICATE},
 };
 use http_body_util::Full;
@@ -36,6 +37,7 @@ use hyper_util::{
     client::{legacy::Client as HyperClient, proxy::matcher::Matcher},
     rt::{TokioExecutor, TokioTimer},
 };
+use parking_lot::Mutex;
 use tower_http::follow_redirect::{
     FollowRedirect,
     policy::{Action, Attempt, Policy},
@@ -44,6 +46,7 @@ use tower_service::Service;
 use url::Url;
 
 use super::{HttpClientError, HttpRedirectPolicy, connector::Connector, error::transport_error};
+use crate::tls::create_tls_config_from_certs_dir;
 
 #[derive(Clone, Debug)]
 pub(super) struct Client {
@@ -55,23 +58,31 @@ impl Client {
     pub(super) fn new(
         proxy: Option<&str>,
         use_system_proxy: bool,
+        certs_dir: Option<&str>,
+        user_agent: Option<HeaderValue>,
         settings: Settings,
     ) -> Result<Self, HttpClientError> {
-        let provider = rustls::crypto::CryptoProvider::get_default()
-            .cloned()
-            .ok_or_else(|| {
-                HttpClientError::ClientBuildError("TLS provider is unavailable".into())
-            })?;
-        let verifier = rustls_platform_verifier::Verifier::new(provider.clone())
-            .map_err(|e| HttpClientError::ClientBuildError(e.to_string()))?;
-        let mut tls = rustls::ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .map_err(|e| HttpClientError::ClientBuildError(e.to_string()))?
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(verifier))
-            .with_no_client_auth();
-        let connector = Connector::new(tls.clone(), proxy, use_system_proxy)?;
-        let proxies = connector.proxies.clone();
+        let mut tls = if let Some(dir) = certs_dir {
+            create_tls_config_from_certs_dir(Path::new(dir), true)
+                .map_err(|e| HttpClientError::ClientBuildError(format!("{e:#}")))?
+        } else {
+            let provider = rustls::crypto::CryptoProvider::get_default()
+                .cloned()
+                .ok_or_else(|| {
+                    HttpClientError::ClientBuildError("TLS provider is unavailable".into())
+                })?;
+
+            let verifier = platform_verifier(&provider)?;
+            rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .map_err(|e| HttpClientError::ClientBuildError(e.to_string()))?
+                .dangerous()
+                .with_custom_certificate_verifier(verifier)
+                .with_no_client_auth()
+        };
+
+        let connector = Connector::new(tls.clone(), proxy, use_system_proxy, user_agent)?;
+        let proxies = Arc::clone(&connector.proxies);
         tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         let connector = HttpsConnector::from((connector, tls));
 
@@ -82,6 +93,9 @@ impl Client {
             .pool_idle_timeout(settings.pool_idle_timeout)
             .http2_keep_alive_interval(settings.keep_alive_interval)
             .http2_keep_alive_while_idle(settings.keep_alive_interval.is_some())
+            .http2_initial_stream_window_size(settings.stream_window)
+            .http2_initial_connection_window_size(settings.connection_window)
+            // Keep after the window sizes: setting a window size turns adaptive windows off
             .http2_adaptive_window(settings.adaptive_window)
             .build(connector);
         Ok(Self { client, proxies })
@@ -89,24 +103,15 @@ impl Client {
 
     pub(super) async fn send(
         &self,
-        mut request: Request<Full<Bytes>>,
+        request: Request<Full<Bytes>>,
         redirects: HttpRedirectPolicy,
     ) -> Result<Response<Incoming>, HttpClientError> {
-        if request.uri().scheme_str() == Some("http")
-            && !request.headers().contains_key(PROXY_AUTHORIZATION)
-            && let Some(proxy) = self.proxies.intercept(request.uri())
-            && let Some(auth) = proxy.basic_auth()
-        {
-            request
-                .headers_mut()
-                .insert(PROXY_AUTHORIZATION, auth.clone());
-        }
-
         let policy = Redirects {
             policy: redirects,
             count: 0,
             previous: None,
         };
+
         FollowRedirect::with_policy(self.clone(), policy)
             .preserve_extensions(false)
             .call(request)
@@ -123,7 +128,17 @@ impl Service<Request<Full<Bytes>>> for Client {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, request: Request<Full<Bytes>>) -> Self::Future {
+    fn call(&mut self, mut request: Request<Full<Bytes>>) -> Self::Future {
+        if request.uri().scheme_str() == Some("http")
+            && !request.headers().contains_key(PROXY_AUTHORIZATION)
+            && let Some(proxy) = self.proxies.intercept(request.uri())
+            && let Some(auth) = proxy.basic_auth()
+        {
+            request
+                .headers_mut()
+                .insert(PROXY_AUTHORIZATION, auth.clone());
+        }
+
         let client = self.client.clone();
         Box::pin(async move {
             let mut retries = 0;
@@ -144,18 +159,9 @@ pub(super) struct Settings {
     pub(super) pool_max_idle_per_host: usize,
     pub(super) pool_idle_timeout: Duration,
     pub(super) keep_alive_interval: Option<Duration>,
+    pub(super) stream_window: Option<u32>,
+    pub(super) connection_window: Option<u32>,
     pub(super) adaptive_window: bool,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            pool_max_idle_per_host: usize::MAX,
-            pool_idle_timeout: Duration::from_secs(90),
-            keep_alive_interval: None,
-            adaptive_window: false,
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -190,31 +196,56 @@ impl Policy<Full<Bytes>, HttpClientError> for Redirects {
         let Some(previous) = &self.previous else {
             return;
         };
+
         let Ok(next) = Url::parse(&request.uri().to_string()) else {
             return;
         };
 
         if previous.origin() != next.origin() {
-            for name in [AUTHORIZATION, COOKIE, PROXY_AUTHORIZATION, WWW_AUTHENTICATE] {
+            for name in [
+                AUTHORIZATION,
+                COOKIE,
+                PROXY_AUTHORIZATION,
+                REFERER,
+                WWW_AUTHENTICATE,
+            ] {
                 request.headers_mut().remove(name);
             }
+
             request.headers_mut().remove("cookie2");
+            return;
         }
 
-        if !(previous.scheme() == "https" && next.scheme() == "http") {
-            let mut referer = previous.clone();
-            let _ = referer.set_username("");
-            let _ = referer.set_password(None);
-            referer.set_fragment(None);
-            if let Ok(value) = referer.as_str().parse() {
-                request.headers_mut().insert(REFERER, value);
-            }
+        let mut referer = previous.clone();
+        let _ = referer.set_username("");
+        let _ = referer.set_password(None);
+        referer.set_fragment(None);
+        if let Ok(value) = referer.as_str().parse() {
+            request.headers_mut().insert(REFERER, value);
         }
     }
 
     fn clone_body(&self, body: &Full<Bytes>) -> Option<Full<Bytes>> {
         Some(body.clone())
     }
+}
+
+// Each `Verifier::new` reloads the platform roots, which on Linux reads the CA bundle from disk,
+// so concurrent first builds share one load under the lock, and a failed load is not cached.
+fn platform_verifier(
+    provider: &Arc<rustls::crypto::CryptoProvider>,
+) -> Result<Arc<rustls_platform_verifier::Verifier>, HttpClientError> {
+    static VERIFIER: Mutex<Option<Arc<rustls_platform_verifier::Verifier>>> = Mutex::new(None);
+
+    let mut cached = VERIFIER.lock();
+
+    if let Some(verifier) = &*cached {
+        return Ok(Arc::clone(verifier));
+    }
+
+    let verifier = rustls_platform_verifier::Verifier::new(Arc::clone(provider))
+        .map_err(|e| HttpClientError::ClientBuildError(e.to_string()))?;
+    Ok(Arc::clone(cached.insert(Arc::new(verifier))))
 }
 
 fn retryable(e: &(dyn Error + 'static)) -> bool {
@@ -225,7 +256,41 @@ fn retryable(e: &(dyn Error + 'static)) -> bool {
                 && ((e.is_go_away() && e.reason() == Some(h2::Reason::NO_ERROR))
                     || (e.is_reset() && e.reason() == Some(h2::Reason::REFUSED_STREAM)));
         }
+
         cause = e.source();
     }
+
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    #[case::upgrade("http://example.com", "https://example.com")]
+    #[case::downgrade("https://example.com", "http://example.com")]
+    #[case::host("https://source.example", "https://destination.example")]
+    fn redirect_removes_referer_across_origins(#[case] previous: &str, #[case] next: &str) {
+        let previous = format!("{previous}/start?signature=SECRET");
+        let previous = Url::parse(&previous).unwrap();
+
+        let mut policy = Redirects {
+            policy: HttpRedirectPolicy::Follow,
+            count: 1,
+            previous: Some(previous),
+        };
+
+        let mut request = Request::builder()
+            .uri(format!("{next}/next"))
+            .header(REFERER, "https://private.example/signed?token=PRIOR_SECRET")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        policy.on_request(&mut request);
+
+        assert_eq!(request.headers().get(REFERER), None);
+    }
 }

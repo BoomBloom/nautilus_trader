@@ -22,7 +22,7 @@
 //!   [`DecodeDataFromRecordBatch`] for Parquet-backed custom data decoded at runtime by type name.
 //!   Types must be registered via [`ensure_custom_data_registered::<T>()`] before use.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use arrow::{
     array::{
@@ -106,11 +106,14 @@ where
             })
             .collect();
         let typed = typed?;
-        let metadata = typed
-            .first()
-            .map(EncodeToRecordBatch::metadata)
-            .unwrap_or_default();
-        EncodeToRecordBatch::encode_batch(&metadata, &typed).map_err(|e| anyhow::anyhow!("{e}"))
+
+        let metadata = if typed.is_empty() {
+            HashMap::new()
+        } else {
+            T::chunk_metadata(&typed)
+        };
+
+        T::encode_batch(&metadata, &typed).map_err(|e| anyhow::anyhow!("{e}"))
     });
 
     let decoder: ArrowDecoder = Box::new(|metadata, batch| {
@@ -349,7 +352,7 @@ fn strip_data_type_column(
         .iter()
         .enumerate()
         .filter(|(i, _)| *i != data_type_col_idx)
-        .map(|(_, f)| f.clone())
+        .map(|(_, f)| Arc::clone(f))
         .collect();
     let new_columns: Vec<Arc<dyn arrow::array::Array>> = batch
         .columns()
@@ -371,8 +374,8 @@ impl CustomDataDecoder {
     ///
     /// # Errors
     ///
-    /// Returns an `EncodingError` if the type is unregistered, decoding fails, or a registered
-    /// decoder yields a non-custom row.
+    /// Returns an error if the type is unregistered, decoding fails, or a registered decoder yields
+    /// a non-custom row.
     pub fn decode_custom_batch(
         metadata: &std::collections::HashMap<String, String>,
         record_batch: &RecordBatch,

@@ -22,26 +22,39 @@
 use std::sync::Arc;
 
 use ahash::AHashSet;
+use async_trait::async_trait;
 use datafusion::{
     arrow::{
         array::{
             Array, ArrayRef, BinaryViewArray, FixedSizeBinaryBuilder, FixedSizeListArray,
-            ListArray, StringArray, StringViewArray, new_empty_array, new_null_array,
+            ListArray, StringArray, StringViewArray, UInt32Array, new_empty_array, new_null_array,
         },
         buffer::{OffsetBuffer, ScalarBuffer},
-        compute::{cast, concat},
-        datatypes::{DataType, Field, Schema},
+        compute::{cast, concat, take_record_batch},
+        datatypes::{DataType, Schema, SchemaRef},
+        error::ArrowError,
         record_batch::RecordBatch,
     },
-    catalog::TableProvider,
+    catalog::{Session, TableProvider},
+    common::{Statistics, stats::Precision},
+    datasource::{
+        file_format::{
+            FileFormat, FileMeta, file_compression_type::FileCompressionType, options::ReadOptions,
+        },
+        listing::{ListingTable, ListingTableConfig, ListingTableUrl},
+        physical_plan::{FileScanConfig, FileSource},
+        table_schema::TableSchema,
+    },
     error::{DataFusionError, Result},
-    physical_plan::{EmptyRecordBatchStream, SendableRecordBatchStream},
+    physical_expr::LexOrdering,
+    physical_plan::{EmptyRecordBatchStream, ExecutionPlan, SendableRecordBatchStream},
     prelude::*,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use nautilus_common::live::{block_on_nautilus_with, get_runtime};
 use nautilus_core::UnixNanos;
-use object_store::ObjectStore;
+use nautilus_serialization::arrow::{KEY_IDENTIFIER, StringColumnRef};
+use object_store::{ObjectMeta, ObjectStore};
 use tokio::{
     sync::mpsc::{self, Receiver},
     task::JoinHandle,
@@ -71,6 +84,7 @@ impl<T> BlockingBatchStream<T> {
 
         let task = runtime.spawn(async move {
             futures::pin_mut!(stream);
+
             while let Some(item) = stream.next().await {
                 if sender.send(item).await.is_err() {
                     break;
@@ -109,11 +123,13 @@ impl DataBackendSession {
     /// Creates a new [`DataBackendSession`] instance.
     #[must_use]
     pub fn new(chunk_size: usize) -> Self {
+        let runtime = get_runtime().handle().clone();
         let session_ctx = SessionContext::new_with_config(session_config());
+
         Self {
-            session_ctx,
             chunk_size,
-            runtime: get_runtime().handle().clone(),
+            runtime,
+            session_ctx,
             registered_tables: AHashSet::new(),
         }
     }
@@ -123,7 +139,7 @@ impl DataBackendSession {
         self.session_ctx.register_object_store(url, object_store);
     }
 
-    /// Registers an OpenDAL-backed storage backend with the session context.
+    /// Registers a storage backend's object store with the session context.
     ///
     /// External catalog implementations can call this before adding native table providers or
     /// object-store-relative file paths to the session.
@@ -170,6 +186,7 @@ impl DataBackendSession {
         if batches.is_empty() {
             batches.push(RecordBatch::new_empty(schema));
         }
+
         Ok(batches)
     }
 
@@ -189,25 +206,63 @@ impl DataBackendSession {
         Ok(self.execute_registered(table_name, sql_query)?)
     }
 
+    // Returns `false` without registering when the files' schemas cannot merge, such as files
+    // written at different precisions.
+    pub(crate) fn try_register_parquet_files_table(
+        &mut self,
+        table_name: &str,
+        file_paths: Vec<String>,
+    ) -> anyhow::Result<bool> {
+        match self.register_parquet_files_table(table_name, file_paths) {
+            Err(e) if is_schema_merge_error(&e) => Ok(false),
+            result => result.map(|()| true),
+        }
+    }
+
     fn register_parquet_files_table(
         &mut self,
         table_name: &str,
         file_paths: Vec<String>,
     ) -> anyhow::Result<()> {
-        if !self.registered_tables.contains(table_name) {
-            let parquet_options = ParquetReadOptions::<'_> {
-                skip_metadata: Some(false),
-                ..Default::default()
-            };
-            let dataframe = block_on_nautilus_with(|| {
-                self.session_ctx.read_parquet(file_paths, parquet_options)
-            })?;
-            validate_catalog_schema(dataframe.schema().as_arrow())?;
-            self.session_ctx
-                .register_table(table_name, dataframe.into_view())?;
-            self.registered_tables.insert(table_name.to_string());
+        if self.registered_tables.contains(table_name) {
+            return Ok(());
         }
 
+        // Catalog files are written in ascending ts_init order, declaring it lets files without
+        // sorting metadata skip a sort that can reorder rows with equal ts_init.
+        let parquet_options = ParquetReadOptions::<'_> {
+            skip_metadata: Some(false),
+            file_sort_order: vec![vec![col("ts_init").sort(true, false)]],
+            ..Default::default()
+        };
+
+        let mut listing_options = parquet_options.to_listing_options(
+            &self.session_ctx.copied_config(),
+            self.session_ctx.copied_table_options(),
+        );
+        listing_options.format = Arc::new(CatalogParquetFormat(listing_options.format));
+        let table_paths = file_paths
+            .into_iter()
+            .map(ListingTableUrl::parse)
+            .collect::<Result<Vec<_>>>()?;
+        let state = self.session_ctx.state();
+        let config = block_on_nautilus_with(|| {
+            ListingTableConfig::new_with_multi_paths(table_paths)
+                .with_listing_options(listing_options)
+                .infer_schema(&state)
+        })?;
+        let table = ListingTable::try_new(config)?.with_cache(
+            self.session_ctx
+                .runtime_env()
+                .cache_manager
+                .get_file_statistic_cache(),
+        );
+        let dataframe = self.session_ctx.read_table(Arc::new(table))?;
+
+        validate_catalog_schema(dataframe.schema().as_arrow())?;
+        self.session_ctx
+            .register_table(table_name, dataframe.into_view())?;
+        self.registered_tables.insert(table_name.to_string());
         Ok(())
     }
 
@@ -234,10 +289,118 @@ impl DataBackendSession {
     }
 }
 
-fn session_config() -> SessionConfig {
+fn is_schema_merge_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<ArrowError>(),
+            Some(ArrowError::SchemaError(_))
+        )
+    })
+}
+
+pub(crate) fn session_config() -> SessionConfig {
     SessionConfig::new()
         .set_str("datafusion.optimizer.repartition_file_scans", "false")
+        // Repartitioning filtered batches can reorder rows with equal ts_init
+        .set_str(
+            "datafusion.optimizer.enable_round_robin_repartition",
+            "false",
+        )
         .set_str("datafusion.optimizer.prefer_existing_sort", "true")
+}
+
+// Parquet format whose file statistics omit float bounds. Parquet float statistics skip NaN, so a
+// column holding NaN and one other value reports equal bounds, and DataFusion then reads that value
+// for every row (apache/datafusion#26490). The other bounds stay, so DataFusion can still prove the
+// files of one scan group are ordered by `ts_init` and stream them without sorting.
+#[derive(Debug)]
+struct CatalogParquetFormat(Arc<dyn FileFormat>);
+
+#[async_trait]
+impl FileFormat for CatalogParquetFormat {
+    fn get_ext(&self) -> String {
+        self.0.get_ext()
+    }
+
+    fn get_ext_with_compression(&self, compression: &FileCompressionType) -> Result<String> {
+        self.0.get_ext_with_compression(compression)
+    }
+
+    fn compression_type(&self) -> Option<FileCompressionType> {
+        self.0.compression_type()
+    }
+
+    async fn infer_schema(
+        &self,
+        state: &dyn Session,
+        store: &Arc<dyn ObjectStore>,
+        objects: &[ObjectMeta],
+    ) -> Result<SchemaRef> {
+        self.0.infer_schema(state, store, objects).await
+    }
+
+    async fn infer_stats(
+        &self,
+        state: &dyn Session,
+        store: &Arc<dyn ObjectStore>,
+        table_schema: SchemaRef,
+        object: &ObjectMeta,
+    ) -> Result<Statistics> {
+        let statistics = self
+            .0
+            .infer_stats(state, store, Arc::clone(&table_schema), object)
+            .await?;
+        Ok(statistics_without_float_bounds(statistics, &table_schema))
+    }
+
+    async fn infer_ordering(
+        &self,
+        state: &dyn Session,
+        store: &Arc<dyn ObjectStore>,
+        table_schema: SchemaRef,
+        object: &ObjectMeta,
+    ) -> Result<Option<LexOrdering>> {
+        self.0
+            .infer_ordering(state, store, table_schema, object)
+            .await
+    }
+
+    async fn infer_stats_and_ordering(
+        &self,
+        state: &dyn Session,
+        store: &Arc<dyn ObjectStore>,
+        table_schema: SchemaRef,
+        object: &ObjectMeta,
+    ) -> Result<FileMeta> {
+        let meta = self
+            .0
+            .infer_stats_and_ordering(state, store, Arc::clone(&table_schema), object)
+            .await?;
+        let statistics = statistics_without_float_bounds(meta.statistics, &table_schema);
+        Ok(FileMeta::new(statistics).with_ordering(meta.ordering))
+    }
+
+    async fn create_physical_plan(
+        &self,
+        state: &dyn Session,
+        conf: FileScanConfig,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.0.create_physical_plan(state, conf).await
+    }
+
+    fn file_source(&self, table_schema: TableSchema) -> Arc<dyn FileSource> {
+        self.0.file_source(table_schema)
+    }
+}
+
+fn statistics_without_float_bounds(mut statistics: Statistics, schema: &Schema) -> Statistics {
+    for (column, field) in statistics.column_statistics.iter_mut().zip(schema.fields()) {
+        if field.data_type().is_floating() {
+            column.min_value = Precision::Absent;
+            column.max_value = Precision::Absent;
+        }
+    }
+    statistics
 }
 
 pub(crate) fn cast_record_batch_to_schema(
@@ -254,25 +417,14 @@ pub(crate) fn cast_record_batch_to_schema(
             .unwrap_or(batch_field.as_ref());
 
         fields.push(Arc::new(field.clone()));
-        columns.push(cast_column_to_field(column, field)?);
+        columns.push(cast_column_to_data_type(column, field.data_type())?);
     }
 
     let schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
     Ok(RecordBatch::try_new(schema, columns)?)
 }
 
-fn cast_column_to_field(column: &ArrayRef, field: &Field) -> Result<ArrayRef> {
-    cast_column_to_data_type(column, field.data_type())
-}
-
-#[expect(
-    clippy::too_many_lines,
-    reason = "the function keeps recursive Arrow cast rules in one exhaustive type dispatcher"
-)]
-pub(crate) fn cast_column_to_data_type(
-    column: &ArrayRef,
-    data_type: &DataType,
-) -> Result<ArrayRef> {
+fn cast_column_to_data_type(column: &ArrayRef, data_type: &DataType) -> Result<ArrayRef> {
     if column.data_type() == data_type {
         return Ok(column.clone());
     }
@@ -292,6 +444,7 @@ pub(crate) fn cast_column_to_data_type(
                 builder.append_value(array.value(row))?;
             }
         }
+
         return Ok(Arc::new(builder.finish()));
     }
 
@@ -302,9 +455,11 @@ pub(crate) fn cast_column_to_data_type(
             .as_any()
             .downcast_ref::<FixedSizeListArray>()
             .expect("FixedSizeList column should downcast to FixedSizeListArray");
+
         let size = usize::try_from(*size).map_err(|e| {
             DataFusionError::Execution(format!("Invalid fixed-size list length {size}: {e}"))
         })?;
+
         let mut parts = Vec::with_capacity(array.len());
         let mut offsets = Vec::with_capacity(array.len() + 1);
         offsets.push(0_i32);
@@ -314,6 +469,7 @@ pub(crate) fn cast_column_to_data_type(
                 let value = array.value(row);
                 parts.push(cast_column_to_data_type(&value, field.data_type())?);
             }
+
             let offset = parts
                 .len()
                 .checked_mul(size)
@@ -323,17 +479,11 @@ pub(crate) fn cast_column_to_data_type(
                         "List offset exceeds the supported i32 range".to_string(),
                     )
                 })?;
+
             offsets.push(offset);
         }
-        let values = if parts.is_empty() {
-            new_empty_array(field.data_type())
-        } else {
-            let parts = parts
-                .iter()
-                .map(std::convert::AsRef::as_ref)
-                .collect::<Vec<_>>();
-            concat(&parts)?
-        };
+
+        let values = concat_list_values(&parts, field.data_type())?;
         let offsets = OffsetBuffer::new(ScalarBuffer::from(offsets));
         return Ok(Arc::new(ListArray::try_new(
             field.clone(),
@@ -350,15 +500,18 @@ pub(crate) fn cast_column_to_data_type(
             .as_any()
             .downcast_ref::<ListArray>()
             .expect("List column should downcast to ListArray");
+
         let size_usize = usize::try_from(*size).map_err(|e| {
             DataFusionError::Execution(format!("Invalid fixed-size list length {size}: {e}"))
         })?;
+
         let mut parts = Vec::with_capacity(array.len());
         for row in 0..array.len() {
             if array.is_null(row) {
                 parts.push(new_null_array(field.data_type(), size_usize));
                 continue;
             }
+
             let value = array.value(row);
             if value.len() != size_usize {
                 return Err(DataFusionError::Execution(format!(
@@ -366,17 +519,11 @@ pub(crate) fn cast_column_to_data_type(
                     value.len(),
                 )));
             }
+
             parts.push(cast_column_to_data_type(&value, field.data_type())?);
         }
-        let values = if parts.is_empty() {
-            new_empty_array(field.data_type())
-        } else {
-            let parts = parts
-                .iter()
-                .map(std::convert::AsRef::as_ref)
-                .collect::<Vec<_>>();
-            concat(&parts)?
-        };
+
+        let values = concat_list_values(&parts, field.data_type())?;
         return Ok(Arc::new(FixedSizeListArray::try_new(
             field.clone(),
             *size,
@@ -388,6 +535,15 @@ pub(crate) fn cast_column_to_data_type(
     Ok(cast(column, data_type)?)
 }
 
+fn concat_list_values(parts: &[ArrayRef], data_type: &DataType) -> Result<ArrayRef> {
+    if parts.is_empty() {
+        return Ok(new_empty_array(data_type));
+    }
+
+    let parts = parts.iter().map(AsRef::as_ref).collect::<Vec<_>>();
+    Ok(concat(&parts)?)
+}
+
 #[must_use]
 pub fn build_query(
     table: &str,
@@ -395,16 +551,8 @@ pub fn build_query(
     end: Option<UnixNanos>,
     where_clause: Option<&str>,
 ) -> String {
-    let conditions = query_conditions(start, end, where_clause);
-    let mut query = format!("SELECT * FROM {table}");
-
-    if !conditions.is_empty() {
-        query.push_str(" WHERE ");
-        query.push_str(&conditions.join(" AND "));
-    }
-
-    query.push_str(" ORDER BY ts_init");
-    query
+    let filter = where_sql(start, end, where_clause);
+    format!("SELECT * FROM {table}{filter} ORDER BY ts_init")
 }
 
 #[must_use]
@@ -414,23 +562,15 @@ pub fn build_identifier_query(
     end: Option<UnixNanos>,
     where_clause: Option<&str>,
 ) -> String {
-    let conditions = query_conditions(start, end, where_clause);
-    let mut query = format!("SELECT DISTINCT identifier FROM {table}");
-
-    if !conditions.is_empty() {
-        query.push_str(" WHERE ");
-        query.push_str(&conditions.join(" AND "));
-    }
-
-    query.push_str(" ORDER BY identifier");
-    query
+    let filter = where_sql(start, end, where_clause);
+    format!("SELECT DISTINCT identifier FROM {table}{filter} ORDER BY identifier")
 }
 
-fn query_conditions(
+fn where_sql(
     start: Option<UnixNanos>,
     end: Option<UnixNanos>,
     where_clause: Option<&str>,
-) -> Vec<String> {
+) -> String {
     let mut conditions = Vec::new();
 
     if let Some(clause) = where_clause {
@@ -447,7 +587,11 @@ fn query_conditions(
         conditions.push(format!("CAST(ts_init AS BIGINT) <= {end_ts}"));
     }
 
-    conditions
+    if conditions.is_empty() {
+        return String::new();
+    }
+
+    format!(" WHERE {}", conditions.join(" AND "))
 }
 
 pub fn identifiers_from_record_batches(batches: &[RecordBatch]) -> anyhow::Result<Vec<String>> {
@@ -465,6 +609,7 @@ pub fn identifiers_from_record_batches(batches: &[RecordBatch]) -> anyhow::Resul
                     identifiers.insert(array.value(row).to_string());
                 }
             }
+
             continue;
         }
 
@@ -474,6 +619,7 @@ pub fn identifiers_from_record_batches(batches: &[RecordBatch]) -> anyhow::Resul
                     identifiers.insert(array.value(row).to_string());
                 }
             }
+
             continue;
         }
 
@@ -485,102 +631,75 @@ pub fn identifiers_from_record_batches(batches: &[RecordBatch]) -> anyhow::Resul
     Ok(identifiers)
 }
 
+/// Keeps the rows whose catalog identifier satisfies `matches`.
+///
+/// Each row's identifier comes from the `identifier` column, or `fallback_identifier` when the
+/// batch has no such column or the row value is null. Returns `None` when no row matches.
+pub(crate) fn filter_record_batch_by_identifier(
+    batch: &RecordBatch,
+    fallback_identifier: Option<&str>,
+    matches: impl Fn(Option<&str>) -> bool,
+) -> anyhow::Result<Option<RecordBatch>> {
+    let Some(column) = batch.column_by_name(KEY_IDENTIFIER) else {
+        return Ok(matches(fallback_identifier).then(|| batch.clone()));
+    };
+
+    let identifiers = StringColumnRef::try_from_array(column.as_ref())
+        .ok_or_else(|| anyhow::anyhow!("Identifier column must be an Arrow string type"))?;
+
+    let indices = (0..batch.num_rows())
+        .filter_map(|row| {
+            let identifier = (!identifiers.is_null(row))
+                .then(|| identifiers.value(row))
+                .or(fallback_identifier);
+            matches(identifier).then(|| u32::try_from(row))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if indices.is_empty() {
+        return Ok(None);
+    }
+
+    if indices.len() == batch.num_rows() {
+        return Ok(Some(batch.clone()));
+    }
+
+    take_record_batch(batch, &UInt32Array::from(indices))
+        .map(Some)
+        .map_err(|e| anyhow::anyhow!("Failed to filter catalog batch by identifier: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
+        fs::File,
+        ops::Range,
+        path::Path,
         sync::{Arc, mpsc},
         time::Duration,
     };
 
-    use nautilus_common::live::get_runtime;
-    use nautilus_model::{
-        data::{DataBatch, QuoteTick},
-        identifiers::InstrumentId,
-        types::{Price, Quantity},
+    use datafusion::{
+        arrow::{
+            array::{AsArray, BooleanArray, Decimal128Array, FixedSizeBinaryArray, UInt32Array},
+            buffer::NullBuffer,
+            compute::{concat_batches, filter_record_batch},
+            datatypes::{Field, TimestampNanosecondType},
+        },
+        datasource::MemTable,
+        execution::object_store::ObjectStoreUrl,
+        physical_plan::displayable,
+    };
+    use nautilus_testkit::common::get_test_data_file_path;
+    use parquet::{
+        arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder},
+        file::{metadata::SortingColumn, properties::WriterProperties},
     };
     use rstest::rstest;
     use tempfile::TempDir;
 
     use super::*;
-    use crate::{
-        catalog::session::{DataBatchQuery, TypedDataBatchSession},
-        common::storage::create_storage_backend_from_path,
-    };
-
-    fn typed_quote(ts_init: u64) -> QuoteTick {
-        QuoteTick::new(
-            InstrumentId::from("AUD/USD.SIM"),
-            Price::from("1.0"),
-            Price::from("1.1"),
-            Quantity::from("1000"),
-            Quantity::from("1000"),
-            UnixNanos::from(ts_init),
-            UnixNanos::from(ts_init),
-        )
-    }
-
-    fn batch_ts(batch: &DataBatch) -> Vec<u64> {
-        match batch {
-            DataBatch::Quote(quotes) => quotes
-                .as_ref()
-                .iter()
-                .map(|quote| quote.ts_init.as_u64())
-                .collect(),
-            other => panic!("expected quote batch, found {other:?}"),
-        }
-    }
-
-    #[rstest]
-    fn typed_session_chunks_pages_with_carry_across_pulls() {
-        let pages: Vec<anyhow::Result<Vec<QuoteTick>>> = vec![
-            Ok(vec![typed_quote(1), typed_quote(2), typed_quote(3)]),
-            Ok(Vec::new()),
-            Ok(vec![typed_quote(4), typed_quote(5)]),
-        ];
-        let mut session = TypedDataBatchSession::new(Box::new(pages.into_iter()), Some(2));
-
-        assert_eq!(batch_ts(&session.next_batch().unwrap().unwrap()), [1, 2]);
-        assert_eq!(batch_ts(&session.next_batch().unwrap().unwrap()), [3, 4]);
-        assert_eq!(batch_ts(&session.next_batch().unwrap().unwrap()), [5]);
-        assert!(session.next_batch().unwrap().is_none());
-    }
-
-    #[rstest]
-    fn typed_session_extends_chunk_across_equal_boundary_ts() {
-        let data = vec![
-            typed_quote(1),
-            typed_quote(2),
-            typed_quote(2),
-            typed_quote(2),
-            typed_quote(3),
-        ];
-        let mut session = TypedDataBatchSession::from_vec(data, Some(2));
-
-        assert_eq!(
-            batch_ts(&session.next_batch().unwrap().unwrap()),
-            [1, 2, 2, 2]
-        );
-        assert_eq!(batch_ts(&session.next_batch().unwrap().unwrap()), [3]);
-        assert!(session.next_batch().unwrap().is_none());
-    }
-
-    #[rstest]
-    fn typed_session_empty_source_yields_none() {
-        let mut session = TypedDataBatchSession::<QuoteTick>::from_vec(Vec::new(), None);
-
-        assert!(session.next_batch().unwrap().is_none());
-    }
-
-    #[rstest]
-    fn typed_session_propagates_page_error() {
-        let pages: Vec<anyhow::Result<Vec<QuoteTick>>> = vec![
-            Ok(vec![typed_quote(1)]),
-            Err(anyhow::anyhow!("page failed")),
-        ];
-        let mut session = TypedDataBatchSession::new(Box::new(pages.into_iter()), Some(4));
-
-        assert_eq!(session.next_batch().unwrap_err().to_string(), "page failed");
-    }
+    use crate::common::storage::create_storage_backend_from_path;
 
     #[rstest]
     fn register_storage_backend_accepts_memory_backend() {
@@ -588,6 +707,8 @@ mod tests {
         let mut session = DataBackendSession::new(10);
 
         session.register_storage_backend(&storage).unwrap();
+
+        assert_registered_object_store(&session, &storage);
     }
 
     #[rstest]
@@ -598,6 +719,159 @@ mod tests {
         let mut session = DataBackendSession::new(10);
 
         session.register_storage_backend(&storage).unwrap();
+
+        assert_registered_object_store(&session, &storage);
+    }
+
+    fn assert_registered_object_store(session: &DataBackendSession, storage: &StorageBackend) {
+        let root_url = ObjectStoreUrl::parse(storage.datafusion_root_url().unwrap()).unwrap();
+        let registered = session
+            .session_ctx
+            .runtime_env()
+            .object_store(root_url)
+            .unwrap();
+
+        assert!(std::ptr::addr_eq(
+            Arc::as_ptr(&registered),
+            Arc::as_ptr(&storage.object_store),
+        ));
+    }
+
+    fn memory_table(column: &str) -> Arc<dyn TableProvider> {
+        let schema = Arc::new(Schema::new(vec![Field::new(column, DataType::Utf8, true)]));
+        Arc::new(MemTable::try_new(schema, vec![Vec::new()]).unwrap())
+    }
+
+    #[rstest]
+    fn register_table_provider_keeps_first_registration() {
+        let mut session = DataBackendSession::new(10);
+
+        session
+            .register_table_provider("records", memory_table("first"))
+            .unwrap();
+        session
+            .register_table_provider("records", memory_table("second"))
+            .unwrap();
+        let provider =
+            futures::executor::block_on(session.session_ctx.table_provider("records")).unwrap();
+
+        assert_eq!(provider.schema().field(0).name(), "first");
+    }
+
+    #[rstest]
+    fn session_config_keeps_file_scan_order() {
+        let config = session_config();
+        let optimizer = &config.options().optimizer;
+
+        assert!(!optimizer.repartition_file_scans);
+        assert!(!optimizer.enable_round_robin_repartition);
+        assert!(optimizer.prefer_existing_sort);
+    }
+
+    #[rstest]
+    fn identifiers_from_record_batches_reads_utf8_view_columns() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "identifier",
+            DataType::Utf8View,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringViewArray::from(vec![
+                Some("ESZ4.XCME"),
+                None,
+                Some("ESM4.XCME"),
+            ])) as ArrayRef],
+        )
+        .unwrap();
+
+        let identifiers = identifiers_from_record_batches(&[batch]).unwrap();
+
+        assert_eq!(identifiers, vec!["ESM4.XCME", "ESZ4.XCME"]);
+    }
+
+    #[rstest]
+    #[case::missing_column("instrument_id", DataType::Utf8, "identifier column not found")]
+    #[case::unsupported_type(
+        "identifier",
+        DataType::Int32,
+        "identifier column must be Utf8 or Utf8View"
+    )]
+    fn identifiers_from_record_batches_rejects_invalid_columns(
+        #[case] name: &str,
+        #[case] data_type: DataType,
+        #[case] expected: &str,
+    ) {
+        let column = new_null_array(&data_type, 1);
+        let schema = Arc::new(Schema::new(vec![Field::new(name, data_type, true)]));
+        let batch = RecordBatch::try_new(schema, vec![column]).unwrap();
+
+        let error = identifiers_from_record_batches(&[batch]).unwrap_err();
+
+        assert_eq!(error.to_string(), expected);
+    }
+
+    #[rstest]
+    fn binary_view_cast_to_fixed_size_binary_preserves_nulls() {
+        let values = vec![Some(b"ab".as_slice()), None, Some(b"cd".as_slice())];
+        let column = Arc::new(BinaryViewArray::from(values.clone())) as ArrayRef;
+
+        let cast = cast_column_to_data_type(&column, &DataType::FixedSizeBinary(2)).unwrap();
+
+        let expected =
+            FixedSizeBinaryArray::try_from_sparse_iter_with_size(values.into_iter(), 2).unwrap();
+        assert_eq!(cast.to_data(), expected.to_data());
+    }
+
+    #[rstest]
+    fn list_cast_to_fixed_size_list_rejects_wrong_row_length() {
+        let field = Arc::new(Field::new("element", DataType::UInt32, false));
+        let list = Arc::new(
+            ListArray::try_new(
+                field.clone(),
+                OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 3])),
+                Arc::new(UInt32Array::from(vec![1_u32, 2, 3])),
+                None,
+            )
+            .unwrap(),
+        ) as ArrayRef;
+
+        let error =
+            cast_column_to_data_type(&list, &DataType::FixedSizeList(field, 2)).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Execution error: List row 0 has length 3, expected 2"
+        );
+    }
+
+    struct DropSignal(mpsc::Sender<()>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    #[rstest]
+    fn blocking_batch_stream_drop_stops_producer() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (dropped_sender, dropped_receiver) = mpsc::channel();
+        let signal = DropSignal(dropped_sender);
+
+        let stream = futures::stream::pending::<i32>().chain(futures::stream::once(async move {
+            drop(signal);
+            0
+        }));
+
+        let stream = BlockingBatchStream::from_stream_with_runtime(stream, runtime.handle());
+
+        drop(stream);
+
+        assert_eq!(
+            dropped_receiver.recv_timeout(Duration::from_secs(5)),
+            Ok(())
+        );
     }
 
     #[rstest]
@@ -674,11 +948,6 @@ mod tests {
 
     #[rstest]
     fn fixed_size_list_cast_round_trips_through_delta_list_type() {
-        use arrow::{
-            array::{Decimal128Array, UInt32Array},
-            buffer::NullBuffer,
-        };
-
         let field = Arc::new(Field::new("element", DataType::Decimal128(38, 16), true));
         let values = Decimal128Array::from(vec![1_i128, 2, 3, 4])
             .with_precision_and_scale(38, 16)
@@ -727,10 +996,12 @@ mod tests {
     fn blocking_batch_stream_prefetches_first_item() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let (polled_sender, polled_receiver) = mpsc::channel();
+
         let stream = futures::stream::once(async move {
             polled_sender.send(()).unwrap();
             42
         });
+
         let mut stream = BlockingBatchStream::from_stream_with_runtime(stream, runtime.handle());
 
         assert_eq!(polled_receiver.recv_timeout(Duration::from_secs(1)), Ok(()),);
@@ -752,5 +1023,200 @@ mod tests {
 
             assert_eq!(stream.next(), Some(42));
         });
+    }
+
+    // Rows sharing a ts_init sit on both sides of the second row group boundary in this file
+    const FILTER_QUERY_FIXTURE: &str = "nautilus/arrow/quotes-3-groups-filter-query.parquet";
+    const FILTER_QUERY_START: i64 = 1_701_388_832_486_000_000;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Registration {
+        File,
+        Directory,
+        DisjointFiles,
+    }
+
+    #[rstest]
+    fn query_preserves_equal_timestamp_order(
+        #[values(
+            Registration::File,
+            Registration::Directory,
+            Registration::DisjointFiles
+        )]
+        registration: Registration,
+        #[values(false, true)] sorting_metadata: bool,
+        #[values(false, true)] filtered: bool,
+        #[values(1, 2, 4, 8)] partitions: usize,
+    ) {
+        let (fixture, row_groups) = read_filter_query_fixture();
+        let temp_dir = TempDir::new().unwrap();
+        let file_count = match registration {
+            Registration::File | Registration::Directory => 1,
+            Registration::DisjointFiles => 3,
+        };
+
+        for (index, rows) in disjoint_file_ranges(&fixture, file_count)
+            .into_iter()
+            .enumerate()
+        {
+            let path = temp_dir.path().join(format!("part-{index}.parquet"));
+            write_quotes(&path, &fixture, rows, &row_groups, sorting_metadata);
+        }
+
+        // Directory tables register with a trailing separator, like catalog directory tables
+        let path = match registration {
+            Registration::File => temp_dir.path().join("part-0.parquet"),
+            Registration::Directory | Registration::DisjointFiles => temp_dir.path().join(""),
+        };
+        let path = path.to_str().unwrap().to_string();
+
+        let start = filtered.then(|| UnixNanos::from(FILTER_QUERY_START as u64));
+        let expected = if filtered {
+            let ts_init = fixture
+                .column_by_name("ts_init")
+                .unwrap()
+                .as_primitive::<TimestampNanosecondType>();
+            let mask = ts_init
+                .values()
+                .iter()
+                .map(|value| Some(*value >= FILTER_QUERY_START))
+                .collect::<BooleanArray>();
+            filter_record_batch(&fixture, &mask).unwrap()
+        } else {
+            fixture
+        };
+
+        let mut session = DataBackendSession::new(10);
+        session.session_ctx =
+            SessionContext::new_with_config(session_config().with_target_partitions(partitions));
+        let query = build_query("quotes", start, None, None);
+        let batches = session
+            .collect_parquet_files_batches("quotes", vec![path], Some(&query))
+            .unwrap();
+        let actual = concat_batches(&batches[0].schema(), &batches).unwrap();
+        let actual = cast_record_batch_to_schema(&actual, &expected.schema()).unwrap();
+        let first_mismatch = (0..expected.num_rows().min(actual.num_rows()))
+            .find(|&row| actual.slice(row, 1) != expected.slice(row, 1));
+
+        assert_eq!(expected.num_rows(), if filtered { 10_001 } else { 15_000 });
+        assert_eq!(actual.num_rows(), expected.num_rows());
+        assert_eq!(first_mismatch, None);
+    }
+
+    // Streamed reads rely on DataFusion proving the files of one scan group are ordered, which
+    // needs their ts_init statistics; a SortExec would buffer the whole input instead.
+    #[rstest]
+    fn query_of_disjoint_files_keeps_ordered_scan(#[values(1, 2, 8)] partitions: usize) {
+        let (fixture, row_groups) = read_filter_query_fixture();
+        let temp_dir = TempDir::new().unwrap();
+
+        for (index, rows) in disjoint_file_ranges(&fixture, 3).into_iter().enumerate() {
+            let path = temp_dir.path().join(format!("part-{index}.parquet"));
+            write_quotes(&path, &fixture, rows, &row_groups, true);
+        }
+        let path = temp_dir.path().join("").to_str().unwrap().to_string();
+        let mut session = DataBackendSession::new(10);
+        session.session_ctx =
+            SessionContext::new_with_config(session_config().with_target_partitions(partitions));
+        session
+            .register_parquet_files_table("quotes", vec![path])
+            .unwrap();
+        let query = build_query("quotes", None, None, None);
+        let plan = block_on_nautilus_with(|| async {
+            session
+                .session_ctx
+                .sql(&query)
+                .await?
+                .create_physical_plan()
+                .await
+        })
+        .unwrap();
+        let plan = displayable(plan.as_ref()).indent(true).to_string();
+
+        assert!(!plan.contains("SortExec"), "{plan}");
+        assert!(plan.contains("output_ordering=[ts_init@"), "{plan}");
+    }
+
+    fn read_filter_query_fixture() -> (RecordBatch, Vec<usize>) {
+        let path = get_test_data_file_path(FILTER_QUERY_FIXTURE);
+        let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(path).unwrap()).unwrap();
+        let row_groups = builder
+            .metadata()
+            .row_groups()
+            .iter()
+            .map(|row_group| usize::try_from(row_group.num_rows()).unwrap())
+            .collect();
+        let schema = builder.schema().clone();
+        let batches = builder
+            .build()
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+        (concat_batches(&schema, &batches).unwrap(), row_groups)
+    }
+
+    // Splits rows into contiguous ranges that never divide rows sharing a ts_init
+    fn disjoint_file_ranges(batch: &RecordBatch, count: usize) -> Vec<Range<usize>> {
+        let ts_init = batch
+            .column_by_name("ts_init")
+            .unwrap()
+            .as_primitive::<TimestampNanosecondType>()
+            .values();
+        let mut ranges = Vec::with_capacity(count);
+        let mut start = 0;
+
+        for index in 1..count {
+            let mut end = (batch.num_rows() * index / count).max(start + 1);
+            while end < batch.num_rows() && ts_init[end] == ts_init[end - 1] {
+                end += 1;
+            }
+            ranges.push(start..end);
+            start = end;
+        }
+
+        ranges.push(start..batch.num_rows());
+        ranges
+    }
+
+    // Writes the rows keeping the fixture's row group boundaries, with or without the
+    // ts_init sorting metadata the catalog writer stores.
+    fn write_quotes(
+        path: &Path,
+        batch: &RecordBatch,
+        rows: Range<usize>,
+        row_groups: &[usize],
+        sorting_metadata: bool,
+    ) {
+        let sorting_columns = sorting_metadata.then(|| {
+            vec![SortingColumn {
+                column_idx: i32::try_from(batch.schema().index_of("ts_init").unwrap()).unwrap(),
+                descending: false,
+                nulls_first: false,
+            }]
+        });
+        let properties = WriterProperties::builder()
+            .set_sorting_columns(sorting_columns)
+            .build();
+        let mut writer = ArrowWriter::try_new(
+            File::create(path).unwrap(),
+            batch.schema(),
+            Some(properties),
+        )
+        .unwrap();
+        let mut boundary = 0;
+
+        for row_group in row_groups {
+            let group = boundary..boundary + row_group;
+            boundary = group.end;
+            let start = group.start.max(rows.start);
+            let end = group.end.min(rows.end);
+            if start < end {
+                writer.write(&batch.slice(start, end - start)).unwrap();
+                writer.flush().unwrap();
+            }
+        }
+
+        writer.close().unwrap();
     }
 }

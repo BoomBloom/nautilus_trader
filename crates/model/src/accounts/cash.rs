@@ -22,6 +22,12 @@
 //! - BUY orders lock quote currency (cost of purchase).
 //! - SELL orders lock base currency (assets being sold).
 //!
+//! Instruments that model no base currency (binary options, equities, and the other types whose
+//! `base_currency()` is `None`) have no asset to reserve, so a SELL locks nothing rather than
+//! labeling the quantity as quote money. Inventory availability for those instruments is not
+//! tracked or checked locally, including across concurrent SELLs, and is left to the venue,
+//! whose rejections arrive through the normal order lifecycle.
+//!
 //! Callers must clear all existing locks via [`CashAccount::clear_balance_locked`]
 //! before applying new locks. This prevents stale currency entries when order
 //! compositions change.
@@ -127,8 +133,6 @@ impl CashAccount {
     /// # Errors
     ///
     /// Returns an error if `allow_borrowing` is false and any balance has a negative total.
-    ///
-    /// TODO: Force stop backtest engine on error (like Python's `set_backtest_force_stop`)
     pub fn update_balances(&mut self, balances: &[AccountBalance]) -> anyhow::Result<()> {
         if !self.allow_borrowing {
             for balance in balances {
@@ -271,15 +275,17 @@ mod tests {
     use indexmap::IndexMap;
     use rstest::rstest;
     use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
 
     use crate::{
         accounts::{Account, CashAccount, stubs::*},
         enums::{AccountType, CurrencyType, LiquiditySide, OrderSide, OrderType},
-        events::{AccountState, account::stubs::*},
+        events::{AccountState, account::stubs::*, order::spec::OrderFilledSpec},
+        fees::MakerTakerFeeRates,
         identifiers::{AccountId, InstrumentId, position_id::PositionId, stubs::uuid4},
         instruments::{
-            Commodity, CryptoFuture, CryptoPerpetual, CurrencyPair, Equity, Instrument,
-            InstrumentAny, stubs::*,
+            BinaryOption, Commodity, CryptoFuture, CryptoPerpetual, CurrencyPair, Equity,
+            Instrument, InstrumentAny, stubs::*,
         },
         orders::{builder::OrderTestBuilder, stubs::TestOrderEventStubs},
         position::Position,
@@ -496,7 +502,7 @@ mod tests {
             Some(cash_account_state_multi_changed_btc.clone())
         );
         assert_eq!(
-            cash_account_multi.events,
+            *cash_account_multi.events,
             vec![
                 cash_account_state_multi,
                 cash_account_state_multi_changed_btc
@@ -547,6 +553,109 @@ mod tests {
     }
 
     #[rstest]
+    #[case(OrderSide::Buy, "0.01", "0.001234 USD")]
+    #[case(OrderSide::Sell, "0.0001", "0.0001 AUD")]
+    fn test_balance_locked_preserves_native_precision(
+        mut cash_account_million_usd: CashAccount,
+        audusd_sim: CurrencyPair,
+        #[case] side: OrderSide,
+        #[case] qty: &str,
+        #[case] expected: &str,
+    ) {
+        let instrument = audusd_sim.into_any();
+        let locked = cash_account_million_usd
+            .calculate_balance_locked(
+                &instrument,
+                side,
+                Quantity::from(qty),
+                Price::from("0.1234"),
+                None,
+            )
+            .unwrap();
+        cash_account_million_usd
+            .update_balance_locked(instrument.id(), locked)
+            .unwrap();
+        let expected = Money::from_str_exact(expected).unwrap();
+
+        assert_eq!(locked, expected);
+        assert_eq!(
+            cash_account_million_usd.balances_locked[&(instrument.id(), expected.currency)],
+            expected,
+        );
+
+        if side == OrderSide::Buy {
+            assert_eq!(
+                cash_account_million_usd
+                    .balance(Some(Currency::USD()))
+                    .copied(),
+                Some(AccountBalance::new(
+                    Money::from("1000000 USD"),
+                    expected,
+                    Money::from_str_exact("999999.998766 USD").unwrap(),
+                )),
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::profit("0 USD", "1000000.000001 USD")]
+    #[case::fee("0.000001 USD", "1000000 USD")]
+    fn test_fill_cash_flows_preserve_micro_profit_and_fee(
+        mut cash_account_million_usd: CashAccount,
+        audusd_sim: CurrencyPair,
+        #[case] fee: &str,
+        #[case] expected: &str,
+    ) {
+        let instrument = audusd_sim.into_any();
+        let fee = Money::from_str_exact(fee).unwrap();
+        let mut cash_flows = Vec::new();
+
+        for (side, price, commission) in [
+            (OrderSide::Buy, "0.1234", fee),
+            (OrderSide::Sell, "0.1235", Money::zero(Currency::USD())),
+        ] {
+            let fill = OrderFilledSpec::builder()
+                .instrument_id(instrument.id())
+                .order_side(side)
+                .last_qty(Quantity::from("0.01"))
+                .last_px(Price::from(price))
+                .commission(commission)
+                .build();
+            let pnls = cash_account_million_usd
+                .calculate_pnls(&instrument, &fill, None)
+                .unwrap();
+            let current = cash_account_million_usd.balance_total(None).unwrap();
+            let total = current
+                .checked_add(pnls[0])
+                .unwrap()
+                .checked_sub(commission)
+                .unwrap();
+            let balance = AccountBalance::new(total, Money::zero(Currency::USD()), total);
+            cash_account_million_usd
+                .update_balances(&[balance])
+                .unwrap();
+            cash_flows.extend(pnls);
+        }
+
+        let expected = Money::from_str_exact(expected).unwrap();
+        assert_eq!(
+            cash_flows,
+            vec![
+                Money::from_str_exact("-0.001234 USD").unwrap(),
+                Money::from_str_exact("0.001235 USD").unwrap(),
+            ],
+        );
+        assert_eq!(
+            cash_account_million_usd.balance(None).copied(),
+            Some(AccountBalance::new(
+                expected,
+                Money::zero(Currency::USD()),
+                expected
+            )),
+        );
+    }
+
+    #[rstest]
     fn test_calculate_balance_locked_buy_returns_error_for_unrepresentable_notional(
         cash_account_million_usd: CashAccount,
         audusd_sim: CurrencyPair,
@@ -563,7 +672,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_calculate_balance_locked_buy_quanto_uses_quote_currency(
+    fn test_calculate_balance_locked_buy_quanto_uses_settlement_currency(
         cash_account_million_usd: CashAccount,
         ethbtc_quanto: CryptoFuture,
     ) {
@@ -576,7 +685,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert_eq!(balance_locked, Money::from("0.18 BTC"));
+        assert_eq!(balance_locked, Money::from("0.18 USDT"));
     }
 
     #[rstest]
@@ -586,11 +695,11 @@ mod tests {
         #[case] use_quote_for_inverse: bool,
         #[case] expected: Money,
         cash_account_million_usd: CashAccount,
-        xbtusd_inverse_perp: CryptoPerpetual,
+        btcusd_inverse_perp: CryptoPerpetual,
     ) {
         let balance_locked = cash_account_million_usd
             .calculate_balance_locked(
-                &xbtusd_inverse_perp.into_any(),
+                &btcusd_inverse_perp.into_any(),
                 OrderSide::Buy,
                 Quantity::from("100"),
                 Price::from("50000"),
@@ -631,7 +740,43 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert_eq!(balance_locked, Money::from("100 USD"));
+        assert_eq!(balance_locked, Money::zero(Currency::USD()));
+    }
+
+    #[rstest]
+    fn test_calculate_balance_locked_sell_binary_option_reserves_nothing(
+        cash_account_million_usd: CashAccount,
+        binary_option: BinaryOption,
+    ) {
+        // BinaryOption::base_currency() is None: there is no modeled asset to reserve, so a
+        // SELL must not reserve quote collateral.
+        let balance_locked = cash_account_million_usd
+            .calculate_balance_locked(
+                &InstrumentAny::BinaryOption(binary_option),
+                OrderSide::Sell,
+                Quantity::from("5.00"),
+                Price::from("0.500"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(balance_locked, Money::zero(Currency::USDC()));
+    }
+
+    #[rstest]
+    fn test_calculate_balance_locked_buy_no_base_currency_still_reserves_notional(
+        cash_account_million_usd: CashAccount,
+        binary_option: BinaryOption,
+    ) {
+        let balance_locked = cash_account_million_usd
+            .calculate_balance_locked(
+                &binary_option.into_any(),
+                OrderSide::Buy,
+                Quantity::from("5"),
+                Price::from("0.500"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(balance_locked, Money::new(2.5, Currency::USDC()));
     }
 
     #[rstest]
@@ -663,6 +808,60 @@ mod tests {
             .calculate_pnls(&audusd_sim, &fill_owned, Some(position))
             .unwrap();
         assert_eq!(pnls, vec![Money::from("-800000 USD")]);
+    }
+
+    #[cfg(feature = "defi")]
+    #[rstest]
+    fn test_fill_cash_flows_reject_unrepresentable_foreign_commission(
+        cash_account: CashAccount,
+        audusd_sim: CurrencyPair,
+    ) {
+        let instrument = audusd_sim.into_any();
+        let fill = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .last_qty(Quantity::from("0.01"))
+            .last_px(Price::from("0.1234"))
+            .commission(Money::from_raw(
+                100_000_000_000_000_000_000_000_000_001,
+                Currency::EUR(),
+            ))
+            .build();
+
+        let error = cash_account
+            .calculate_pnls(&instrument, &fill, None)
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "position input exceeds exact Decimal representation"
+        );
+    }
+
+    #[rstest]
+    fn test_fill_cash_flows_preserve_sub_cent_base_and_quote(
+        cash_account_multi: CashAccount,
+        audusd_sim: CurrencyPair,
+    ) {
+        let instrument = audusd_sim.into_any();
+        let fill = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .order_side(OrderSide::Buy)
+            .last_qty(Quantity::from("0.0001"))
+            .last_px(Price::from("0.1234"))
+            .commission(Money::zero(Currency::USD()))
+            .build();
+
+        let pnls = cash_account_multi
+            .calculate_pnls(&instrument, &fill, None)
+            .unwrap();
+
+        assert_eq!(
+            pnls,
+            vec![
+                Money::from_str_exact("0.0001 AUD").unwrap(),
+                Money::from_str_exact("-0.00001234 USD").unwrap(),
+            ],
+        );
     }
 
     #[rstest]
@@ -740,14 +939,16 @@ mod tests {
         #[case] use_quote_for_inverse: bool,
         #[case] expected: Money,
         cash_account_million_usd: CashAccount,
-        xbtusd_bitmex: CryptoPerpetual,
+        btcusd_bybit: CryptoPerpetual,
     ) {
+        let fee_rates = MakerTakerFeeRates::new(dec!(-0.00025), dec!(0.00075));
         let result = cash_account_million_usd
             .calculate_commission(
-                &xbtusd_bitmex.into_any(),
+                &btcusd_bybit.into_any(),
                 Quantity::from("100000"),
                 Price::from("11450.50"),
                 LiquiditySide::Maker,
+                fee_rates,
                 Some(use_quote_for_inverse),
             )
             .unwrap();
@@ -759,12 +960,14 @@ mod tests {
         cash_account_million_usd: CashAccount,
         audusd_sim: CurrencyPair,
     ) {
+        let fee_rates = MakerTakerFeeRates::new(dec!(0.00002), dec!(0.00002));
         let result = cash_account_million_usd
             .calculate_commission(
                 &audusd_sim.into_any(),
                 Quantity::from("1500000"),
                 Price::from("0.8005"),
                 LiquiditySide::Taker,
+                fee_rates,
                 None,
             )
             .unwrap();
@@ -774,14 +977,16 @@ mod tests {
     #[rstest]
     fn test_calculate_commission_crypto_taker(
         cash_account_million_usd: CashAccount,
-        xbtusd_bitmex: CryptoPerpetual,
+        btcusd_bybit: CryptoPerpetual,
     ) {
+        let fee_rates = MakerTakerFeeRates::new(dec!(-0.00025), dec!(0.00075));
         let result = cash_account_million_usd
             .calculate_commission(
-                &xbtusd_bitmex.into_any(),
+                &btcusd_bybit.into_any(),
                 Quantity::from("100000"),
                 Price::from("11450.50"),
                 LiquiditySide::Taker,
+                fee_rates,
                 None,
             )
             .unwrap();
@@ -791,12 +996,14 @@ mod tests {
     #[rstest]
     fn test_calculate_commission_fx_taker(cash_account_million_usd: CashAccount) {
         let instrument = usdjpy_idealpro();
+        let fee_rates = MakerTakerFeeRates::new(dec!(0.00002), dec!(0.00002));
         let result = cash_account_million_usd
             .calculate_commission(
                 &instrument.into_any(),
                 Quantity::from("2200000"),
                 Price::from("120.310"),
                 LiquiditySide::Taker,
+                fee_rates,
                 None,
             )
             .unwrap();

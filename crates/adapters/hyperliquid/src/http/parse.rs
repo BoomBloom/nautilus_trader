@@ -14,6 +14,7 @@
 // -------------------------------------------------------------------------------------------------
 
 use anyhow::Context;
+use indexmap::IndexMap;
 use jiff::Timestamp;
 use nautilus_core::{Params, UUID4, UnixNanos, datetime::unix_nanos_to_iso8601};
 use nautilus_model::{
@@ -46,7 +47,7 @@ use crate::{
         },
         parse::{
             format_outcome_nautilus_symbol, is_conditional_order_data, make_fill_trade_id,
-            millis_to_nanos, parse_trigger_order_type,
+            millis_to_nanos, parse_trigger_order_type, parse_trigger_order_type_label,
         },
         types::HyperliquidAssetId,
     },
@@ -343,13 +344,13 @@ pub fn parse_spot_instruments(meta: &SpotMeta) -> Result<Vec<HyperliquidInstrume
     Ok(defs)
 }
 
-// Default precision for HIP-4 outcome side tokens until the venue exposes
-// per-market values via `outcomeMeta`. Outcomes settle in `[0, 1]` so 4
-// decimals of price granularity (tick `0.0001`) and 2 decimals of size
-// granularity (lot `0.01`) are conservative starting values; refine when
-// real venue payloads land.
-pub const OUTCOME_PRICE_DECIMALS: u32 = 4;
-pub const OUTCOME_SIZE_DECIMALS: u32 = 2;
+// Precision for HIP-4 outcome side tokens, which `outcomeMeta` does not expose.
+// Venue order books and fills price outcomes in steps of `0.00001` (5 decimals)
+// and size them in whole tokens.
+pub const OUTCOME_PRICE_DECIMALS: u32 = 5;
+pub const OUTCOME_SIZE_DECIMALS: u32 = 0;
+
+pub(crate) const DEFAULT_OUTCOME_QUOTE_CURRENCY: &str = "USDC";
 
 /// Parse outcome instrument definitions from Hyperliquid `outcomeMeta` response.
 ///
@@ -366,6 +367,8 @@ pub const OUTCOME_SIZE_DECIMALS: u32 = 2;
 ///
 /// `side_name` is taken from the venue's `sideSpecs` entry when present,
 /// otherwise it falls back to the canonical HIP-4 labels (`"Yes"` / `"No"`).
+/// Quote and settlement currency use `quoteToken`, falling back to USDC
+/// when the field is absent.
 pub fn parse_outcome_instruments(
     meta: &OutcomeMeta,
 ) -> Result<Vec<HyperliquidInstrumentDef>, String> {
@@ -378,6 +381,30 @@ pub fn parse_outcome_instruments(
     }
 
     Ok(defs)
+}
+
+pub(crate) fn parse_unlisted_outcome_instrument(
+    asset_id: HyperliquidAssetId,
+) -> Result<HyperliquidInstrumentDef, String> {
+    let (Some(outcome), Some(side)) = (asset_id.outcome_index(), asset_id.outcome_side()) else {
+        return Err(format!("Asset {asset_id} is not a HIP-4 outcome"));
+    };
+
+    // Only the encoding survives settlement, so market metadata stays empty
+    let market = OutcomeMarket {
+        outcome,
+        name: String::new(),
+        description: String::new(),
+        quote_token: None,
+        side_specs: Vec::new(),
+    };
+
+    let meta = OutcomeMeta {
+        outcomes: Vec::new(),
+        questions: Vec::new(),
+    };
+
+    build_outcome_def(&market, side, &meta)
 }
 
 fn build_outcome_def(
@@ -434,7 +461,11 @@ fn build_outcome_def(
         symbol: Ustr::from(symbol.as_str()),
         raw_symbol: Ustr::from(coin.as_str()),
         base: Ustr::from(token.as_str()),
-        quote: "USDH".into(),
+        quote: market
+            .quote_token
+            .as_deref()
+            .unwrap_or(DEFAULT_OUTCOME_QUOTE_CURRENCY)
+            .into(),
         settlement: None,
         market_type: HyperliquidMarketType::Outcome,
         asset_index: asset_id.to_raw(),
@@ -489,10 +520,11 @@ fn build_outcome_info(
     side_name: Option<&str>,
     parent_question: Option<&OutcomeQuestion>,
 ) -> Params {
-    let mut info = Params::new();
+    let mut info = IndexMap::from([
+        ("outcome_index".into(), json!(market.outcome)),
+        ("outcome_side".into(), json!(side)),
+    ]);
 
-    info.insert("outcome_index".into(), json!(market.outcome));
-    info.insert("outcome_side".into(), json!(side));
     if let Some(name) = side_name {
         info.insert("side_name".into(), Value::String(name.to_string()));
     }
@@ -535,7 +567,7 @@ fn build_outcome_info(
         }
     }
 
-    info
+    Params::new(info)
 }
 
 fn pow10_neg(decimals: u32) -> Decimal {
@@ -685,12 +717,9 @@ pub fn get_currency(code: &str) -> Currency {
     })
 }
 
-/// Returns the HIP-4 outcome settlement currency, registering it on first call.
+/// Returns USDH, registering it at 8-decimal precision on first call.
 ///
-/// Outcome markets settle in USDH (token index 360 on the `USDH/USDC` spot pair
-/// `@230`), not USDC. The registration is explicit so the precision is
-/// deterministic rather than dependent on whichever caller first triggers
-/// `get_currency`'s auto-register path.
+/// Used when venue metadata selects USDH as the settlement currency.
 pub fn get_usdh_currency() -> Currency {
     Currency::try_from_str("USDH").unwrap_or_else(|| {
         let currency = Currency::new("USDH", 8, 0, "Hyperliquid USD", CurrencyType::Crypto);
@@ -703,7 +732,7 @@ pub fn get_usdh_currency() -> Currency {
 
 /// Resolves the commission currency for a fill given the venue's `feeToken` field.
 ///
-/// HIP-4 outcome fills echo the side token (e.g. `+50`) as `feeToken` even when
+/// HIP-4 outcome fills can echo the side token (e.g. `+50`) as `feeToken` when
 /// the fee is zero. The side token is not a Nautilus currency and emitting it as
 /// the commission currency would leak into `OrderFilled` events and persistence;
 /// for outcome side tokens the instrument's quote currency is always used, even
@@ -714,8 +743,8 @@ pub fn get_usdh_currency() -> Currency {
 ///
 /// # Errors
 ///
-/// Returns an error when an outcome side token carries a non-zero fee, or when
-/// `fee_token` cannot be resolved and `fee_amount` is non-zero.
+/// Returns an error if an outcome side token carries a non-zero fee, or when `fee_token` cannot be
+/// resolved and `fee_amount` is non-zero.
 pub fn resolve_fee_currency(
     fee_token: &str,
     fee_amount: Decimal,
@@ -765,10 +794,10 @@ const HYPERLIQUID_MIN_ORDER_NOTIONAL: Decimal = Decimal::TEN;
 /// and `InstrumentAny` is the only instrument shape published on the message bus.
 /// Carrying the index here lets the execution client register a market discovered
 /// after its own bootstrap without refetching venue metadata.
-fn info_with_asset_index(info: Option<Params>, asset_index: u32) -> Params {
+fn info_with_asset_index(info: Option<IndexMap<String, Value>>, asset_index: u32) -> Params {
     let mut info = info.unwrap_or_default();
     info.insert(ASSET_INDEX_INFO_KEY.to_string(), json!(asset_index));
-    info
+    Params::new(info)
 }
 
 /// Converts a single Hyperliquid instrument definition into a Nautilus `InstrumentAny`.
@@ -800,7 +829,7 @@ pub fn create_instrument_from_def(
             let base_currency = get_currency(&def.base);
             let quote_currency = get_currency(&def.quote);
             let min_notional = Some(min_order_notional(quote_currency)?);
-            let info = serde_json::from_str::<Params>(&def.raw_data).ok();
+            let info = serde_json::from_str::<IndexMap<String, Value>>(&def.raw_data).ok();
             let info = info_with_asset_index(info, def.asset_index);
 
             Some(InstrumentAny::CurrencyPair(
@@ -859,7 +888,9 @@ pub fn create_instrument_from_def(
         }
         HyperliquidMarketType::Outcome => {
             let outcome = def.outcome.as_ref()?;
-            let currency = get_usdh_currency();
+            let currency = get_outcome_currency(&def.quote);
+            let info = outcome.info.as_deref().cloned();
+            let info = info_with_asset_index(info, def.asset_index);
 
             Some(InstrumentAny::BinaryOption(
                 BinaryOption::builder()
@@ -875,7 +906,7 @@ pub fn create_instrument_from_def(
                     .size_increment(size_increment)
                     .maybe_outcome(outcome.side_name)
                     .maybe_description(outcome.description)
-                    .info(info_with_asset_index(outcome.info.clone(), def.asset_index))
+                    .info(info)
                     .ts_event(ts_init)
                     .ts_init(ts_init)
                     .build()
@@ -887,6 +918,14 @@ pub fn create_instrument_from_def(
 
 fn min_order_notional(currency: Currency) -> Option<Money> {
     Money::from_decimal(HYPERLIQUID_MIN_ORDER_NOTIONAL, currency).ok()
+}
+
+pub(crate) fn get_outcome_currency(code: &str) -> Currency {
+    if code == "USDH" {
+        get_usdh_currency()
+    } else {
+        get_currency(code)
+    }
 }
 
 /// Convert a collection of Hyperliquid instrument definitions into Nautilus instruments,
@@ -955,9 +994,20 @@ pub fn parse_order_status_report_from_basic(
     let venue_order_id = VenueOrderId::new(order.oid.to_string());
     let order_side = OrderSide::from(order.side);
 
-    let is_conditional = is_conditional_order_data(order.trigger_px, order.tpsl.as_ref());
+    // REST rows (`frontendOpenOrders`) carry trigger semantics in the `orderType` label
+    // instead of the WebSocket `tpsl` / `isMarket` fields
+    let (tpsl, is_market) = match (order.tpsl, order.order_type.as_deref()) {
+        (Some(tpsl), _) => (Some(tpsl), order.is_market),
+        (None, Some(label)) => match parse_trigger_order_type_label(label) {
+            Some((tpsl, is_market)) => (Some(tpsl), Some(is_market)),
+            None => (None, order.is_market),
+        },
+        (None, None) => (None, order.is_market),
+    };
+
+    let is_conditional = is_conditional_order_data(order.trigger_px, tpsl.as_ref());
     let order_type = if is_conditional {
-        match (order.is_market, order.tpsl.as_ref()) {
+        match (is_market, tpsl.as_ref()) {
             (Some(is_market), Some(tpsl)) => parse_trigger_order_type(is_market, tpsl),
             (None, Some(tpsl)) => parse_trigger_order_type(false, tpsl),
             _ => OrderType::Limit,
@@ -969,8 +1019,6 @@ pub fn parse_order_status_report_from_basic(
     let time_in_force = order
         .tif
         .map_or(TimeInForce::Gtc, hyperliquid_time_in_force_to_nautilus);
-    let order_status = OrderStatus::from(*status);
-
     let price_precision = instrument.price_precision();
     let size_precision = instrument.size_precision();
 
@@ -982,6 +1030,16 @@ pub fn parse_order_status_report_from_basic(
     let filled_sz = orig_sz.abs() - current_sz.abs();
     let filled_qty = Quantity::from_decimal_dp(filled_sz, size_precision)
         .map_err(|e| anyhow::anyhow!("Failed to create quantity from filled_sz: {e}"))?;
+
+    // The venue marks an order `filled` once it stops executing, with `sz` holding any remainder
+    // it canceled (seen on IOC orders). A filled report would leave that remainder open.
+    let venue_status = OrderStatus::from(*status);
+    let remainder_canceled = venue_status == OrderStatus::Filled && filled_qty < quantity;
+    let order_status = if remainder_canceled {
+        OrderStatus::Canceled
+    } else {
+        venue_status
+    };
 
     let ts_accepted = UnixNanos::from(order.timestamp * 1_000_000);
     let ts_last = ts_accepted;
@@ -1006,7 +1064,9 @@ pub fn parse_order_status_report_from_basic(
 
     // Add client order ID if present
     if let Some(cloid) = &order.cloid {
-        report = report.with_client_order_id(ClientOrderId::new(cloid.as_str()));
+        let client_order_id =
+            ClientOrderId::new_checked(cloid.as_str()).context("invalid order client order ID")?;
+        report = report.with_client_order_id(client_order_id);
     }
 
     if matches!(order.tif, Some(HyperliquidTimeInForce::Alo)) {
@@ -1019,13 +1079,15 @@ pub fn parse_order_status_report_from_basic(
 
     if let Some(reason) = status.rejection_reason() {
         report = report.with_cancel_reason(reason.to_string());
+    } else if remainder_canceled {
+        report = report.with_cancel_reason("Unfilled remainder canceled".to_string());
     }
 
-    // Only set price for non-filled orders. For filled orders, the limit price is not
-    // the execution price, and setting it would cause bogus inferred fills to be created
-    // during reconciliation. Real fills arrive via the userEvents WebSocket channel.
+    // Only set price for orders the venue did not report as filled. For filled orders, the
+    // limit price is not the execution price, and setting it would cause bogus inferred fills
+    // to be created during reconciliation. Real fills arrive via the userEvents WebSocket channel.
     if !matches!(
-        order_status,
+        venue_status,
         OrderStatus::Filled | OrderStatus::PartiallyFilled
     ) {
         let price = Price::from_decimal_dp(order.limit_px, price_precision)
@@ -1162,6 +1224,8 @@ pub fn filter_recent_public_trades(
 
 /// Parse Hyperliquid fill to FillReport.
 ///
+/// Preserves the raw venue CLOID as the client order ID when present.
+///
 /// # Errors
 ///
 /// Returns an error if required fields are missing or invalid.
@@ -1216,6 +1280,12 @@ pub fn parse_fill_report(
 
     let ts_event = UnixNanos::from(fill.time * 1_000_000);
     let report_id = UUID4::new();
+    let client_order_id = fill
+        .cloid
+        .as_deref()
+        .map(ClientOrderId::new_checked)
+        .transpose()
+        .context("invalid fill client order ID")?;
 
     let report = FillReport::new(
         account_id,
@@ -1227,7 +1297,7 @@ pub fn parse_fill_report(
         last_px,
         commission,
         liquidity_side,
-        None, // client_order_id - to be linked by execution engine
+        client_order_id,
         None, // venue_position_id
         ts_event,
         ts_init,
@@ -1338,6 +1408,67 @@ mod tests {
     fn test_parse_fill_side() {
         assert_eq!(parse_fill_side(&HyperliquidSide::Buy), OrderSide::Buy,);
         assert_eq!(parse_fill_side(&HyperliquidSide::Sell), OrderSide::Sell,);
+    }
+
+    #[rstest]
+    #[case::with_cloid(Some("0x0123456789abcdef0123456789abcdef"))]
+    #[case::without_cloid(None)]
+    fn test_parse_fill_report_client_order_id(#[case] cloid: Option<&str>) {
+        let meta: PerpMeta = load_test_data("http_meta_perp_sample.json");
+        let defs = parse_perp_instruments(&meta, 0).unwrap();
+        let instrument = create_instrument_from_def(&defs[0], UnixNanos::default()).unwrap();
+        let mut fills: Vec<HyperliquidFill> = load_test_data("http_query_order_fills.json");
+        fills[0].cloid = cloid.map(String::from);
+        let account_id = AccountId::from("HYPERLIQUID-REST");
+        let ts_init = UnixNanos::from(1_700_000_003_000_000_000);
+
+        let report = parse_fill_report(&fills[0], &instrument, account_id, ts_init).unwrap();
+
+        assert_eq!(report.client_order_id, cloid.map(ClientOrderId::new));
+        assert_eq!(report.account_id, account_id);
+        assert_eq!(report.instrument_id, instrument.id());
+        assert_eq!(report.venue_order_id, VenueOrderId::from("900029"));
+        assert_eq!(
+            report.trade_id,
+            make_fill_trade_id(
+                "0xquery-fill-a",
+                900029,
+                dec!(90000),
+                dec!(0.0004),
+                1_700_000_001_000,
+                dec!(0)
+            )
+        );
+        assert_eq!(report.order_side, OrderSide::Buy);
+        assert_eq!(report.last_qty.as_decimal(), dec!(0.0004));
+        assert_eq!(report.last_px.as_decimal(), dec!(90000));
+        assert_eq!(report.commission, Money::from("0.010 USDC"));
+        assert_eq!(report.liquidity_side, LiquiditySide::Taker);
+        assert_eq!(report.venue_position_id, None);
+        assert_eq!(report.ts_event, UnixNanos::from(1_700_000_001_000_000_000));
+        assert_eq!(report.ts_init, ts_init);
+    }
+
+    #[rstest]
+    #[case::empty("")]
+    #[case::whitespace("   ")]
+    #[case::non_ascii("0x\u{e9}")]
+    fn test_parse_fill_report_rejects_invalid_client_order_id(#[case] cloid: &str) {
+        let instrument = create_btc_perp_instrument();
+        let mut fills: Vec<HyperliquidFill> = load_test_data("http_query_order_fills.json");
+        fills[0].cloid = Some(cloid.to_string());
+
+        let result = parse_fill_report(
+            &fills[0],
+            &instrument,
+            AccountId::from("HYPERLIQUID-REST"),
+            UnixNanos::default(),
+        );
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "invalid fill client order ID"
+        );
     }
 
     #[rstest]
@@ -1502,6 +1633,7 @@ mod tests {
                 outcome: 2,
                 name: "Recurring BTC".to_string(),
                 description: "Daily settlement".to_string(),
+                quote_token: Some("USDC".to_string()),
                 side_specs: vec![
                     OutcomeSideSpec {
                         name: "Yes".to_string(),
@@ -1994,12 +2126,45 @@ mod tests {
     }
 
     #[rstest]
+    fn test_parse_outcome_quote_tokens_from_metadata() {
+        let meta: OutcomeMeta = load_test_data("http_outcome_meta.json");
+        assert_eq!(meta.outcomes[0].quote_token.as_deref(), Some("USDC"));
+        assert_eq!(meta.outcomes[1].quote_token.as_deref(), Some("USDH"));
+        assert_eq!(meta.outcomes[2].quote_token, None);
+
+        let defs = parse_outcome_instruments(&meta).unwrap();
+        assert_eq!(defs.len(), 6);
+
+        for (index, currency) in [Currency::USDC(), get_usdh_currency(), Currency::USDC()]
+            .into_iter()
+            .enumerate()
+        {
+            for side in 0..=1 {
+                let def = &defs[2 * index + side];
+                let instrument = create_instrument_from_def(def, UnixNanos::default()).unwrap();
+                assert_eq!(def.quote, currency.code);
+                assert_eq!(instrument.quote_currency(), currency);
+                assert_eq!(instrument.settlement_currency(), currency);
+                assert_eq!(
+                    instrument.id().symbol.as_str(),
+                    format!(
+                        "{}-{}-OUTCOME",
+                        index + 1,
+                        if side == 0 { "YES" } else { "NO" }
+                    )
+                );
+            }
+        }
+    }
+
+    #[rstest]
     fn test_parse_outcome_instruments_emits_both_sides() {
         let meta = OutcomeMeta {
             outcomes: vec![OutcomeMarket {
                 outcome: 1,
                 name: "BTC daily".to_string(),
                 description: "BTC settles above strike at 06:00 UTC".to_string(),
+                quote_token: Some("USDC".to_string()),
                 side_specs: vec![
                     OutcomeSideSpec {
                         name: "Yes".to_string(),
@@ -2022,9 +2187,9 @@ mod tests {
         assert_eq!(yes.asset_index, 100_000_010);
         assert_eq!(yes.price_decimals, OUTCOME_PRICE_DECIMALS);
         assert_eq!(yes.size_decimals, OUTCOME_SIZE_DECIMALS);
-        assert_eq!(yes.tick_size, dec!(0.0001));
-        assert_eq!(yes.lot_size, dec!(0.01));
-        assert_eq!(yes.quote, "USDH");
+        assert_eq!(yes.tick_size, dec!(0.00001));
+        assert_eq!(yes.lot_size, dec!(1));
+        assert_eq!(yes.quote, "USDC");
         assert!(yes.active);
 
         let yes_meta = yes.outcome.as_ref().unwrap();
@@ -2053,6 +2218,7 @@ mod tests {
                 outcome: 5,
                 name: "Recurring".to_string(),
                 description: String::new(),
+                quote_token: Some("USDC".to_string()),
                 side_specs: vec![],
             }],
             questions: vec![],
@@ -2076,6 +2242,71 @@ mod tests {
     }
 
     #[rstest]
+    #[case::yes(0, "20-YES-OUTCOME", "#200", "+200", 100_000_200, "Yes")]
+    #[case::no(1, "20-NO-OUTCOME", "#201", "+201", 100_000_201, "No")]
+    fn test_parse_unlisted_outcome_instrument(
+        #[case] side: u8,
+        #[case] symbol: &str,
+        #[case] raw_symbol: &str,
+        #[case] base: &str,
+        #[case] asset_index: u32,
+        #[case] side_name: &str,
+    ) {
+        let listed_meta = OutcomeMeta {
+            outcomes: vec![OutcomeMarket {
+                outcome: 20,
+                name: "Recurring".to_string(),
+                description: "class:priceBinary|underlying:BTC|expiry:20260511-0600".to_string(),
+                quote_token: Some("USDC".to_string()),
+                side_specs: vec![],
+            }],
+            questions: vec![],
+        };
+
+        let listed = parse_outcome_instruments(&listed_meta).unwrap();
+
+        let def = parse_unlisted_outcome_instrument(HyperliquidAssetId::outcome(20, side)).unwrap();
+
+        let listed = &listed[usize::from(side)];
+        let outcome = def.outcome.as_ref().unwrap();
+        assert_eq!(def.symbol, symbol);
+        assert_eq!(def.raw_symbol, raw_symbol);
+        assert_eq!(def.base, base);
+        assert_eq!(def.quote, "USDC");
+        let instrument = create_instrument_from_def(&def, UnixNanos::default()).unwrap();
+        assert_eq!(instrument.quote_currency(), Currency::USDC());
+        assert_eq!(instrument.settlement_currency(), Currency::USDC());
+        assert_eq!(def.market_type, HyperliquidMarketType::Outcome);
+        assert_eq!(def.asset_index, asset_index);
+        assert_eq!(def.price_decimals, OUTCOME_PRICE_DECIMALS);
+        assert_eq!(def.size_decimals, OUTCOME_SIZE_DECIMALS);
+        assert_eq!(def.tick_size, dec!(0.00001));
+        assert_eq!(def.lot_size, dec!(1));
+        assert!(def.active);
+        assert_eq!(outcome.outcome_index, 20);
+        assert_eq!(outcome.outcome_side, side);
+        assert_eq!(outcome.market_name, "");
+        assert_eq!(outcome.side_name.unwrap(), side_name);
+        assert_eq!(outcome.description, None);
+        assert_eq!(outcome.expiration_ns, UnixNanos::default());
+        assert_eq!(
+            (def.symbol, def.raw_symbol, def.asset_index),
+            (listed.symbol, listed.raw_symbol, listed.asset_index),
+            "an unlisted side must map to the same instrument as its listed form",
+        );
+    }
+
+    #[rstest]
+    fn test_parse_unlisted_outcome_instrument_rejects_non_outcome_asset() {
+        let result = parse_unlisted_outcome_instrument(HyperliquidAssetId::spot(107));
+
+        assert_eq!(
+            result.unwrap_err(),
+            "Asset 10107 is not a HIP-4 outcome".to_string()
+        );
+    }
+
+    #[rstest]
     fn test_get_usdh_currency_registers_with_explicit_precision() {
         let currency = get_usdh_currency();
         assert_eq!(currency.code, "USDH");
@@ -2095,6 +2326,7 @@ mod tests {
                 outcome: 2,
                 name: "Recurring BTC".to_string(),
                 description: "Daily settlement".to_string(),
+                quote_token: Some("USDC".to_string()),
                 side_specs: vec![
                     OutcomeSideSpec {
                         name: "Yes".to_string(),
@@ -2115,7 +2347,7 @@ mod tests {
                 assert_eq!(bo.id.symbol.as_str(), "2-YES-OUTCOME");
                 assert_eq!(bo.raw_symbol.as_str(), "#20");
                 assert_eq!(bo.asset_class, AssetClass::Alternative);
-                assert_eq!(bo.currency.code, "USDH");
+                assert_eq!(bo.currency.code, "USDC");
                 assert_eq!(bo.price_precision, OUTCOME_PRICE_DECIMALS as u8);
                 assert_eq!(bo.size_precision, OUTCOME_SIZE_DECIMALS as u8);
                 assert_eq!(bo.outcome.unwrap(), "Yes");
@@ -2142,6 +2374,7 @@ mod tests {
                 description:
                     "class:priceBinary|underlying:BTC|expiry:20260508-0600|targetPrice:81041|period:1d"
                         .to_string(),
+                quote_token: Some("USDC".to_string()),
                 side_specs: vec![
                     OutcomeSideSpec {
                         name: "Yes".to_string(),
@@ -2179,12 +2412,14 @@ mod tests {
                     outcome: 6,
                     name: "Recurring Fallback".to_string(),
                     description: "other".to_string(),
+                    quote_token: Some("USDC".to_string()),
                     side_specs: vec![],
                 },
                 OutcomeMarket {
                     outcome: 7,
                     name: "Recurring Named Outcome".to_string(),
                     description: "index:0".to_string(),
+                    quote_token: Some("USDC".to_string()),
                     side_specs: vec![],
                 },
             ],
@@ -2237,12 +2472,20 @@ mod tests {
     }
 
     #[rstest]
-    fn test_parse_fill_report_outcome_round_trip() {
+    #[case::usdc_side_token("USDC", "+420", Decimal::ZERO)]
+    #[case::usdh_side_token("USDH", "+420", Decimal::ZERO)]
+    #[case::usdc_fee("USDC", "USDC", dec!(0.0345))]
+    fn test_parse_fill_report_outcome_round_trip(
+        #[case] quote_token: &str,
+        #[case] fee_token: &str,
+        #[case] fee: Decimal,
+    ) {
         let meta = OutcomeMeta {
             outcomes: vec![OutcomeMarket {
                 outcome: 42,
                 name: "BTC daily".to_string(),
                 description: "BTC settles above strike at 06:00 UTC".to_string(),
+                quote_token: Some(quote_token.to_string()),
                 side_specs: vec![
                     OutcomeSideSpec {
                         name: "Yes".to_string(),
@@ -2271,24 +2514,71 @@ mod tests {
             hash: "0xfeed".to_string(),
             oid: 99_001,
             crossed: true,
-            fee: dec!(0.0),
+            fee,
             tid: 77_001,
-            fee_token: Ustr::from("+420"),
+            fee_token: Ustr::from(fee_token),
             builder_fee: Some(dec!(0.0001)),
+            cloid: None,
         };
 
         let account_id = AccountId::from("HYPERLIQUID-001");
         let report = parse_fill_report(&fill, &yes, account_id, UnixNanos::default()).unwrap();
 
         // Zero-fee outcome fills resolve commission to the instrument's quote
-        // currency (USDH) rather than the side token, so downstream OrderFilled
+        // currency rather than the side token, so downstream OrderFilled
         // events and persistence carry a registered currency.
-        assert_eq!(report.commission.currency.code, "USDH");
-        assert!(report.commission.as_decimal().is_zero());
+        assert_eq!(
+            report.commission,
+            Money::from_decimal(fee, yes.quote_currency()).unwrap()
+        );
         assert_eq!(report.order_side, OrderSide::Buy);
         assert_eq!(report.liquidity_side, LiquiditySide::Taker);
         assert_eq!(report.last_qty.as_decimal(), dec!(1000));
         assert_eq!(report.last_px.as_decimal(), dec!(0.55));
+    }
+
+    #[rstest]
+    fn test_parse_fill_report_outcome_keeps_venue_price() {
+        // Venue outcome prices use five decimals, which must not be rounded away
+        let meta = OutcomeMeta {
+            outcomes: vec![OutcomeMarket {
+                outcome: 1473,
+                name: "Recurring".to_string(),
+                description: String::new(),
+                quote_token: Some("USDC".to_string()),
+                side_specs: vec![],
+            }],
+            questions: vec![],
+        };
+
+        let defs = parse_outcome_instruments(&meta).unwrap();
+        let yes = create_instrument_from_def(&defs[0], UnixNanos::default()).unwrap();
+
+        let fill = HyperliquidFill {
+            coin: Ustr::from("#14730"),
+            px: dec!(0.61271),
+            sz: dec!(112.0),
+            side: HyperliquidSide::Sell,
+            time: 1_791_262_678_530,
+            start_position: dec!(112.0),
+            dir: HyperliquidFillDirection::Sell,
+            closed_pnl: dec!(-0.0056),
+            hash: "0xbeef".to_string(),
+            oid: 99_002,
+            crossed: true,
+            fee: dec!(0.09223001),
+            tid: 77_002,
+            fee_token: Ustr::from("USDC"),
+            builder_fee: None,
+            cloid: None,
+        };
+
+        let account_id = AccountId::from("HYPERLIQUID-001");
+        let report = parse_fill_report(&fill, &yes, account_id, UnixNanos::default()).unwrap();
+
+        assert_eq!(report.last_px, Price::from("0.61271"));
+        assert_eq!(report.last_qty, Quantity::from("112"));
+        assert_eq!(report.last_qty.precision, 0);
     }
 
     #[rstest]
@@ -2318,6 +2608,7 @@ mod tests {
                 outcome: 88,
                 name: "Edge".to_string(),
                 description: String::new(),
+                quote_token: Some("USDC".to_string()),
                 side_specs: vec![],
             }],
             questions: vec![],
@@ -2332,7 +2623,7 @@ mod tests {
 
         let currency = resolve_fee_currency("+880", Decimal::ZERO, &yes)
             .expect("zero-fee outcome side token must resolve to quote currency");
-        assert_eq!(currency.code, "USDH");
+        assert_eq!(currency.code, "USDC");
 
         let err = resolve_fee_currency("+880", dec!(0.01), &yes).unwrap_err();
         let err_msg = err.to_string();
@@ -2362,6 +2653,7 @@ mod tests {
                 outcome: 77,
                 name: "Edge".to_string(),
                 description: String::new(),
+                quote_token: Some("USDC".to_string()),
                 side_specs: vec![],
             }],
             questions: vec![],
@@ -2374,7 +2666,7 @@ mod tests {
         // return the instrument's quote currency on a zero-fee fill.
         let currency = resolve_fee_currency("+UNREGISTERED-TOKEN", Decimal::ZERO, &no)
             .expect("zero-fee fallback should succeed");
-        assert_eq!(currency.code, "USDH");
+        assert_eq!(currency.code, "USDC");
 
         let err = resolve_fee_currency("+UNREGISTERED-TOKEN", dec!(0.01), &no).unwrap_err();
         assert!(err.to_string().contains("non-zero fee"));
@@ -2407,6 +2699,7 @@ mod tests {
                 description:
                     "class:priceBinary|underlying:BTC|expiry:20260508-0600|targetPrice:81041|period:1d"
                         .to_string(),
+                quote_token: Some("USDC".to_string()),
                 side_specs: vec![
                     OutcomeSideSpec {
                         name: "Yes".to_string(),
@@ -2435,12 +2728,14 @@ mod tests {
                     outcome: 6,
                     name: "Recurring Fallback".to_string(),
                     description: "other".to_string(),
+                    quote_token: Some("USDC".to_string()),
                     side_specs: vec![],
                 },
                 OutcomeMarket {
                     outcome: 7,
                     name: "Recurring Named Outcome".to_string(),
                     description: "index:0".to_string(),
+                    quote_token: Some("USDC".to_string()),
                     side_specs: vec![],
                 },
             ],
@@ -2554,5 +2849,162 @@ mod tests {
         assert!(meta.parent_question(7).is_some());
         assert!(meta.parent_question(6).is_some());
         assert!(meta.parent_question(99).is_none());
+    }
+
+    fn frontend_open_order_row(order_type: &str, is_trigger: bool, trigger_px: &str) -> Value {
+        // Shape of a `frontendOpenOrders` row: no `tpsl` / `isMarket`, the trigger kind is
+        // only carried by the `orderType` label
+        json!({
+            "coin": "BTC",
+            "side": "A",
+            "limitPx": "49000.0",
+            "sz": "0.01",
+            "oid": 42,
+            "timestamp": 1_754_000_000_000u64,
+            "triggerCondition": if is_trigger { "Price below 50000" } else { "N/A" },
+            "isTrigger": is_trigger,
+            "triggerPx": trigger_px,
+            "children": [],
+            "isPositionTpsl": false,
+            "reduceOnly": true,
+            "orderType": order_type,
+            "origSz": "0.01",
+            "tif": if is_trigger { Value::Null } else { json!("Gtc") },
+            "cloid": null
+        })
+    }
+
+    fn create_btc_perp_instrument() -> InstrumentAny {
+        let instrument_id = InstrumentId::new(Symbol::new("BTC-PERP"), *HYPERLIQUID_VENUE);
+
+        InstrumentAny::CryptoPerpetual(
+            CryptoPerpetual::builder()
+                .instrument_id(instrument_id)
+                .raw_symbol(Symbol::new("BTC-PERP"))
+                .base_currency(Currency::from("BTC"))
+                .quote_currency(Currency::from("USDC"))
+                .settlement_currency(Currency::from("USDC"))
+                .is_inverse(false)
+                .price_precision(1)
+                .size_precision(5)
+                .price_increment(Price::from("0.1"))
+                .size_increment(Quantity::from("0.00001"))
+                .ts_event(UnixNanos::default())
+                .ts_init(UnixNanos::default())
+                .build()
+                .unwrap(),
+        )
+    }
+
+    #[rstest]
+    #[case("Stop Market", OrderType::StopMarket)]
+    #[case("Stop Limit", OrderType::StopLimit)]
+    #[case("Take Profit Market", OrderType::MarketIfTouched)]
+    #[case("Take Profit Limit", OrderType::LimitIfTouched)]
+    fn test_parse_order_status_report_from_frontend_open_order_trigger_label(
+        #[case] label: &str,
+        #[case] expected: OrderType,
+    ) {
+        let instrument = create_btc_perp_instrument();
+        let order: WsBasicOrderData =
+            serde_json::from_value(frontend_open_order_row(label, true, "50000.0")).unwrap();
+
+        let report = parse_order_status_report_from_basic(
+            &order,
+            &HyperliquidOrderStatusEnum::Open,
+            &instrument,
+            AccountId::new("HYPERLIQUID-001"),
+            UnixNanos::default(),
+        )
+        .unwrap();
+
+        assert_eq!(report.order_type, expected);
+        assert_eq!(report.trigger_price, Some(Price::from("50000.0")));
+        assert_eq!(report.trigger_type, Some(TriggerType::Default));
+        assert_eq!(report.price, Some(Price::from("49000.0")));
+        assert!(report.reduce_only);
+    }
+
+    #[rstest]
+    fn test_parse_order_status_report_from_frontend_open_order_plain_limit() {
+        let instrument = create_btc_perp_instrument();
+        let order: WsBasicOrderData =
+            serde_json::from_value(frontend_open_order_row("Limit", false, "0.0")).unwrap();
+
+        let report = parse_order_status_report_from_basic(
+            &order,
+            &HyperliquidOrderStatusEnum::Open,
+            &instrument,
+            AccountId::new("HYPERLIQUID-001"),
+            UnixNanos::default(),
+        )
+        .unwrap();
+
+        assert_eq!(report.order_type, OrderType::Limit);
+        assert!(report.trigger_price.is_none());
+        assert!(report.trigger_type.is_none());
+    }
+
+    #[rstest]
+    #[case::empty("")]
+    #[case::whitespace("   ")]
+    #[case::non_ascii("0x\u{e9}")]
+    fn test_parse_order_status_report_rejects_invalid_client_order_id(#[case] cloid: &str) {
+        let instrument = create_btc_perp_instrument();
+        let mut order: WsBasicOrderData =
+            serde_json::from_value(frontend_open_order_row("Limit", false, "0.0")).unwrap();
+        order.cloid = Some(cloid.to_string());
+
+        let result = parse_order_status_report_from_basic(
+            &order,
+            &HyperliquidOrderStatusEnum::Open,
+            &instrument,
+            AccountId::from("HYPERLIQUID-REST"),
+            UnixNanos::default(),
+        );
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "invalid order client order ID"
+        );
+    }
+
+    #[rstest]
+    #[case("Ioc", "0.0005", OrderStatus::Canceled, "0.0145")]
+    #[case("Gtc", "0.0005", OrderStatus::Canceled, "0.0145")]
+    #[case("Ioc", "0.0", OrderStatus::Filled, "0.015")]
+    #[case("Ioc", "0.000001", OrderStatus::Filled, "0.015")] // Below size precision
+    fn test_parse_order_status_report_from_basic_filled_with_remainder(
+        #[case] tif: &str,
+        #[case] sz: &str,
+        #[case] expected_status: OrderStatus,
+        #[case] expected_filled: &str,
+    ) {
+        // The venue marks an IOC order `filled` even when its remainder was canceled; `sz`
+        // carries that unfilled remainder
+        let instrument = create_btc_perp_instrument();
+        let mut row = frontend_open_order_row("Limit", false, "0.0");
+        row["origSz"] = json!("0.015");
+        row["sz"] = json!(sz);
+        row["tif"] = json!(tif);
+        let order: WsBasicOrderData = serde_json::from_value(row).unwrap();
+
+        let report = parse_order_status_report_from_basic(
+            &order,
+            &HyperliquidOrderStatusEnum::Filled,
+            &instrument,
+            AccountId::new("HYPERLIQUID-001"),
+            UnixNanos::default(),
+        )
+        .unwrap();
+
+        assert_eq!(report.order_status, expected_status);
+        assert_eq!(report.quantity, Quantity::from("0.015"));
+        assert_eq!(report.filled_qty, Quantity::from(expected_filled));
+        assert!(report.price.is_none(), "venue-filled rows carry no price");
+        assert_eq!(
+            report.cancel_reason.is_some(),
+            expected_status == OrderStatus::Canceled
+        );
     }
 }

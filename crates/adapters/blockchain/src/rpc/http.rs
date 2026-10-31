@@ -17,6 +17,7 @@ use std::{collections::HashMap, fmt::Debug, net::Ipv4Addr, num::NonZeroU32, str:
 
 use alloy::primitives::{Address, B256, Bytes, U256};
 use bytes::Bytes as HttpBytes;
+use nautilus_common::config::check_valid_format;
 use nautilus_core::{hex, string::secret::REDACTED};
 use nautilus_model::defi::rpc::{RpcLog, RpcNodeHttpResponse};
 use nautilus_network::{
@@ -63,15 +64,21 @@ impl BlockchainHttpRpcClient {
     ///
     /// If `rpc_request_per_second` is `Some(0)` or an invalid value, rate limiting is disabled.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the internal HTTP client cannot be created.
-    #[must_use]
+    /// Returns an error if the endpoint is invalid or the HTTP client cannot be created.
     pub fn new(
         http_rpc_url: String,
         rpc_request_per_second: Option<u32>,
         proxy_url: Option<String>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
+        check_valid_format(
+            "http_rpc_url",
+            Url::parse(&http_rpc_url)
+                .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host().is_some()),
+            "an HTTP or HTTPS URL with a host",
+        )?;
+
         let default_quota =
             rpc_request_per_second.and_then(|rps| Quota::per_second(NonZeroU32::new(rps)?));
         let use_system_proxy = !is_canonical_loopback_endpoint(&http_rpc_url);
@@ -81,13 +88,13 @@ impl BlockchainHttpRpcClient {
             .maybe_default_quota(default_quota)
             .maybe_proxy_url(proxy_url)
             .redirect_policy(HttpRedirectPolicy::Reject)
+            .redact_url(true)
             .use_system_proxy(use_system_proxy)
-            .build()
-            .expect("Failed to create HTTP client");
-        Self {
+            .build()?;
+        Ok(Self {
             http_rpc_url,
             http_client,
-        }
+        })
     }
 
     /// Generic method that sends a JSON-RPC request and returns the raw response in bytes.
@@ -115,7 +122,7 @@ impl BlockchainHttpRpcClient {
 
         let response = self
             .http_client
-            .request_with_url_redacted(
+            .request(
                 Method::POST,
                 self.http_rpc_url.clone(),
                 None,
@@ -858,8 +865,8 @@ impl BlockchainHttpRpcClient {
     ///
     /// # Errors
     ///
-    /// Returns a [`BroadcastError`] classifying the failure. Errors are sanitized: they carry
-    /// the numeric RPC code only, never the endpoint URL or the signed payload.
+    /// Returns an error if broadcasting fails. The error classifies the failure and is sanitized:
+    /// it carries the numeric RPC code only, never the endpoint URL or the signed payload.
     pub async fn send_raw_transaction(
         &self,
         raw_tx: &[u8],
@@ -954,9 +961,7 @@ fn is_canonical_loopback_endpoint(endpoint: &str) -> bool {
 
     let raw_host = if let Some(suffix) = authority.strip_prefix("[::1]") {
         if suffix.is_empty() || suffix.starts_with(':') {
-            return Url::parse(endpoint)
-                .ok()
-                .is_some_and(|url| url.host_str() == Some("[::1]"));
+            return Url::parse(endpoint).is_ok_and(|url| url.host_str() == Some("[::1]"));
         }
         return false;
     } else if authority.starts_with('[') {
@@ -970,9 +975,10 @@ fn is_canonical_loopback_endpoint(endpoint: &str) -> bool {
     let Ok(address) = raw_host.parse::<Ipv4Addr>() else {
         return false;
     };
+
     address.is_loopback()
         && raw_host == address.to_string()
-        && Url::parse(endpoint).ok().is_some_and(|url| {
+        && Url::parse(endpoint).is_ok_and(|url| {
             url.host_str()
                 .and_then(|host| host.parse::<Ipv4Addr>().ok())
                 == Some(address)
@@ -1038,9 +1044,44 @@ fn parse_hex_quantity_result(method: &str, result: Option<String>) -> anyhow::Re
 #[cfg(test)]
 pub(crate) mod tests {
     use alloy::primitives::{address, b256};
+    use nautilus_common::config::ConfigError;
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    #[case("not a URL")]
+    #[case("file:///tmp/rpc")]
+    #[case("http://")]
+    fn test_constructor_rejects_invalid_endpoint(#[case] endpoint: &str) {
+        let error = BlockchainHttpRpcClient::new(endpoint.to_string(), None, None).unwrap_err();
+
+        assert_eq!(
+            error.downcast_ref::<ConfigError>(),
+            Some(&ConfigError::invalid_format(
+                "http_rpc_url",
+                "an HTTP or HTTPS URL with a host"
+            )),
+        );
+    }
+
+    #[rstest]
+    fn test_constructor_propagates_invalid_proxy() {
+        let error = BlockchainHttpRpcClient::new(
+            "https://rpc.example.com".to_string(),
+            None,
+            Some("://invalid".to_string()),
+        )
+        .unwrap_err();
+
+        let source = error.downcast_ref::<HttpClientError>().unwrap();
+
+        let HttpClientError::InvalidProxy(reason) = source else {
+            panic!("unexpected HTTP client error: {source:?}");
+        };
+
+        assert_eq!(reason, "proxy URL is malformed");
+    }
 
     #[rstest]
     fn rpc_response_preview_truncates_on_utf8_boundary() {
@@ -1102,7 +1143,8 @@ pub(crate) mod tests {
             endpoint.to_string(),
             None,
             Some("not a valid proxy URL".to_string()),
-        );
+        )
+        .unwrap();
 
         assert_eq!(client.http_rpc_url, endpoint);
     }
@@ -1576,7 +1618,7 @@ pub(crate) mod tests {
     async fn client_for(state: MockRpcState) -> (BlockchainHttpRpcClient, MockRpcState) {
         let addr = start_mock_rpc_server(state.clone()).await;
         (
-            BlockchainHttpRpcClient::new(format!("http://{addr}"), None, None),
+            BlockchainHttpRpcClient::new(format!("http://{addr}"), None, None).unwrap(),
             state,
         )
     }
@@ -1589,7 +1631,7 @@ pub(crate) mod tests {
         let http_rpc_url = format!(
             "https://rpc-user:{USERINFO_SECRET}@rpc.example.com/{PATH_SECRET}?api_key={QUERY_SECRET}"
         );
-        let client = BlockchainHttpRpcClient::new(http_rpc_url.clone(), None, None);
+        let client = BlockchainHttpRpcClient::new(http_rpc_url.clone(), None, None).unwrap();
 
         let debug = format!("{client:?}");
 
@@ -1598,6 +1640,40 @@ pub(crate) mod tests {
         assert!(!debug.contains(PATH_SECRET));
         assert!(!debug.contains(QUERY_SECRET));
         assert!(!debug.contains(&http_rpc_url));
+    }
+
+    #[tokio::test]
+    async fn transport_errors_omit_rpc_origin() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+        });
+
+        let client = BlockchainHttpRpcClient::new(
+            format!("http://{addr}/rpc-path-secret?api_key=rpc-query-secret"),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let error = client
+            .post_json_body(Vec::new(), Some(2))
+            .await
+            .unwrap_err();
+        peer.await.unwrap();
+
+        assert!(
+            matches!(error, HttpClientError::TransportError(_)),
+            "{error:?}"
+        );
+
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(!rendered.contains(&addr.to_string()), "{rendered}");
+            assert!(!rendered.contains("rpc-path-secret"), "{rendered}");
+            assert!(!rendered.contains("rpc-query-secret"), "{rendered}");
+        }
     }
 
     #[tokio::test]

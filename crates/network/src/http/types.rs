@@ -15,10 +15,11 @@
 
 //! HTTP types including status codes, methods, and responses.
 
-use std::{collections::HashMap, hash::Hash};
+use std::{collections::HashMap, hash::Hash, time::Duration};
 
 use bytes::Bytes;
 use http::{Method, StatusCode, status::InvalidStatusCode};
+use jiff::{Timestamp, fmt::rfc2822::DateTimeParser};
 
 /// An HTTP status code.
 ///
@@ -122,15 +123,33 @@ impl From<HttpMethod> for Method {
     }
 }
 
-/// The status, selected headers, and raw body returned by an HTTP request.
+/// The status, selected headers, and decoded body returned by a buffered HTTP request.
 #[derive(Clone, Debug)]
 pub struct HttpResponse {
     /// The HTTP status code.
     pub status: HttpStatus,
     /// The response headers as a map of key-value pairs.
     pub headers: HashMap<String, String>,
-    /// The raw response body.
+    /// The response body after HTTP content decoding.
     pub body: Bytes,
+}
+
+/// Parses a `Retry-After` delay in seconds or an HTTP date relative to `now`.
+///
+/// Returns zero for a past date and `None` for an invalid value.
+#[must_use]
+pub fn parse_retry_after(value: &str, now: Timestamp) -> Option<Duration> {
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+
+    let retry_at = DateTimeParser::new().parse_timestamp(value).ok()?;
+    let delay = retry_at.duration_since(now);
+    if delay.is_negative() {
+        Some(Duration::ZERO)
+    } else {
+        Some(delay.unsigned_abs())
+    }
 }
 
 #[cfg(test)]

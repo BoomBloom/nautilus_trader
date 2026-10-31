@@ -490,8 +490,9 @@ async fn unsubscribe_during_recovery_does_not_replay_book(#[case] timeout: u64) 
     session.stop().await;
 }
 
+// A rejected replacement stays owned by recovery, so a late snapshot restores the book
 #[tokio::test]
-async fn permanent_rejection_suppresses_late_snapshot_until_reconnect() {
+async fn permanent_rejection_accepts_late_snapshot_without_reconnect() {
     let mut session = BookClient::connect(1).await;
     let id = InstrumentId::from("BTC-USD.OKX");
     session.subscribe(id);
@@ -500,21 +501,11 @@ async fn permanent_rejection_suppresses_late_snapshot_until_reconnect() {
     session.wire.late_snapshot.store(true, Ordering::SeqCst);
     session.wire.corrupt_updates.store(1, Ordering::SeqCst);
     session.wire.push.notify_one();
-    wait_until_async(
-        || async { session.wire.subscriptions.load(Ordering::SeqCst) == 2 },
-        Duration::from_secs(5),
-    )
-    .await;
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), session.events.recv())
-            .await
-            .is_err()
-    );
-    session.wire.reject.store(false, Ordering::SeqCst);
-    session.wire.late_snapshot.store(false, Ordering::SeqCst);
-    session.reconnect();
+
     session.snapshots(&[id], 2).await;
-    assert_eq!(session.wire.subscriptions.load(Ordering::SeqCst), 3);
+
+    assert_eq!(session.wire.subscriptions.load(Ordering::SeqCst), 2);
+    assert_eq!(session.wire.connections.load(Ordering::SeqCst), 1);
     assert_eq!(session.snapshots[&id], 2);
     session.stop().await;
 }
@@ -762,7 +753,7 @@ async fn depth_and_deltas_use_independent_feeds(
         {
             DataEvent::Data(Data::BookDepth(value)) => depth = Some(value),
             DataEvent::Data(Data::BookDeltas(value)) => deltas = Some(value),
-            DataEvent::Instrument(_) => {}
+            DataEvent::Data(Data::Instrument(_)) => {}
             other => panic!("unexpected event: {other:?}"),
         }
     }
@@ -784,8 +775,7 @@ async fn depth_and_deltas_use_independent_feeds(
     different.depth = std::num::NonZeroUsize::new(3);
     assert!(session.client.subscribe_book_depth(different).is_err());
     let mut conflict = subscribe_depth();
-    let mut params = Params::new();
-    params.insert("rpi".to_string(), json!(true));
+    let params = Params::new([("rpi".to_string(), json!(true))].into());
     conflict.params = Some(params);
     assert!(session.client.subscribe_book_depth(conflict).is_err());
 
@@ -980,7 +970,7 @@ async fn spread_depth_and_deltas_keep_shared_feed_until_last_unsubscribe(
         {
             DataEvent::Data(Data::BookDepth(depth)) => initial_depth = Some(depth),
             DataEvent::Data(Data::BookDeltas(deltas)) => initial_deltas = Some(deltas),
-            DataEvent::Instrument(_) => {}
+            DataEvent::Data(Data::Instrument(_)) => {}
             other => panic!("unexpected event: {other:?}"),
         }
     }

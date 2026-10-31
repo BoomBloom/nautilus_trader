@@ -29,8 +29,8 @@ use super::{
     DecodeDataFromRecordBatch, EncodingError, KEY_IDENTIFIER, decode_required_decimal_price,
     decode_required_decimal_quantity, decode_required_timestamp, enum_dictionary_array,
     enum_dictionary_data_type, extract_column, extract_column_string, fixed_decimal_data_type,
-    identifier_array_from_display, parse_metadata, required_price_decimal_array,
-    required_quantity_decimal_array,
+    identifier_array_from_display, metadata_with_type_name, parse_metadata,
+    required_price_decimal_array, required_quantity_decimal_array, validate_required_column,
 };
 #[cfg(test)]
 use super::{KEY_INSTRUMENT_ID, KEY_PRICE_PRECISION};
@@ -39,8 +39,8 @@ use crate::arrow::{ArrowSchemaProvider, Data, DecodeFromRecordBatch, EncodeToRec
 impl ArrowSchemaProvider for TradeTick {
     fn get_schema(metadata: Option<HashMap<String, String>>) -> Schema {
         let fields = vec![
-            Field::new("price", fixed_decimal_data_type(), true),
-            Field::new("size", fixed_decimal_data_type(), true),
+            Field::new("price", fixed_decimal_data_type(), false),
+            Field::new("size", fixed_decimal_data_type(), false),
             Field::new("aggressor_side", enum_dictionary_data_type(), false),
             Field::new("trade_id", DataType::Utf8, false),
             Field::new("ts_event", crate::arrow::timestamp_data_type(), false),
@@ -48,10 +48,7 @@ impl ArrowSchemaProvider for TradeTick {
             Field::new(KEY_IDENTIFIER, DataType::Utf8, true),
         ];
 
-        match metadata {
-            Some(metadata) => Schema::new_with_metadata(fields, metadata),
-            None => Schema::new(fields),
-        }
+        Schema::new_with_metadata(fields, metadata_with_type_name("TradeTick", metadata))
     }
 }
 
@@ -138,6 +135,7 @@ impl DecodeFromRecordBatch for TradeTick {
             extract_column::<Decimal128Array>(cols, "size", 1, fixed_decimal_data_type())?;
 
         let aggressor_side_values = extract_column_string(cols, "aggressor_side", 2)?;
+        validate_required_column(cols[2].as_ref(), "aggressor_side")?;
         let ts_event_values = extract_column::<UInt64Array>(cols, "ts_event", 4, DataType::UInt64)?;
         let ts_init_values = extract_column::<UInt64Array>(cols, "ts_init", 5, DataType::UInt64)?;
 
@@ -221,7 +219,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::arrow::{get_raw_price, get_raw_quantity};
+    use crate::arrow::{KEY_TYPE_NAME, get_raw_price, get_raw_quantity};
 
     #[rstest]
     fn test_get_schema() {
@@ -231,10 +229,10 @@ mod tests {
 
         let mut expected_fields = Vec::with_capacity(7);
 
-        expected_fields.push(Field::new("price", fixed_decimal_data_type(), true));
+        expected_fields.push(Field::new("price", fixed_decimal_data_type(), false));
 
         expected_fields.extend(vec![
-            Field::new("size", fixed_decimal_data_type(), true),
+            Field::new("size", fixed_decimal_data_type(), false),
             Field::new("aggressor_side", enum_dictionary_data_type(), false),
             Field::new("trade_id", DataType::Utf8, false),
             Field::new("ts_event", crate::arrow::timestamp_data_type(), false),
@@ -242,7 +240,9 @@ mod tests {
             Field::new(KEY_IDENTIFIER, DataType::Utf8, true),
         ]);
 
-        let expected_schema = Schema::new_with_metadata(expected_fields, metadata);
+        let mut expected_metadata = metadata;
+        expected_metadata.insert(KEY_TYPE_NAME.to_string(), "TradeTick".to_string());
+        let expected_schema = Schema::new_with_metadata(expected_fields, expected_metadata);
         assert_eq!(schema, expected_schema);
     }
 
@@ -455,6 +455,72 @@ mod tests {
             err.to_string().contains("NULL value at row 0"),
             "Expected NULL error, was: {err}"
         );
+    }
+
+    #[rstest]
+    #[case::null_key(true)]
+    #[case::null_value(false)]
+    fn test_decode_batch_rejects_null_aggressor_side_with_field_and_row(#[case] null_key: bool) {
+        use arrow::{
+            array::{DictionaryArray, Int8Array},
+            datatypes::Int8Type,
+        };
+
+        let instrument_id = InstrumentId::from("AAPL.XNAS");
+        let metadata = TradeTick::get_metadata(&instrument_id, 2, 0);
+        let raw_price = (100.00 * FIXED_SCALAR) as PriceRaw;
+        let price =
+            crate::arrow::test_support::decimal_array_from_bytes(vec![&raw_price.to_le_bytes()]);
+        let size = crate::arrow::test_support::decimal_array_from_bytes(vec![
+            &((1000.0 * FIXED_SCALAR) as QuantityRaw).to_le_bytes(),
+        ]);
+
+        let aggressor_side = if null_key {
+            DictionaryArray::<Int8Type>::try_new(
+                Int8Array::from(vec![None]),
+                Arc::new(StringArray::from(vec!["BUY"])),
+            )
+            .unwrap()
+        } else {
+            DictionaryArray::<Int8Type>::try_new(
+                Int8Array::from(vec![0]),
+                Arc::new(StringArray::from(vec![None::<&str>])),
+            )
+            .unwrap()
+        };
+
+        let trade_id = StringArray::from(vec!["1"]);
+        let ts_event = UInt64Array::from(vec![1]);
+        let ts_init = UInt64Array::from(vec![2]);
+        let fields = vec![
+            Field::new("price", fixed_decimal_data_type(), false),
+            Field::new("size", fixed_decimal_data_type(), false),
+            Field::new("aggressor_side", enum_dictionary_data_type(), true),
+            Field::new("trade_id", DataType::Utf8, false),
+            Field::new("ts_event", crate::arrow::timestamp_data_type(), false),
+            Field::new("ts_init", crate::arrow::timestamp_data_type(), false),
+        ];
+        let schema = Schema::new_with_metadata(fields, metadata.clone());
+        let record_batch = crate::arrow::record_batch_with_timestamps(
+            Arc::new(schema),
+            vec![
+                Arc::new(price),
+                Arc::new(size),
+                Arc::new(aggressor_side),
+                Arc::new(trade_id),
+                Arc::new(ts_event),
+                Arc::new(ts_init),
+            ],
+        )
+        .unwrap();
+
+        let result = TradeTick::decode_batch(&metadata, record_batch);
+
+        assert!(matches!(
+            result,
+            Err(EncodingError::ParseError("aggressor_side", ref message))
+                if message == "row 0: required value is null"
+        ));
     }
 
     #[rstest]

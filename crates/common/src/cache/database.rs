@@ -24,7 +24,7 @@ use nautilus_model::{
     accounts::AccountAny,
     data::{
         Bar, CustomData, DataType, FundingRateUpdate, InstrumentClose, QuoteTick, TradeTick,
-        greeks::{GreeksData, YieldCurveData},
+        greeks::{GreeksData, YieldCurve},
     },
     events::{OrderEventAny, OrderSnapshot, position::snapshot::PositionSnapshot},
     identifiers::{
@@ -42,6 +42,66 @@ use ustr::Ustr;
 use super::config::CacheConfig;
 use crate::signal::Signal;
 
+/// Registers currencies loaded from a cache database, keeping the registry's definition.
+///
+/// A `Money` or `Currency` decoded afterwards resolves its code through the global registry, so a
+/// loaded currency must reach it before the dependent payloads are read. `Currency::register` does
+/// not overwrite, so a built-in constant or a currency an adapter registered first keeps its
+/// definition; the map takes that definition too, so the cache and the decoded payloads agree, and a
+/// stored record that differs from it is logged.
+///
+/// # Errors
+///
+/// Returns an error if `Currency::register` does; it does not at present, so the result only
+/// keeps callers forward-compatible.
+pub fn register_loaded_currencies(currencies: &mut AHashMap<Ustr, Currency>) -> anyhow::Result<()> {
+    for (code, currency) in currencies.iter_mut() {
+        Currency::register(*currency, false)?;
+
+        let Some(registered) = Currency::try_from_str(code) else {
+            continue;
+        };
+        let mut differences: Vec<String> = Vec::new();
+        if registered.precision != currency.precision {
+            differences.push(format!(
+                "precision {} vs registered {}",
+                currency.precision, registered.precision
+            ));
+        }
+
+        if registered.iso4217 != currency.iso4217 {
+            differences.push(format!(
+                "iso4217 {} vs registered {}",
+                currency.iso4217, registered.iso4217
+            ));
+        }
+
+        if registered.name != currency.name {
+            differences.push(format!(
+                "name {} vs registered {}",
+                currency.name, registered.name
+            ));
+        }
+
+        if registered.currency_type != currency.currency_type {
+            differences.push(format!(
+                "type {:?} vs registered {:?}",
+                currency.currency_type, registered.currency_type
+            ));
+        }
+
+        if !differences.is_empty() {
+            log::warn!(
+                "Stored currency {code} differs from the registered definition ({}); using the registered one",
+                differences.join(", "),
+            );
+            *currency = registered;
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Default)]
 pub struct CacheMap {
     pub currencies: AHashMap<Ustr, Currency>,
@@ -52,7 +112,7 @@ pub struct CacheMap {
     pub orders: AHashMap<ClientOrderId, OrderAny>,
     pub positions: AHashMap<PositionId, Position>,
     pub greeks: AHashMap<InstrumentId, GreeksData>,
-    pub yield_curves: AHashMap<String, YieldCurveData>,
+    pub yield_curves: AHashMap<String, YieldCurve>,
 }
 
 /// Factory for constructing cache database adapters at runtime.
@@ -83,11 +143,14 @@ pub trait CacheDatabaseAdapter {
     /// Returns an error if the database fails to close properly.
     fn close(&mut self) -> anyhow::Result<()>;
 
-    /// Flushes any pending changes to the database.
+    /// Clears persisted data according to the backing's scope.
+    ///
+    /// Redis clears the entire logical database, including other traders and user keys.
+    /// PostgreSQL removes only this trader's rows and saved component state.
     ///
     /// # Errors
     ///
-    /// Returns an error if flushing changes fails.
+    /// Returns an error if removing the persisted data fails.
     fn flush(&mut self) -> anyhow::Result<()>;
 
     /// Loads all cached data into memory.
@@ -159,18 +222,18 @@ pub trait CacheDatabaseAdapter {
     ///
     /// # Errors
     ///
-    /// Returns an error if loading greeks data fails.
+    /// Returns an error if loading greeks data fails or the adapter does not support it.
     async fn load_greeks(&self) -> anyhow::Result<AHashMap<InstrumentId, GreeksData>> {
-        Ok(AHashMap::new())
+        anyhow::bail!("Loading greeks for cache adapter not supported")
     }
 
-    /// Loads all [`YieldCurveData`] from the cache.
+    /// Loads all [`YieldCurve`] from the cache.
     ///
     /// # Errors
     ///
-    /// Returns an error if loading yield curve data fails.
-    async fn load_yield_curves(&self) -> anyhow::Result<AHashMap<String, YieldCurveData>> {
-        Ok(AHashMap::new())
+    /// Returns an error if loading yield curve data fails or the adapter does not support it.
+    async fn load_yield_curves(&self) -> anyhow::Result<AHashMap<String, YieldCurve>> {
+        anyhow::bail!("Loading yield curves for cache adapter not supported")
     }
 
     /// Loads mapping from order IDs to position IDs.
@@ -213,6 +276,30 @@ pub trait CacheDatabaseAdapter {
         &self,
         instrument_id: &InstrumentId,
     ) -> anyhow::Result<Option<SyntheticInstrument>>;
+
+    /// Loads an instrument for a synchronous cache caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if loading fails or synchronous reads are unsupported.
+    fn load_instrument_sync(
+        &self,
+        _instrument_id: &InstrumentId,
+    ) -> anyhow::Result<Option<InstrumentAny>> {
+        anyhow::bail!("Synchronous instrument loading is not supported by this cache database")
+    }
+
+    /// Loads a synthetic instrument for a synchronous cache caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if loading fails or synchronous reads are unsupported.
+    fn load_synthetic_sync(
+        &self,
+        _instrument_id: &InstrumentId,
+    ) -> anyhow::Result<Option<SyntheticInstrument>> {
+        anyhow::bail!("Synchronous synthetic loading is not supported by this cache database")
+    }
 
     /// Loads a single account by ID.
     ///
@@ -440,18 +527,18 @@ pub trait CacheDatabaseAdapter {
     ///
     /// # Errors
     ///
-    /// Returns an error if adding greeks data fails.
+    /// Returns an error if adding greeks data fails or the adapter does not support it.
     fn add_greeks(&self, _greeks: &GreeksData) -> anyhow::Result<()> {
-        Ok(())
+        anyhow::bail!("Saving greeks for cache adapter not supported")
     }
 
     /// Adds yield curve data to the cache.
     ///
     /// # Errors
     ///
-    /// Returns an error if adding yield curve data fails.
-    fn add_yield_curve(&self, _yield_curve: &YieldCurveData) -> anyhow::Result<()> {
-        Ok(())
+    /// Returns an error if adding yield curve data fails or the adapter does not support it.
+    fn add_yield_curve(&self, _yield_curve: &YieldCurve) -> anyhow::Result<()> {
+        anyhow::bail!("Saving yield curves for cache adapter not supported")
     }
 
     /// Deletes actor state from the cache.
@@ -482,7 +569,10 @@ pub trait CacheDatabaseAdapter {
     /// Returns an error if deleting a position fails.
     fn delete_position(&self, position_id: &PositionId) -> anyhow::Result<()>;
 
-    /// Deletes an account event from the cache.
+    /// Requests deletion of an account event from the database.
+    ///
+    /// Redis and PostgreSQL retain the full account history for balance and margin replay;
+    /// their implementations log the request and return success without deleting it.
     ///
     /// # Errors
     ///

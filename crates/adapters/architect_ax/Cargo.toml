@@ -73,6 +73,7 @@ dashmap = { workspace = true }
 dotenvy = { workspace = true }
 futures-util = { workspace = true }
 http = { workspace = true }
+indexmap = { workspace = true }
 jiff = { workspace = true }
 log = { workspace = true }
 parking_lot = { workspace = true }
@@ -93,6 +94,7 @@ pyo3-async-runtimes = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
+nautilus-live = { workspace = true, features = ["test-support"] }
 nautilus-testkit = { workspace = true, default-features = false, features = [
   "testers",
 ] }
@@ -158,3 +160,12 @@ name = "ax-exec-tester"
 path = "examples/node_exec_tester.rs"
 required-features = ["examples"]
 doc = false
+
+# Sandbox market-data validation; needs sandbox API credentials in AX_API_KEY and AX_API_SECRET.
+# Run with `cargo test --package nautilus-architect-ax --features examples --test ax-book-stress -- --timeout 10 --rounds 14`
+[[test]]
+name = "ax-book-stress"
+path = "tests/stress/book_stress.rs"
+harness = false
+test = false
+required-features = ["examples"]

@@ -243,6 +243,52 @@ impl FromU8 for AssetClass {
     }
 }
 
+/// How position reconciliation may use a venue-reported average entry price.
+#[repr(C)]
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Display,
+    Hash,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    AsRefStr,
+    FromRepr,
+    EnumIter,
+    EnumString,
+)]
+#[strum(ascii_case_insensitive)]
+#[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        frozen,
+        eq,
+        eq_int,
+        module = "nautilus_trader.model",
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE",
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.model")
+)]
+pub enum AvgPxReconciliation {
+    /// The average must match the cached position average within tolerance, and prices
+    /// reconciliation fills.
+    #[default]
+    Match = 1,
+    /// The average prices only positions opened from flat, and is never compared.
+    ///
+    /// For venue averages computed by a different method, such as FIFO lots.
+    OpeningOnly = 2,
+}
+
 /// The aggregation method through which a bar is generated and closed.
 #[repr(C)]
 #[derive(
@@ -757,12 +803,32 @@ impl InstrumentClass {
     }
 
     /// Returns whether this instrument class allows negative prices.
+    ///
+    /// Futures allow negative prices, which occur as real settlement prices (e.g. WTI crude
+    /// oil in April 2020) and in back-adjusted continuous price series. Inverse instruments
+    /// whose notional divides by price still require a positive price.
     #[must_use]
     pub const fn allows_negative_price(&self) -> bool {
         matches!(
             self,
-            Self::Option | Self::FuturesSpread | Self::OptionSpread
+            Self::Future | Self::Option | Self::FuturesSpread | Self::OptionSpread
         )
+    }
+
+    /// Returns whether fills for this instrument class exchange the notional value as premium cash.
+    #[must_use]
+    pub const fn is_premium_based(&self) -> bool {
+        matches!(
+            self,
+            Self::Option | Self::OptionSpread | Self::BinaryOption | Self::Warrant
+        )
+    }
+
+    /// Returns whether inverse valuation for this class divides by price, which holds for inverse
+    /// instruments unless the class is premium based.
+    #[must_use]
+    pub const fn divides_notional_by_price(&self, is_inverse: bool) -> bool {
+        is_inverse && !self.is_premium_based()
     }
 
     /// Returns the [`InstrumentClass`] for the parent-symbol suffix, if recognized.
@@ -1094,6 +1160,71 @@ pub enum OptionKind {
     Call = 1,
     /// A Put option gives the holder the right, but not the obligation, to sell an underlying asset at a specified strike price within a specified period of time.
     Put = 2,
+}
+
+/// Selects which option kinds an option chain carries at each strike position.
+#[repr(C)]
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Display,
+    Hash,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    AsRefStr,
+    FromRepr,
+    EnumIter,
+    EnumString,
+)]
+#[strum(ascii_case_insensitive)]
+#[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        frozen,
+        eq,
+        eq_int,
+        module = "nautilus_trader.model",
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE",
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.model")
+)]
+pub enum OptionSideFilter {
+    /// Calls and puts at every strike.
+    #[default]
+    Both = 1,
+    /// Calls only.
+    Calls = 2,
+    /// Puts only.
+    Puts = 3,
+    /// Out-of-the-money wings: puts below the ATM strike, calls above it, both at the ATM strike.
+    Otm = 4,
+}
+
+impl OptionSideFilter {
+    /// Returns whether `kind` belongs to the chain at a strike whose ordering relative to the
+    /// ATM strike is `position` (`Less` = below ATM, `Greater` = above ATM).
+    #[must_use]
+    pub fn includes(&self, kind: OptionKind, position: std::cmp::Ordering) -> bool {
+        match self {
+            Self::Both => true,
+            Self::Calls => kind == OptionKind::Call,
+            Self::Puts => kind == OptionKind::Put,
+            Self::Otm => match position {
+                std::cmp::Ordering::Less => kind == OptionKind::Put,
+                std::cmp::Ordering::Greater => kind == OptionKind::Call,
+                std::cmp::Ordering::Equal => true,
+            },
+        }
+    }
 }
 
 /// The numeraire convention for option greeks published by a venue.
@@ -2100,6 +2231,7 @@ enum_strum_serde!(AccountType);
 enum_strum_serde!(AggregationSource);
 enum_strum_serde!(AggressorSide);
 enum_strum_serde!(AssetClass);
+enum_strum_serde!(AvgPxReconciliation);
 enum_strum_serde!(BarAggregation);
 enum_strum_serde!(BarIntervalType);
 enum_strum_serde!(BetSide);
@@ -2116,6 +2248,7 @@ enum_strum_serde!(MarketStatus);
 enum_strum_serde!(MarketStatusAction);
 enum_strum_serde!(OmsType);
 enum_strum_serde!(OptionKind);
+enum_strum_serde!(OptionSideFilter);
 enum_strum_serde!(OrderSide);
 enum_strum_serde!(OrderStatus);
 enum_strum_serde!(OrderType);
@@ -2387,12 +2520,12 @@ mod tests {
     }
 
     #[rstest]
+    #[case(InstrumentClass::Future, true)]
     #[case(InstrumentClass::Option, true)]
     #[case(InstrumentClass::FuturesSpread, true)]
     #[case(InstrumentClass::OptionSpread, true)]
     #[case(InstrumentClass::Spot, false)]
     #[case(InstrumentClass::Swap, false)]
-    #[case(InstrumentClass::Future, false)]
     #[case(InstrumentClass::Forward, false)]
     #[case(InstrumentClass::Cfd, false)]
     #[case(InstrumentClass::Bond, false)]
@@ -2404,6 +2537,49 @@ mod tests {
         #[case] expected: bool,
     ) {
         assert_eq!(class.allows_negative_price(), expected);
+    }
+
+    #[rstest]
+    #[case(InstrumentClass::Option, true)]
+    #[case(InstrumentClass::OptionSpread, true)]
+    #[case(InstrumentClass::BinaryOption, true)]
+    #[case(InstrumentClass::Warrant, true)]
+    #[case(InstrumentClass::Spot, false)]
+    #[case(InstrumentClass::Swap, false)]
+    #[case(InstrumentClass::Future, false)]
+    #[case(InstrumentClass::FuturesSpread, false)]
+    #[case(InstrumentClass::Forward, false)]
+    #[case(InstrumentClass::Cfd, false)]
+    #[case(InstrumentClass::Bond, false)]
+    #[case(InstrumentClass::SportsBetting, false)]
+    fn test_instrument_class_is_premium_based(
+        #[case] class: InstrumentClass,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(class.is_premium_based(), expected);
+    }
+
+    #[rstest]
+    #[case(InstrumentClass::Option, true, false)]
+    #[case(InstrumentClass::OptionSpread, true, false)]
+    #[case(InstrumentClass::BinaryOption, true, false)]
+    #[case(InstrumentClass::Warrant, true, false)]
+    #[case(InstrumentClass::Spot, true, true)]
+    #[case(InstrumentClass::Swap, true, true)]
+    #[case(InstrumentClass::Future, true, true)]
+    #[case(InstrumentClass::FuturesSpread, true, true)]
+    #[case(InstrumentClass::Forward, true, true)]
+    #[case(InstrumentClass::Cfd, true, true)]
+    #[case(InstrumentClass::Bond, true, true)]
+    #[case(InstrumentClass::SportsBetting, true, true)]
+    #[case(InstrumentClass::Future, false, false)]
+    #[case(InstrumentClass::Option, false, false)]
+    fn test_instrument_class_divides_notional_by_price(
+        #[case] class: InstrumentClass,
+        #[case] is_inverse: bool,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(class.divides_notional_by_price(is_inverse), expected);
     }
 
     #[rstest]
@@ -2512,6 +2688,7 @@ mod tests {
             AggregationSource,
             AggressorSide,
             AssetClass,
+            AvgPxReconciliation,
             BarAggregation,
             BarIntervalType,
             BetSide,
@@ -2564,6 +2741,8 @@ mod tests {
         "AssetClass::Equity=EQUITY",
         "AssetClass::FX=FX",
         "AssetClass::Index=INDEX",
+        "AvgPxReconciliation::Match=MATCH",
+        "AvgPxReconciliation::OpeningOnly=OPENING_ONLY",
         "BarAggregation::Day=DAY",
         "BarAggregation::Hour=HOUR",
         "BarAggregation::Millisecond=MILLISECOND",
@@ -2734,6 +2913,7 @@ mod tests {
             AggregationSource,
             AggressorSide,
             AssetClass,
+            AvgPxReconciliation,
             BarAggregation,
             BarIntervalType,
             BetSide,
@@ -3044,5 +3224,82 @@ mod tests {
     #[case(r#"{"order":"BUY","position":true}"#)]
     fn test_optional_sides_serde_rejects_invalid_values(#[case] json: &str) {
         assert!(serde_json::from_str::<OptionalSides>(json).is_err());
+    }
+
+    #[rstest]
+    #[case(
+        OptionSideFilter::Both,
+        OptionKind::Call,
+        std::cmp::Ordering::Less,
+        true
+    )]
+    #[case(
+        OptionSideFilter::Both,
+        OptionKind::Put,
+        std::cmp::Ordering::Greater,
+        true
+    )]
+    #[case(
+        OptionSideFilter::Calls,
+        OptionKind::Call,
+        std::cmp::Ordering::Less,
+        true
+    )]
+    #[case(
+        OptionSideFilter::Calls,
+        OptionKind::Put,
+        std::cmp::Ordering::Less,
+        false
+    )]
+    #[case(
+        OptionSideFilter::Puts,
+        OptionKind::Put,
+        std::cmp::Ordering::Greater,
+        true
+    )]
+    #[case(
+        OptionSideFilter::Puts,
+        OptionKind::Call,
+        std::cmp::Ordering::Greater,
+        false
+    )]
+    #[case(OptionSideFilter::Otm, OptionKind::Put, std::cmp::Ordering::Less, true)]
+    #[case(
+        OptionSideFilter::Otm,
+        OptionKind::Call,
+        std::cmp::Ordering::Less,
+        false
+    )]
+    #[case(
+        OptionSideFilter::Otm,
+        OptionKind::Call,
+        std::cmp::Ordering::Greater,
+        true
+    )]
+    #[case(
+        OptionSideFilter::Otm,
+        OptionKind::Put,
+        std::cmp::Ordering::Greater,
+        false
+    )]
+    #[case(
+        OptionSideFilter::Otm,
+        OptionKind::Call,
+        std::cmp::Ordering::Equal,
+        true
+    )]
+    #[case(
+        OptionSideFilter::Otm,
+        OptionKind::Put,
+        std::cmp::Ordering::Equal,
+        true
+    )]
+    fn test_option_side_filter_includes(
+        #[case] filter: OptionSideFilter,
+        #[case] kind: OptionKind,
+        #[case] position: std::cmp::Ordering,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(filter.includes(kind, position), expected);
     }
 }

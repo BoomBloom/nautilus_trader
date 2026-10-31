@@ -41,14 +41,12 @@ Examples include Betfair match-odds selections and handicap market selections.
 | `min_price`          | `Option<Price>`    | `Price \| None`    | `None`           | Minimum valid quote or order price.      |
 | `margin_init`        | `Option<Decimal>`  | `Decimal \| None`  | `1`              | Initial margin rate.                     |
 | `margin_maint`       | `Option<Decimal>`  | `Decimal \| None`  | `1`              | Maintenance margin rate.                 |
-| `maker_fee`          | `Option<Decimal>`  | `Decimal \| None`  | `0`              | Maker fee rate. Negative values rebate.  |
-| `taker_fee`          | `Option<Decimal>`  | `Decimal \| None`  | `0`              | Taker fee rate. Negative values rebate.  |
 | `tick_scheme`        | `Option<Ustr>`     | `str \| None`      | `None`           | Registered variable tick scheme name.    |
 | `info`               | `Option<Params>`   | `dict \| None`     | `None`           | Adapter metadata.                        |
 | `ts_event`           | `UnixNanos`        | `int`              | Required         | Event timestamp in nanoseconds.          |
 | `ts_init`            | `UnixNanos`        | `int`              | Required         | Initialization timestamp in nanoseconds. |
 
-*Note: Python constructors use `instrument_id`; Rust stores the same value as `id`.*
+**Note**: Python constructors use `instrument_id`. Rust stores the same value as `id`.
 
 ## Behavior
 
@@ -105,8 +103,6 @@ let selection = BettingInstrument::builder()
     .min_price(Price::from("1.00"))
     .margin_init(dec!(1))
     .margin_maint(dec!(1))
-    .maker_fee(dec!(0))
-    .taker_fee(dec!(0))
     .ts_event(UnixNanos::default())
     .ts_init(UnixNanos::default())
     .build()
@@ -159,9 +155,8 @@ selection = BettingInstrument(
 
 ## Adapters
 
-Representative adapters that create or consume `BettingInstrument` instruments include:
-
-- [Betfair](../../integrations/betfair.md) for sports betting markets.
+The [Betfair](../../integrations/betfair.md) adapter creates or consumes
+`BettingInstrument` instruments for sports betting markets.
 
 ## Related guides
 

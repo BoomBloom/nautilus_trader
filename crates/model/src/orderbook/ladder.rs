@@ -21,9 +21,10 @@ use std::{
     fmt::{Debug, Display},
 };
 
-use nautilus_core::UnixNanos;
-#[cfg(feature = "python")]
-use nautilus_core::correctness::{CorrectnessError, CorrectnessResult};
+use nautilus_core::{
+    UnixNanos,
+    correctness::{CorrectnessError, CorrectnessResult},
+};
 
 use crate::{
     data::order::{BookOrder, OrderId},
@@ -101,7 +102,7 @@ impl Display for BookPrice {
 /// an incomplete MBP stream (missing `F_LAST`) would leave batch state that
 /// incorrectly affects subsequent snapshot processing.
 ///
-/// The discriminants are serialized in Python `OrderBook` state and must remain stable.
+/// The discriminants are serialized in `OrderBook` state and must remain stable.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 enum L1BatchState {
@@ -151,7 +152,6 @@ impl BookLadder {
     }
 
     #[must_use]
-    #[cfg(feature = "python")]
     pub(crate) fn batch_state_code(&self) -> u8 {
         self.batch_state as u8
     }
@@ -160,8 +160,7 @@ impl BookLadder {
     ///
     /// # Errors
     ///
-    /// Returns an error for an unknown state code or a batch state on a non-L1 ladder.
-    #[cfg(feature = "python")]
+    /// Returns an error if the state code is unknown or a batch state appears on a non-L1 ladder.
     pub(crate) fn set_batch_state_code(&mut self, code: u8) -> CorrectnessResult<()> {
         let batch_state = match code {
             0 => L1BatchState::None,
@@ -549,9 +548,9 @@ impl BookLadder {
 
             for book_order in level.orders.values() {
                 let current = book_order.size;
-                if cumulative_denominator + current >= target {
+                let remainder = target - cumulative_denominator;
+                if current >= remainder {
                     // This order has filled us, add fill and return
-                    let remainder = target - cumulative_denominator;
                     if remainder.is_positive() {
                         fills.push((book_order.price, remainder));
                     }
@@ -590,6 +589,7 @@ impl BookLadder {
 
 #[cfg(test)]
 mod tests {
+    use nautilus_core::correctness::CorrectnessError;
     use rstest::rstest;
 
     use crate::{
@@ -1374,6 +1374,7 @@ mod tests {
         #[case] side: Option<OrderSide>,
         #[case] old_price: &str,
         #[case] new_price: &str,
+        #[values(false, true)] via_update: bool,
     ) {
         let mut ladder = BookLadder::new(side_spec, BookType::L3_MBO);
 
@@ -1398,7 +1399,12 @@ mod tests {
             size: Quantity::from(60),
             order_id: 1,
         };
-        ladder.add(moved_new, 0);
+
+        if via_update {
+            ladder.update(moved_new, 0);
+        } else {
+            ladder.add(moved_new, 0);
+        }
 
         assert_eq!(
             ladder.len(),
@@ -1409,12 +1415,30 @@ mod tests {
             .levels
             .get(&BookPrice::new(Price::from(old_price), side_spec))
             .expect("Old level should remain");
-        assert_eq!(old_level.get_orders(), vec![staying]);
         let new_level = ladder
             .levels
             .get(&BookPrice::new(Price::from(new_price), side_spec))
             .expect("New level should exist");
-        assert_eq!(new_level.get_orders(), vec![moved_new]);
+
+        // `BookOrder` equality compares IDs only, so compare the fields that must move
+        let fields = |level: &BookLevel| {
+            level
+                .iter()
+                .map(|order| (order.order_id, order.price, order.size))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            fields(old_level),
+            vec![(2, Price::from(old_price), Quantity::from(30))]
+        );
+        assert_eq!(
+            fields(new_level),
+            vec![(1, Price::from(new_price), Quantity::from(60))]
+        );
+        assert_eq!(ladder.cache.len(), 2);
+        assert_eq!(ladder.cache[&1], new_level.price);
+        assert_eq!(ladder.cache[&2], old_level.price);
     }
 
     #[rstest]
@@ -1826,6 +1850,99 @@ mod tests {
             Price::from("101.00"),
             "F_SNAPSHOT batch should keep best ask (101) from ALL deltas"
         );
+    }
+
+    #[rstest]
+    #[case::bids(OrderSide::Buy, ["101.00", "100.00", "99.00"], "101.00")]
+    #[case::asks(OrderSide::Sell, ["99.00", "100.00", "101.00"], "99.00")]
+    fn test_l1_snapshot_batch_keeps_best_when_delivered_first(
+        #[case] side: OrderSide,
+        #[case] prices: [&str; 3],
+        #[case] expected_best: &str,
+    ) {
+        let mut ladder = BookLadder::new(side, BookType::L1_MBP);
+        let batch_size = prices.len();
+
+        for (i, price_str) in prices.iter().enumerate() {
+            let order = BookOrder {
+                side: side.into(),
+                price: Price::from(*price_str),
+                size: Quantity::from(10),
+                order_id: side as u64,
+            };
+
+            let flags = if i == batch_size - 1 {
+                RecordFlag::F_SNAPSHOT as u8 | RecordFlag::F_LAST as u8
+            } else {
+                RecordFlag::F_SNAPSHOT as u8
+            };
+
+            ladder.add(order, flags);
+        }
+
+        assert_eq!(ladder.len(), 1);
+        assert_eq!(
+            ladder.top().unwrap().price.value,
+            Price::from(expected_best)
+        );
+        assert_eq!(ladder.cache.len(), 1);
+    }
+
+    #[rstest]
+    fn test_display() {
+        let mut ladder = BookLadder::new(OrderSide::Buy, BookType::L3_MBO);
+        ladder.add_bulk(&[
+            BookOrder::new(OrderSide::Buy, Price::from("100.00"), Quantity::from(10), 1),
+            BookOrder::new(OrderSide::Buy, Price::from("100.00"), Quantity::from(20), 2),
+            BookOrder::new(OrderSide::Buy, Price::from("99.00"), Quantity::from(30), 3),
+        ]);
+
+        assert_eq!(
+            ladder.to_string(),
+            "BookLadder(side=BUY)\n  100.00 -> 2 orders\n  99.00 -> 1 orders\n"
+        );
+    }
+
+    #[rstest]
+    fn test_batch_state_code_round_trips_on_l1_ladder(#[values(0, 1, 2)] code: u8) {
+        let mut ladder = BookLadder::new(OrderSide::Buy, BookType::L1_MBP);
+
+        ladder.set_batch_state_code(code).unwrap();
+
+        assert_eq!(ladder.batch_state_code(), code);
+    }
+
+    #[rstest]
+    #[case::unknown_code(BookType::L1_MBP, 3, "Invalid L1 batch state code: 3")]
+    #[case::non_l1_batch(
+        BookType::L2_MBP,
+        1,
+        "Cannot restore L1 batch state for book type L2_MBP"
+    )]
+    fn test_set_batch_state_code_rejects_invalid_state(
+        #[case] book_type: BookType,
+        #[case] code: u8,
+        #[case] message: &str,
+    ) {
+        let mut ladder = BookLadder::new(OrderSide::Buy, book_type);
+
+        let result = ladder.set_batch_state_code(code);
+
+        assert_eq!(
+            result,
+            Err(CorrectnessError::PredicateViolation {
+                message: message.to_string(),
+            })
+        );
+        assert_eq!(ladder.batch_state_code(), 0);
+    }
+
+    #[rstest]
+    fn test_set_batch_state_code_accepts_no_batch_on_non_l1_ladder() {
+        let mut ladder = BookLadder::new(OrderSide::Buy, BookType::L2_MBP);
+
+        assert_eq!(ladder.set_batch_state_code(0), Ok(()));
+        assert_eq!(ladder.batch_state_code(), 0);
     }
 
     #[rstest]

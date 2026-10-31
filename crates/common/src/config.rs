@@ -320,8 +320,8 @@ impl ConfigErrorCollector {
     ///
     /// # Errors
     ///
-    /// Returns the collected error, or a [`ConfigError::Multiple`] when more than one error
-    /// was collected.
+    /// Returns an error if any validation error was collected. Returns the collected error for a
+    /// single failure, or combines multiple failures into one error.
     pub fn into_result(self) -> ConfigResult<()> {
         let mut errors = self.errors;
         if errors.is_empty() {
@@ -338,7 +338,7 @@ impl ConfigErrorCollector {
 ///
 /// # Errors
 ///
-/// Returns `error` when `condition` is false.
+/// Returns an error if `condition` is false. Returns the supplied `config_error` unchanged.
 pub fn check(condition: bool, config_error: ConfigError) -> ConfigResult<()> {
     if condition { Ok(()) } else { Err(config_error) }
 }
@@ -347,7 +347,7 @@ pub fn check(condition: bool, config_error: ConfigError) -> ConfigResult<()> {
 ///
 /// # Errors
 ///
-/// Returns [`ConfigError::UnsupportedField`] when `supported` is false.
+/// Returns an error if `supported` is false.
 pub fn check_supported_field(
     field: impl Into<String>,
     supported: bool,
@@ -360,7 +360,7 @@ pub fn check_supported_field(
 ///
 /// # Errors
 ///
-/// Returns [`ConfigError::UnsupportedValue`] when `supported` is false.
+/// Returns an error if `supported` is false.
 pub fn check_supported_value(
     field: impl Into<String>,
     supported: bool,
@@ -373,7 +373,7 @@ pub fn check_supported_value(
 ///
 /// # Errors
 ///
-/// Returns [`ConfigError::EmptyField`] when `value` is empty after trimming.
+/// Returns an error if `value` is empty after trimming.
 pub fn check_non_empty_field(field: impl Into<String>, value: &str) -> ConfigResult<()> {
     check(!value.trim().is_empty(), ConfigError::empty_field(field))
 }
@@ -382,7 +382,7 @@ pub fn check_non_empty_field(field: impl Into<String>, value: &str) -> ConfigRes
 ///
 /// # Errors
 ///
-/// Returns [`ConfigError::InvalidValue`] when `valid` is false.
+/// Returns an error if `valid` is false.
 pub fn check_valid_value(
     field: impl Into<String>,
     valid: bool,
@@ -395,7 +395,7 @@ pub fn check_valid_value(
 ///
 /// # Errors
 ///
-/// Returns [`ConfigError::InvalidFormat`] when `valid` is false.
+/// Returns an error if `valid` is false.
 pub fn check_valid_format(
     field: impl Into<String>,
     valid: bool,
@@ -408,7 +408,7 @@ pub fn check_valid_format(
 ///
 /// # Errors
 ///
-/// Returns [`ConfigError::Range`] when `in_range` is false.
+/// Returns an error if `in_range` is false.
 pub fn check_range(
     field: impl Into<String>,
     in_range: bool,
@@ -421,7 +421,7 @@ pub fn check_range(
 ///
 /// # Errors
 ///
-/// Returns [`ConfigError::FeatureDisabled`] when `enabled` is false.
+/// Returns an error if `enabled` is false.
 pub fn check_feature_enabled(
     field: impl Into<String>,
     feature: impl Into<String>,
@@ -430,11 +430,46 @@ pub fn check_feature_enabled(
     check(enabled, ConfigError::feature_disabled(field, feature))
 }
 
+/// Checks that a list contains no repeated values.
+///
+/// Empty lists are valid. Duplicate values are omitted from errors because configuration
+/// values may contain secrets.
+///
+/// # Errors
+///
+/// Returns an error if an entry equals an earlier entry.
+pub fn check_unique_values<T: PartialEq>(
+    field: impl Into<String>,
+    values: &[T],
+) -> ConfigResult<()> {
+    for (index, value) in values.iter().enumerate() {
+        if values[..index].contains(value) {
+            return Err(ConfigError::duplicate(field, None));
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    #[case::empty(vec![], Ok(()))]
+    #[case::single(vec!["a"], Ok(()))]
+    #[case::distinct(vec!["b", "a"], Ok(()))]
+    #[case::adjacent(vec!["a", "a"], Err(ConfigError::duplicate("selections", None)))]
+    #[case::separated(vec!["a", "b", "a"], Err(ConfigError::duplicate("selections", None)))]
+    fn test_check_unique_values(#[case] values: Vec<&str>, #[case] expected: ConfigResult<()>) {
+        let original = values.clone();
+        let result = check_unique_values("selections", &values);
+
+        assert_eq!(result, expected);
+        assert_eq!(values, original);
+    }
 
     #[rstest]
     fn test_config_error_display_uses_field_path() {

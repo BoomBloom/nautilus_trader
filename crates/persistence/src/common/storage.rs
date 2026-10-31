@@ -25,28 +25,47 @@ use std::{
 
 use ahash::AHashMap;
 use futures::{StreamExt, TryStreamExt, stream::BoxStream};
+use nautilus_common::enums::Environment;
 use nautilus_core::time::nanos_since_unix_epoch;
 use object_store::{
     CopyOptions, Error as ObjectStoreError, GetOptions, GetResult, ListResult, MultipartUpload,
     ObjectMeta, ObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload,
-    PutResult, Result as ObjectStoreResult, path::Path as ObjectPath,
+    PutResult, RenameOptions, Result as ObjectStoreResult, path::Path as ObjectPath,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use url::Url;
 
 pub use crate::common::paths::normalize_path_to_uri;
-use crate::common::paths::{file_uri_to_native_path, make_object_store_path, path_to_file_uri};
+use crate::{
+    backend::parquet::io::{create_object_store_from_path, decode_object_store_segment},
+    common::paths::{
+        create_local_directory, environment_directory, environment_from_directory,
+        file_uri_to_native_path, make_object_store_path, path_to_file_uri,
+    },
+    writer::run::RunStatus,
+};
 
 /// File name used to represent run sessions, including runs that wrote no data files.
 pub const RUN_MANIFEST_FILENAME: &str = "_nautilus_run_manifest.json";
 
 /// Storage-native run manifest shared by catalog and stream writer session discovery.
+///
+/// The environment is stored as its run folder name, so manifests keep the `kind` field.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RunManifest {
     pub schema_version: u32,
-    pub kind: String,
+    #[serde(
+        rename = "kind",
+        serialize_with = "serialize_environment",
+        deserialize_with = "deserialize_environment"
+    )]
+    pub environment: Environment,
     pub instance_id: String,
-    pub status: String,
+    #[serde(
+        serialize_with = "serialize_run_status",
+        deserialize_with = "deserialize_run_status"
+    )]
+    pub status: RunStatus,
     pub empty: bool,
     pub created_ts: u64,
 }
@@ -54,16 +73,59 @@ pub struct RunManifest {
 impl RunManifest {
     /// Creates a run manifest for `status`.
     #[must_use]
-    pub fn new(kind: &str, instance_id: &str, status: &str, empty: bool) -> Self {
+    pub fn new(
+        environment: Environment,
+        instance_id: &str,
+        status: RunStatus,
+        empty: bool,
+    ) -> Self {
         Self {
             schema_version: 1,
-            kind: kind.to_string(),
+            environment,
             instance_id: instance_id.to_string(),
-            status: status.to_string(),
+            status,
             empty,
             created_ts: nanos_since_unix_epoch(),
         }
     }
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde passes the field by reference"
+)]
+fn serialize_environment<S: Serializer>(
+    environment: &Environment,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(environment_directory(*environment))
+}
+
+fn deserialize_environment<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Environment, D::Error> {
+    let directory = String::deserialize(deserializer)?;
+    environment_from_directory(&directory)
+        .ok_or_else(|| D::Error::custom(format!("unknown run environment '{directory}'")))
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde passes the field by reference"
+)]
+fn serialize_run_status<S: Serializer>(
+    status: &RunStatus,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(status.as_str())
+}
+
+fn deserialize_run_status<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<RunStatus, D::Error> {
+    Ok(RunStatus::from_storage_str(&String::deserialize(
+        deserializer,
+    )?))
 }
 
 /// Native object-store storage handles shared by catalog, session, and stream writers.
@@ -92,7 +154,8 @@ impl StorageBackend {
         datafusion_root_url(&self.original_uri)
     }
 
-    /// Lists immediate child directory stems below a storage-relative subdirectory.
+    /// Lists immediate child directory stems below a storage-relative subdirectory, decoded from
+    /// their percent-encoded object-store form.
     ///
     /// This is used by catalog data and run-session discovery so local, memory, and cloud
     /// backends share one object-store listing path.
@@ -114,7 +177,7 @@ impl StorageBackend {
             if let Some(relative_path) = path.strip_prefix(&prefix_str)
                 && let Some(stem) = relative_path.split('/').find(|segment| !segment.is_empty())
             {
-                stems.insert(stem.to_string());
+                stems.insert(decode_object_store_segment(stem));
             }
         }
 
@@ -155,13 +218,13 @@ impl StorageBackend {
     /// Returns an error if manifest serialization or storage writing fails.
     pub async fn write_run_manifest(
         &self,
-        kind: &str,
+        environment: Environment,
         instance_id: &str,
-        status: &str,
+        status: RunStatus,
         empty: bool,
     ) -> anyhow::Result<()> {
-        let manifest = RunManifest::new(kind, instance_id, status, empty);
-        let path = self.run_manifest_path(kind, instance_id);
+        let manifest = RunManifest::new(environment, instance_id, status, empty);
+        let path = self.run_manifest_path(environment, instance_id);
         let bytes = serde_json::to_vec(&manifest)?;
         self.object_store.put(&path, bytes.into()).await?;
         Ok(())
@@ -174,12 +237,12 @@ impl StorageBackend {
     /// Returns an error if manifest serialization or storage writing fails.
     pub async fn write_current_run_manifest(
         &self,
-        kind: &str,
+        environment: Environment,
         instance_id: &str,
-        status: &str,
+        status: RunStatus,
         empty: bool,
     ) -> anyhow::Result<()> {
-        let manifest = RunManifest::new(kind, instance_id, status, empty);
+        let manifest = RunManifest::new(environment, instance_id, status, empty);
         let path = ObjectPath::from(make_object_store_path(
             &self.base_path,
             [RUN_MANIFEST_FILENAME],
@@ -196,11 +259,50 @@ impl StorageBackend {
     /// Returns an error if storage reading or manifest deserialization fails.
     pub async fn read_run_manifest(
         &self,
-        kind: &str,
+        environment: Environment,
         instance_id: &str,
     ) -> anyhow::Result<Option<RunManifest>> {
-        let path = self.run_manifest_path(kind, instance_id);
-        match self.object_store.get(&path).await {
+        self.read_run_manifest_at(&self.run_manifest_path(environment, instance_id))
+            .await
+    }
+
+    /// Lists run IDs from directories and manifests for one environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if storage listing or manifest reading fails.
+    pub async fn list_run_ids(&self, environment: Environment) -> anyhow::Result<Vec<String>> {
+        let directory = environment_directory(environment);
+        let mut run_ids = self
+            .list_directory_stems(directory)
+            .await?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+
+        for manifest in self.list_run_manifests(directory).await? {
+            run_ids.insert(manifest.instance_id);
+        }
+
+        Ok(run_ids.into_iter().collect())
+    }
+
+    async fn list_run_manifests(&self, directory: &str) -> anyhow::Result<Vec<RunManifest>> {
+        let files = self
+            .list_files(directory, Some(RUN_MANIFEST_FILENAME))
+            .await?;
+        let mut manifests = Vec::new();
+
+        for file in files {
+            if let Some(manifest) = self.read_run_manifest_at(&ObjectPath::parse(file)?).await? {
+                manifests.push(manifest);
+            }
+        }
+
+        Ok(manifests)
+    }
+
+    async fn read_run_manifest_at(&self, path: &ObjectPath) -> anyhow::Result<Option<RunManifest>> {
+        match self.object_store.get(path).await {
             Ok(result) => {
                 let bytes = result.bytes().await?;
                 Ok(Some(serde_json::from_slice(&bytes)?))
@@ -210,61 +312,19 @@ impl StorageBackend {
         }
     }
 
-    /// Lists run IDs from directories and manifests for one session kind.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if storage listing or manifest reading fails.
-    pub async fn list_run_ids(&self, kind: &str) -> anyhow::Result<Vec<String>> {
-        self.list_run_ids_for_kinds(&[kind]).await
-    }
-
-    /// Lists run IDs from directories and manifests for multiple session kind aliases.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if storage listing or manifest reading fails.
-    pub async fn list_run_ids_for_kinds(&self, kinds: &[&str]) -> anyhow::Result<Vec<String>> {
-        let mut run_ids = BTreeSet::new();
-
-        for kind in kinds {
-            run_ids.extend(self.list_directory_stems(kind).await?);
-
-            for manifest in self.list_run_manifests(kind).await? {
-                run_ids.insert(manifest.instance_id);
-            }
-        }
-
-        Ok(run_ids.into_iter().collect())
-    }
-
-    async fn list_run_manifests(&self, kind: &str) -> anyhow::Result<Vec<RunManifest>> {
-        let files = self.list_files(kind, Some(RUN_MANIFEST_FILENAME)).await?;
-        let mut manifests = Vec::new();
-
-        for file in files {
-            match self.object_store.get(&ObjectPath::from(file)).await {
-                Ok(result) => {
-                    let bytes = result.bytes().await?;
-                    manifests.push(serde_json::from_slice(&bytes)?);
-                }
-                Err(ObjectStoreError::NotFound { .. }) => {}
-                Err(e) => return Err(e.into()),
-            }
-        }
-
-        Ok(manifests)
-    }
-
-    fn run_manifest_path(&self, kind: &str, instance_id: &str) -> ObjectPath {
+    fn run_manifest_path(&self, environment: Environment, instance_id: &str) -> ObjectPath {
         ObjectPath::from(make_object_store_path(
             &self.base_path,
-            [kind, instance_id, RUN_MANIFEST_FILENAME],
+            [
+                environment_directory(environment),
+                instance_id,
+                RUN_MANIFEST_FILENAME,
+            ],
         ))
     }
 }
 
-/// Returns the root URL DataFusion should use when registering an `OpenDAL` object store.
+/// Returns the root URL DataFusion should use when registering a storage backend's object store.
 ///
 /// # Errors
 ///
@@ -313,25 +373,28 @@ pub fn normalize_storage_location(path: &str) -> anyhow::Result<String> {
                 }
             }
         }
+
         return Ok(path_to_file_uri(&resolved.to_string_lossy())
             .trim_end_matches('/')
             .to_string());
     }
+
     let mut url = Url::parse(&uri)?;
     if url.scheme() == "gcs" {
         url.set_scheme("gs")
             .map_err(|()| anyhow::anyhow!("invalid storage scheme"))?;
     }
+
     url.set_fragment(None);
     url.set_query(None);
     Ok(url.as_str().trim_end_matches('/').to_string())
 }
 
-/// Creates an OpenDAL-backed storage backend from a Nautilus storage URI.
+/// Creates an object-store storage backend from a Nautilus storage URI.
 ///
 /// # Errors
 ///
-/// Returns an error when the URI cannot be parsed or the requested storage service is not enabled.
+/// Returns an error if the URI cannot be parsed or the requested storage service is not enabled.
 #[cfg_attr(not(feature = "cloud"), allow(clippy::needless_pass_by_value))]
 pub fn create_storage_backend_from_path(
     path: &str,
@@ -346,11 +409,10 @@ pub fn create_storage_backend_from_path(
         ));
     }
 
-    if uri.starts_with("file://") {
-        fs::create_dir_all(file_uri_to_native_path(&uri))?;
-    }
+    create_local_directory(&uri)?;
+
     let (object_store, base_path, original_uri) =
-        crate::backend::parquet::io::create_object_store_from_path(&uri, storage_options)?;
+        create_object_store_from_path(&uri, storage_options)?;
     Ok(storage_backend(object_store, base_path, original_uri))
 }
 
@@ -449,16 +511,141 @@ impl ObjectStore for SortedListObjectStore {
     ) -> ObjectStoreResult<()> {
         self.inner.copy_opts(from, to, opts).await
     }
+
+    async fn rename_opts(
+        &self,
+        from: &ObjectPath,
+        to: &ObjectPath,
+        opts: RenameOptions,
+    ) -> ObjectStoreResult<()> {
+        self.inner.rename_opts(from, to, opts).await
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "cloud")]
-    use object_store::{ObjectStoreExt, path::Path as ObjectPath};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use object_store::memory::InMemory;
     use rstest::rstest;
     use tempfile::TempDir;
 
     use super::*;
+
+    // Counts native renames so a forwarded rename is distinguishable from copy then delete
+    #[derive(Debug)]
+    struct RenameCountingStore {
+        inner: InMemory,
+        renames: AtomicUsize,
+    }
+
+    impl Display for RenameCountingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("rename-counting")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for RenameCountingStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> ObjectStoreResult<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            opts: PutMultipartOptions,
+        ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: GetOptions,
+        ) -> ObjectStoreResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> ObjectStoreResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, ObjectStoreResult<ObjectPath>>,
+        ) -> BoxStream<'static, ObjectStoreResult<ObjectPath>> {
+            self.inner.delete_stream(locations)
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            opts: CopyOptions,
+        ) -> ObjectStoreResult<()> {
+            self.inner.copy_opts(from, to, opts).await
+        }
+
+        async fn rename_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            opts: RenameOptions,
+        ) -> ObjectStoreResult<()> {
+            self.renames.fetch_add(1, Ordering::Relaxed);
+            self.inner.rename_opts(from, to, opts).await
+        }
+    }
+
+    #[rstest]
+    fn storage_backend_forwards_rename_to_inner_store() {
+        let inner = Arc::new(RenameCountingStore {
+            inner: InMemory::new(),
+            renames: AtomicUsize::new(0),
+        });
+
+        let storage = storage_backend(inner.clone(), String::new(), "memory://".to_string());
+        let from = ObjectPath::from("backtest/run-001/quotes.feather");
+        let to = ObjectPath::from("backtest/run-001/quotes-renamed.feather");
+
+        let (moved, source) = futures::executor::block_on(async {
+            storage
+                .object_store
+                .put(&from, b"quotes".to_vec().into())
+                .await
+                .unwrap();
+            storage.object_store.rename(&from, &to).await.unwrap();
+            let moved = storage
+                .object_store
+                .get(&to)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            (moved, storage.object_store.head(&from).await)
+        });
+
+        assert_eq!(inner.renames.load(Ordering::Relaxed), 1);
+        assert_eq!(moved.as_ref(), b"quotes");
+        assert!(matches!(source, Err(ObjectStoreError::NotFound { .. })));
+    }
 
     #[rstest]
     fn storage_location_resolves_relative_file_uris() {
@@ -556,23 +743,82 @@ mod tests {
         let storage = create_storage_backend_from_path("memory://", None).unwrap();
         futures::executor::block_on(async {
             storage
-                .write_run_manifest("backtest", "empty-run-001", "completed", true)
+                .write_run_manifest(
+                    Environment::Backtest,
+                    "empty-run-001",
+                    RunStatus::Completed,
+                    true,
+                )
                 .await
                 .unwrap();
         });
 
-        let runs = futures::executor::block_on(storage.list_run_ids("backtest")).unwrap();
+        let runs =
+            futures::executor::block_on(storage.list_run_ids(Environment::Backtest)).unwrap();
+        let manifest = futures::executor::block_on(
+            storage.read_run_manifest(Environment::Backtest, "empty-run-001"),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(runs, vec!["empty-run-001".to_string()]);
+        assert_eq!(manifest.environment, Environment::Backtest);
+        assert_eq!(manifest.instance_id, "empty-run-001");
+        assert_eq!(manifest.status, RunStatus::Completed);
+        assert!(manifest.empty);
+        assert_eq!(manifest.schema_version, 1);
+    }
+
+    #[rstest]
+    fn storage_backend_lists_manifest_of_run_with_encoded_name() {
+        let storage = create_storage_backend_from_path("memory://", None).unwrap();
+        futures::executor::block_on(storage.write_run_manifest(
+            Environment::Backtest,
+            "run-é",
+            RunStatus::Completed,
+            true,
+        ))
+        .unwrap();
+
+        let manifests = futures::executor::block_on(
+            storage.list_run_manifests(environment_directory(Environment::Backtest)),
+        )
+        .unwrap();
         let manifest =
-            futures::executor::block_on(storage.read_run_manifest("backtest", "empty-run-001"))
+            futures::executor::block_on(storage.read_run_manifest(Environment::Backtest, "run-é"))
                 .unwrap()
                 .unwrap();
 
-        assert_eq!(runs, vec!["empty-run-001".to_string()]);
-        assert_eq!(manifest.kind, "backtest");
-        assert_eq!(manifest.instance_id, "empty-run-001");
-        assert_eq!(manifest.status, "completed");
-        assert!(manifest.empty);
-        assert_eq!(manifest.schema_version, 1);
+        assert_eq!(manifests, vec![manifest]);
+    }
+
+    #[rstest]
+    fn storage_backend_lists_run_ids_with_encoded_name() {
+        let storage = create_storage_backend_from_path("memory://", None).unwrap();
+        futures::executor::block_on(storage.write_run_manifest(
+            Environment::Backtest,
+            "run-é",
+            RunStatus::Completed,
+            true,
+        ))
+        .unwrap();
+
+        let runs =
+            futures::executor::block_on(storage.list_run_ids(Environment::Backtest)).unwrap();
+
+        assert_eq!(runs, vec!["run-é".to_string()]);
+    }
+
+    #[rstest]
+    fn read_run_manifest_returns_none_for_missing_run() {
+        let storage = create_storage_backend_from_path("memory://", None).unwrap();
+
+        let manifest = futures::executor::block_on(
+            storage.read_run_manifest(Environment::Backtest, "missing-run"),
+        )
+        .unwrap();
+
+        assert_eq!(manifest, None);
     }
 
     #[rstest]
@@ -588,16 +834,167 @@ mod tests {
                 .await
                 .unwrap();
             storage
-                .write_run_manifest("live", "empty-run-001", "completed", true)
+                .write_run_manifest(
+                    Environment::Live,
+                    "empty-run-001",
+                    RunStatus::Completed,
+                    true,
+                )
                 .await
                 .unwrap();
         });
 
-        let runs = futures::executor::block_on(storage.list_run_ids("live")).unwrap();
+        let runs = futures::executor::block_on(storage.list_run_ids(Environment::Live)).unwrap();
 
         assert_eq!(
             runs,
             vec!["empty-run-001".to_string(), "run-with-data".to_string()],
+        );
+    }
+
+    #[rstest]
+    #[case::gcs_alias("gcs://bucket/catalog/", "gs://bucket/catalog")]
+    #[case::query_and_fragment("s3://bucket/catalog?versionId=1#part", "s3://bucket/catalog")]
+    fn storage_location_normalizes_remote_uris(#[case] path: &str, #[case] expected: &str) {
+        assert_eq!(normalize_storage_location(path).unwrap(), expected);
+    }
+
+    #[cfg(unix)]
+    #[rstest]
+    fn storage_location_resolves_symlinks_and_parent_segments() {
+        let temp_dir = TempDir::new().unwrap();
+        let nested = temp_dir.path().join("source").join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        let link = temp_dir.path().join("link");
+        std::os::unix::fs::symlink(&nested, &link).unwrap();
+        let expected = format!(
+            "file://{}/new-destination",
+            fs::canonicalize(&nested).unwrap().display()
+        );
+
+        let through_link =
+            normalize_storage_location(link.join("new-destination").to_str().unwrap()).unwrap();
+        let through_parent = normalize_storage_location(
+            temp_dir
+                .path()
+                .join("source/missing/../nested/new-destination")
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(through_link, expected);
+        assert_eq!(through_parent, expected);
+    }
+
+    #[cfg(unix)]
+    #[rstest]
+    fn storage_location_propagates_errors_other_than_missing_paths() {
+        let temp_dir = TempDir::new().unwrap();
+        let file = temp_dir.path().join("file");
+        fs::write(&file, b"data").unwrap();
+
+        let error = normalize_storage_location(file.join("child").to_str().unwrap()).unwrap_err();
+
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::NotADirectory,
+        );
+    }
+
+    #[rstest]
+    fn current_run_manifest_is_readable_from_catalog_root() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let run = storage_backend(
+            inner.clone(),
+            "backtest/run-001".to_string(),
+            "memory://".to_string(),
+        );
+        let root = storage_backend(inner, String::new(), "memory://".to_string());
+
+        futures::executor::block_on(run.write_current_run_manifest(
+            Environment::Backtest,
+            "run-001",
+            RunStatus::Completed,
+            false,
+        ))
+        .unwrap();
+        let manifest =
+            futures::executor::block_on(root.read_run_manifest(Environment::Backtest, "run-001"))
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(
+            manifest,
+            RunManifest {
+                schema_version: 1,
+                environment: Environment::Backtest,
+                instance_id: "run-001".to_string(),
+                status: RunStatus::Completed,
+                empty: false,
+                created_ts: manifest.created_ts,
+            },
+        );
+    }
+
+    #[rstest]
+    fn run_manifest_stores_environment_folder_and_status_names() {
+        let manifest = RunManifest {
+            schema_version: 1,
+            environment: Environment::Sandbox,
+            instance_id: "run-001".to_string(),
+            status: RunStatus::InProgress,
+            empty: true,
+            created_ts: 7,
+        };
+
+        let json = serde_json::to_value(&manifest).unwrap();
+        let decoded: RunManifest = serde_json::from_value(json.clone()).unwrap();
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "schema_version": 1,
+                "kind": "sandbox",
+                "instance_id": "run-001",
+                "status": "in_progress",
+                "empty": true,
+                "created_ts": 7,
+            }),
+        );
+        assert_eq!(decoded, manifest);
+    }
+
+    #[rstest]
+    fn run_manifest_rejects_unknown_environment_folder() {
+        let error = serde_json::from_value::<RunManifest>(serde_json::json!({
+            "schema_version": 1,
+            "kind": "paper",
+            "instance_id": "run-001",
+            "status": "completed",
+            "empty": false,
+            "created_ts": 7,
+        }))
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "unknown run environment 'paper'");
+    }
+
+    #[rstest]
+    fn run_ids_reject_unreadable_manifest() {
+        let storage = create_storage_backend_from_path("memory://", None).unwrap();
+        futures::executor::block_on(storage.object_store.put(
+            &ObjectPath::from(format!("backtest/run-001/{RUN_MANIFEST_FILENAME}")),
+            b"{".to_vec().into(),
+        ))
+        .unwrap();
+
+        let error =
+            futures::executor::block_on(storage.list_run_ids(Environment::Backtest)).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "EOF while parsing an object at line 1 column 1"
         );
     }
 
@@ -611,6 +1008,26 @@ mod tests {
         assert_eq!(
             storage.datafusion_root_url().unwrap().as_str(),
             "s3://nautilus-test/"
+        );
+    }
+
+    #[cfg(feature = "cloud")]
+    #[rstest]
+    fn create_storage_backend_rejects_base_path_that_paths_change() {
+        let uri = "s3://nautilus-test/préfix";
+
+        let error = create_storage_backend_from_path(uri, None)
+            .err()
+            .unwrap()
+            .to_string();
+
+        assert_eq!(
+            error,
+            format!(
+                "Storage URI '{uri}' has a base path that URL parsing or object-store path \
+                 encoding changes; use a base path without spaces, non-ASCII, or reserved \
+                 characters"
+            )
         );
     }
 }

@@ -16,8 +16,10 @@
 use std::{cmp, str::FromStr};
 
 use anyhow::Context;
+use indexmap::IndexMap;
+use jiff::tz::TimeZone;
 use nautilus_common::messages::data::{DataResponse, RequestBars, RequestCommand, SubscribeBars};
-use nautilus_core::{Params, UUID4, UnixNanos};
+use nautilus_core::{Params, UUID4, UnixNanos, datetime::get_timezone};
 use nautilus_model::{
     data::BarType,
     enums::{AggregationSource, ContinuousFutureAdjustmentType, PriceType},
@@ -25,6 +27,8 @@ use nautilus_model::{
 };
 use rust_decimal::Decimal;
 use serde_json::Value;
+
+use super::time_range::TIME_RANGE_GENERATOR;
 
 pub(super) const CONTINUOUS_FUTURE_PARENT_REQUEST_ID: &str = "continuous_future_parent_request_id";
 
@@ -40,6 +44,7 @@ pub(super) struct RequestBarAggregation {
     pub(super) update_subscriptions: bool,
     pub(super) disable_build_with_no_updates: bool,
     pub(super) skip_first_non_full_bar: Option<bool>,
+    pub(super) time_zone: Option<TimeZone>,
 }
 
 impl RequestBarAggregation {
@@ -192,17 +197,23 @@ impl ContinuousFutureRequest {
     }
 
     pub(super) fn child_params(&self, parent_params: Option<&Params>, parent_id: UUID4) -> Params {
-        let mut child_params = parent_params.cloned().unwrap_or_default();
+        let mut child_params = parent_params
+            .map(|params| IndexMap::clone(params))
+            .unwrap_or_default();
         child_params.shift_remove(CONTINUOUS_FUTURE_TRANSITIONS);
         child_params.shift_remove(CONTINUOUS_FUTURE_ADJUSTMENT_MODE);
         child_params.shift_remove(LAST_POST_INSTRUMENT_ID);
         child_params.shift_remove(FIRST_PRE_INSTRUMENT_ID);
         child_params.shift_remove(BAR_TYPES);
+
+        // The parent consumes each segment as one response, so a segment must not fan out into
+        // time-range windows.
+        child_params.shift_remove(TIME_RANGE_GENERATOR);
         child_params.insert(
             CONTINUOUS_FUTURE_PARENT_REQUEST_ID.to_string(),
             Value::String(parent_id.to_string()),
         );
-        child_params
+        Params::new(child_params)
     }
 }
 
@@ -311,21 +322,29 @@ pub(super) fn request_bar_aggregation_from_params(
         update_subscriptions,
         disable_build_with_no_updates: false,
         skip_first_non_full_bar,
+        time_zone: time_zone_from_params(Some(params))?,
     }))
 }
 
-pub(super) fn remove_request_bar_aggregation_params(params: &mut Params) {
+pub(super) fn time_zone_from_params(params: Option<&Params>) -> anyhow::Result<Option<TimeZone>> {
+    let Some(value) = params.and_then(|params| params.get("time_zone")) else {
+        return Ok(None);
+    };
+
+    let name = value
+        .as_str()
+        .context("`time_zone` parameter must be a string")?;
+    Ok(Some(get_timezone(name).with_context(|| {
+        format!("invalid `time_zone` parameter {name:?}")
+    })?))
+}
+
+pub(super) fn remove_request_bar_aggregation_params(params: &mut IndexMap<String, Value>) {
     params.shift_remove(BAR_TYPES);
 }
 
 pub(super) fn has_continuous_future_params(params: Option<&Params>) -> bool {
     params.is_some_and(|params| params.contains_key(CONTINUOUS_FUTURE_TRANSITIONS))
-}
-
-pub(super) fn continuous_future_parent_request_id(params: Option<&Params>) -> Option<UUID4> {
-    params
-        .and_then(|params| params.get_str(CONTINUOUS_FUTURE_PARENT_REQUEST_ID))
-        .and_then(|value| UUID4::from_str(value).ok())
 }
 
 pub(super) fn continuous_future_request_from_bars(
@@ -360,7 +379,7 @@ pub(super) fn continuous_future_subscription_from_bars(
         );
     }
 
-    parse_continuous_future(vec![cmd.bar_type], params).map(Some)
+    parse_continuous_future(vec![cmd.single_bar_type()?], params).map(Some)
 }
 
 fn parse_continuous_future(
@@ -427,6 +446,7 @@ fn parse_continuous_future(
             // Roll gaps and weekends must not emit synthetic last-close bars (v1 parity)
             disable_build_with_no_updates: true,
             skip_first_non_full_bar: None,
+            time_zone: time_zone_from_params(Some(params))?,
         },
         transitions,
         adjustment_mode,
@@ -440,7 +460,7 @@ fn continuous_future_bar_types(
     params: &Params,
 ) -> anyhow::Result<Vec<BarType>> {
     let Some(value) = params.get(BAR_TYPES) else {
-        return Ok(vec![request.bar_type]);
+        return Ok(vec![request.single_bar_type()?]);
     };
 
     let values = value
@@ -901,13 +921,15 @@ mod tests {
         #[case] segment_index: usize,
         #[case] expected: &str,
     ) {
-        let mut params = transition_params(mode);
+        let mut params = IndexMap::clone(&transition_params(mode));
         for (key, value) in bound.as_object().unwrap() {
             params.insert(key.clone(), value.clone());
         }
-        let request = continuous_future_request_from_bars(&request_with_params(params))
-            .unwrap()
-            .unwrap();
+
+        let request =
+            continuous_future_request_from_bars(&request_with_params(Params::new(params)))
+                .unwrap()
+                .unwrap();
 
         assert_eq!(
             request.adjustment_for_segment(segment_index),
@@ -948,14 +970,15 @@ mod tests {
 
     #[rstest]
     fn test_continuous_future_source_for_external_reference_uses_segment_instrument() {
-        let mut params = transition_params("BACKWARD_SPREAD");
+        let mut params = IndexMap::clone(&transition_params("BACKWARD_SPREAD"));
         params.insert(
             "bar_types".to_string(),
             json!(["ES.GLBX-5-MINUTE-LAST-INTERNAL@1-MINUTE-EXTERNAL"]),
         );
-        let request = continuous_future_request_from_bars(&request_with_params(params))
-            .unwrap()
-            .unwrap();
+        let request =
+            continuous_future_request_from_bars(&request_with_params(Params::new(params)))
+                .unwrap()
+                .unwrap();
 
         assert_eq!(
             request.source_for_segment(InstrumentId::from("ESH24.GLBX")),

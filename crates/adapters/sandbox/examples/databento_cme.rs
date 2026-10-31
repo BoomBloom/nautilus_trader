@@ -30,6 +30,7 @@ use std::path::PathBuf;
 use nautilus_common::enums::Environment;
 use nautilus_core::env::get_env_var;
 use nautilus_databento::{data::DatabentoDataClientConfig, factories::DatabentoDataClientFactory};
+use nautilus_execution::models::fee::{FeeModelAny, MakerTakerFeeModel};
 use nautilus_live::node::LiveNode;
 use nautilus_model::{
     enums::{AccountType, BookType, OmsType},
@@ -51,7 +52,7 @@ const VENUE: &str = "XCME";
 const ACCOUNT_ID: &str = "XCME-SANDBOX-001";
 const STRATEGY_ID: &str = "SANDBOX_TESTER-001";
 const CLIENT_ID: &str = "DATABENTO";
-const INSTRUMENT_ID: &str = "ESM6.XCME";
+const INSTRUMENT_ID: &str = "ESM26.XCME";
 const ORDER_QTY: &str = "1";
 const STARTING_BALANCE: f64 = 1_000_000.0;
 
@@ -100,8 +101,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         default_leverage: Decimal::ONE,
         leverages: ahash::AHashMap::new(),
         book_type: BookType::L1_MBP,
-        fee_model: None,
         fill_model: None,
+        fee_model: Some(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero())),
+        margin_model: None,
         latency_model: None,
         frozen_account: false,
         bar_execution: true,

@@ -17,7 +17,6 @@
 
 #![expect(
     clippy::missing_errors_doc,
-    clippy::missing_panics_doc,
     reason = "catalog write functions validate catalog-controlled batches and forward storage errors"
 )]
 
@@ -25,14 +24,16 @@ use nautilus_serialization::arrow::catalog_identifier_from_metadata;
 
 use super::{
     BTreeMap, CustomData, Data, DataBatch, EncodeToRecordBatch, HasCatalogDataType, HasTsInit,
-    InstrumentAny, NautilusRecordType, ObjectPath, ObjectStoreExt, Params, ParquetDataCatalog,
-    PathBuf, RecordBatch, Serialize, UnixNanos, WRITE_SKIP_DISJOINT_CHECK, are_intervals_disjoint,
-    instrument_any_type, instrument_path_prefix, parquet_data_path_prefix,
-    prepare_custom_data_batch, record_batch_without_identifier_column, record_path_prefix,
-    timestamps_to_filename, to_snake_case, write_batches_to_object_store, write_catalog_batch,
+    Instrument, InstrumentAny, NautilusDataType, NautilusRecordType, ObjectPath, ObjectStoreExt,
+    Params, ParquetDataCatalog, PathBuf, RecordBatch, Serialize, UnixNanos,
+    WRITE_SKIP_DISJOINT_CHECK, are_intervals_disjoint, group_custom_data_by_type,
+    instrument_any_type, instrument_path_prefix, local_to_object_store_path,
+    parquet_data_path_prefix, prepare_custom_data_batch, record_batch_without_identifier_column,
+    record_path_prefix, timestamps_to_filename, to_snake_case, write_batches_to_object_store,
+    write_catalog_batch,
 };
 use crate::{
-    backend::parquet::io::write_batches_to_object_store_create,
+    backend::parquet::{io::write_batches_to_object_store_create, paths::catalog_filename},
     common::metadata::record_batch_ts_init_range,
 };
 
@@ -80,9 +81,28 @@ impl ParquetDataCatalog {
         end: Option<UnixNanos>,
         skip_disjoint_check: Option<bool>,
     ) -> anyhow::Result<()> {
+        let mut batches = Vec::new();
+        let mut custom = Vec::new();
+
         for batch in DataBatch::from_data_vec_grouped(data)? {
-            write_catalog_batch(self, &batch, start, end, skip_disjoint_check)?;
+            match batch {
+                DataBatch::Custom(data) => custom.extend(data.iter().cloned()),
+                batch => batches.push(batch),
+            }
         }
+
+        // Check every custom group of every type name before any file is written
+        let custom_writes =
+            self.prepare_custom_data_groups(&custom, start, end, skip_disjoint_check)?;
+
+        for batch in &batches {
+            write_catalog_batch(self, batch, start, end, skip_disjoint_check)?;
+        }
+
+        for write in &custom_writes {
+            self.write_custom_data_prepared(write, skip_disjoint_check)?;
+        }
+
         Ok(())
     }
 
@@ -106,6 +126,7 @@ impl ParquetDataCatalog {
         for items in groups.into_values() {
             self.write_to_parquet(&items, start, end, skip_disjoint_check)?;
         }
+
         Ok(())
     }
 
@@ -113,7 +134,7 @@ impl ParquetDataCatalog {
     ///
     /// # Errors
     ///
-    /// Returns error if batches do not contain `ts_init` or cannot be persisted.
+    /// Returns an error if batches do not contain `ts_init` or cannot be persisted.
     pub fn write_record_batches(
         &mut self,
         record_type: &NautilusRecordType,
@@ -221,35 +242,24 @@ impl ParquetDataCatalog {
     where
         T: HasTsInit + EncodeToRecordBatch + HasCatalogDataType,
     {
-        if data.is_empty() {
+        let (Some(first), Some(last)) = (data.first(), data.last()) else {
             return Ok(PathBuf::new());
-        }
+        };
 
         let type_name = to_snake_case(std::any::type_name::<T>());
         Self::check_ascending_timestamps(data, &type_name)?;
+        Self::check_chunk_identity(data, &type_name)?;
 
-        let chunk_metadata = T::chunk_metadata(data);
-        if let Some(position) = data
-            .iter()
-            .position(|item| !item.matches_chunk_metadata(&chunk_metadata))
-        {
-            anyhow::bail!(
-                "Cannot write {type_name} data with mixed identities: element {position} has \
-                 metadata {:?} but the chunk has {chunk_metadata:?}; write each \
-                 instrument or bar type separately",
-                data[position].metadata(),
-            );
-        }
-
-        let start_ts = start.unwrap_or(data.first().unwrap().ts_init());
-        let end_ts = end.unwrap_or(data.last().unwrap().ts_init());
+        let start_ts = start.unwrap_or(first.ts_init());
+        let end_ts = end.unwrap_or(last.ts_init());
 
         let batches = self.data_to_record_batches(data)?;
         let schema = batches.first().expect("Batches are empty.").schema();
 
         let data_type = T::catalog_data_type();
         let path_prefix = parquet_data_path_prefix(&data_type);
-        let identifier = if matches!(data_type, super::NautilusDataType::Bar) {
+
+        let identifier = if matches!(data_type, NautilusDataType::Bar) {
             schema.metadata.get("bar_type").cloned()
         } else {
             schema.metadata.get("instrument_id").cloned()
@@ -302,12 +312,11 @@ impl ParquetDataCatalog {
     where
         D: AsRef<[CustomData]>,
     {
-        let data = data.as_ref();
-        let data = data.iter().collect::<Vec<_>>();
+        let data = data.as_ref().iter().collect::<Vec<_>>();
         self.write_custom_data_refs_batch(&data, start, end, skip_disjoint_check)
     }
 
-    pub(crate) fn write_custom_data_refs_batch(
+    fn write_custom_data_refs_batch(
         &self,
         data: &[&CustomData],
         start: Option<UnixNanos>,
@@ -318,17 +327,103 @@ impl ParquetDataCatalog {
             return Ok(PathBuf::new());
         }
 
-        let (batch, type_name, identifier, start_ts, end_ts) = prepare_custom_data_batch(data)?;
-        let start_ts = start.unwrap_or(start_ts);
-        let end_ts = end.unwrap_or(end_ts);
-        let batches = vec![record_batch_without_identifier_column(batch)?];
+        let write = self.prepare_custom_data_write(data, start, end)?;
+        self.write_custom_data_prepared(&write, skip_disjoint_check)
+    }
 
+    /// Writes custom data as one file per [`DataType`](nautilus_model::data::DataType) group.
+    ///
+    /// Every group is prepared and checked before any file is written, so a call whose groups
+    /// would share a file, or overlap within a directory while the disjoint check is active,
+    /// fails without writing anything.
+    pub(crate) fn write_custom_data_groups(
+        &self,
+        data: &[CustomData],
+        start: Option<UnixNanos>,
+        end: Option<UnixNanos>,
+        skip_disjoint_check: Option<bool>,
+    ) -> anyhow::Result<()> {
+        for write in &self.prepare_custom_data_groups(data, start, end, skip_disjoint_check)? {
+            self.write_custom_data_prepared(write, skip_disjoint_check)?;
+        }
+
+        Ok(())
+    }
+
+    // Prepares one write per custom data group and rejects groups that would share a file or,
+    // while the disjoint check is active, overlap within a directory. A file holds one data type,
+    // so two such groups cannot be stored together, and writing them in turn would skip the
+    // second as an existing file.
+    pub(crate) fn prepare_custom_data_groups(
+        &self,
+        data: &[CustomData],
+        start: Option<UnixNanos>,
+        end: Option<UnixNanos>,
+        skip_disjoint_check: Option<bool>,
+    ) -> anyhow::Result<Vec<CustomDataWrite>> {
+        let check_disjoint = !skip_disjoint_check.unwrap_or(false);
+        let mut writes = Vec::new();
+        let mut directory_intervals: BTreeMap<String, Vec<(u64, u64)>> = BTreeMap::new();
+
+        for group in group_custom_data_by_type(data) {
+            let write = self.prepare_custom_data_write(&group, start, end)?;
+            let interval = (write.start_ts.as_u64(), write.end_ts.as_u64());
+            let intervals = directory_intervals
+                .entry(write.directory.clone())
+                .or_default();
+
+            anyhow::ensure!(
+                !intervals.contains(&interval),
+                "Cannot write custom data for {} with different metadata to the same file {}: \
+                 a file holds one data type",
+                write.type_name,
+                PathBuf::from(&write.directory)
+                    .join(catalog_filename(write.start_ts, write.end_ts, None))
+                    .display(),
+            );
+            intervals.push(interval);
+            anyhow::ensure!(
+                !check_disjoint || are_intervals_disjoint(intervals),
+                "Cannot write custom data for {} with different metadata over overlapping \
+                 intervals {intervals:?} in {}",
+                write.type_name,
+                write.directory,
+            );
+
+            writes.push(write);
+        }
+
+        Ok(writes)
+    }
+
+    pub(crate) fn prepare_custom_data_write(
+        &self,
+        data: &[&CustomData],
+        start: Option<UnixNanos>,
+        end: Option<UnixNanos>,
+    ) -> anyhow::Result<CustomDataWrite> {
+        let (batch, type_name, identifier, start_ts, end_ts) = prepare_custom_data_batch(data)?;
         let directory = self.make_path_custom_data(&type_name, identifier.as_deref())?;
+
+        Ok(CustomDataWrite {
+            type_name,
+            directory,
+            start_ts: start.unwrap_or(start_ts),
+            end_ts: end.unwrap_or(end_ts),
+            batches: vec![record_batch_without_identifier_column(batch)?],
+        })
+    }
+
+    pub(crate) fn write_custom_data_prepared(
+        &self,
+        write: &CustomDataWrite,
+        skip_disjoint_check: Option<bool>,
+    ) -> anyhow::Result<PathBuf> {
         self.write_parquet_file_checked(
-            &directory,
-            start_ts,
-            end_ts,
-            &batches,
+            &write.directory,
+            write.start_ts,
+            write.end_ts,
+            &write.batches,
             skip_disjoint_check.unwrap_or(false),
             "File",
             None,
@@ -380,8 +475,6 @@ impl ParquetDataCatalog {
         &self,
         instruments: Vec<InstrumentAny>,
     ) -> anyhow::Result<Vec<PathBuf>> {
-        use nautilus_model::instruments::Instrument;
-
         if instruments.is_empty() {
             return Ok(Vec::new());
         }
@@ -405,16 +498,18 @@ impl ParquetDataCatalog {
         for ((instrument_prefix, instrument_id), instrument_group) in by_type_and_id {
             Self::check_ascending_timestamps(&instrument_group, "instrument")?;
 
-            let start_ts = HasTsInit::ts_init(instrument_group.first().unwrap());
-            let end_ts = HasTsInit::ts_init(instrument_group.last().unwrap());
-            let batches = self.data_to_record_batches(&instrument_group)?;
-            if batches.is_empty() {
+            let (Some(first), Some(last)) = (instrument_group.first(), instrument_group.last())
+            else {
                 continue;
-            }
+            };
+
+            let start_ts = HasTsInit::ts_init(first);
+            let end_ts = HasTsInit::ts_init(last);
+            let batches = self.data_to_record_batches(&instrument_group)?;
 
             let directory = self.make_path(&instrument_prefix, Some(instrument_id.as_str()))?;
 
-            // ArrowWriter stores the full schema (including "class" metadata) in ARROW:schema.
+            // ArrowWriter stores the full schema (including `type_name` metadata) in ARROW:schema.
             // When reading, use the builder's schema for metadata (see query_instruments).
             let path = self.write_parquet_file_checked(
                 &directory,
@@ -450,21 +545,12 @@ impl ParquetDataCatalog {
         data_description: Option<&str>,
         replay_identity: Option<&str>,
     ) -> anyhow::Result<PathBuf> {
-        let filename = timestamps_to_filename(start_ts, end_ts);
-        let filename = replay_identity.map_or(filename.clone(), |identity| {
-            let stem = filename.strip_suffix(".parquet").unwrap_or(&filename);
-            let digest = blake3::hash(identity.as_bytes()).to_hex();
-            format!("{stem}_{}.parquet", &digest[..16])
-        });
+        let filename = catalog_filename(start_ts, end_ts, replay_identity);
+
         let path = PathBuf::from(directory).join(&filename);
         let object_path = self.to_object_path(&path.to_string_lossy())?;
 
-        let file_exists = self.execute_async(|| async {
-            let exists: bool = self.object_store.head(&object_path).await.is_ok();
-            Ok(exists)
-        })?;
-
-        if file_exists {
+        if self.file_exists(&path.to_string_lossy())? {
             log::info!(
                 "{file_label} {} already exists, skipping write",
                 path.display()
@@ -478,12 +564,11 @@ impl ParquetDataCatalog {
             let mut new_intervals = current_intervals.clone();
             new_intervals.push(new_interval);
 
-            if !are_intervals_disjoint(&new_intervals) {
-                anyhow::bail!(
-                    "Writing file {filename} with interval ({start_ts}, {end_ts}) would create \
-                    non-disjoint intervals. Existing intervals: {current_intervals:?}"
-                );
-            }
+            anyhow::ensure!(
+                are_intervals_disjoint(&new_intervals),
+                "Writing file {filename} with interval ({start_ts}, {end_ts}) would create \
+                non-disjoint intervals. Existing intervals: {current_intervals:?}"
+            );
         }
 
         if let Some(data_description) = data_description {
@@ -495,8 +580,8 @@ impl ParquetDataCatalog {
         }
 
         self.execute_async(|| async {
-            let result = if replay_identity.is_some() {
-                write_batches_to_object_store_create(
+            if replay_identity.is_none() {
+                return write_batches_to_object_store(
                     batches,
                     self.object_store.clone(),
                     &object_path,
@@ -504,31 +589,30 @@ impl ParquetDataCatalog {
                     Some(self.max_row_group_size),
                     None,
                 )
-                .await
-            } else {
-                write_batches_to_object_store(
-                    batches,
-                    self.object_store.clone(),
-                    &object_path,
-                    Some(self.compression),
-                    Some(self.max_row_group_size),
-                    None,
-                )
-                .await
-            };
+                .await;
+            }
 
-            if let Err(e) = result {
-                if replay_identity.is_some()
-                    && matches!(
+            let result = write_batches_to_object_store_create(
+                batches,
+                self.object_store.clone(),
+                &object_path,
+                Some(self.compression),
+                Some(self.max_row_group_size),
+                None,
+            )
+            .await;
+
+            match result {
+                Err(e)
+                    if matches!(
                         e.downcast_ref::<object_store::Error>(),
                         Some(object_store::Error::AlreadyExists { .. })
-                    )
+                    ) =>
                 {
-                    return Ok(());
+                    Ok(())
                 }
-                return Err(e);
+                result => result,
             }
-            Ok(())
         })?;
 
         Ok(path)
@@ -559,10 +643,6 @@ impl ParquetDataCatalog {
     /// - JSON serialization fails.
     /// - Object store write operations fail.
     /// - File path construction fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if data timestamps are not in ascending order.
     ///
     /// # Examples
     ///
@@ -596,20 +676,24 @@ impl ParquetDataCatalog {
     where
         T: HasTsInit + Serialize + HasCatalogDataType + EncodeToRecordBatch,
     {
-        if data.is_empty() {
+        let (Some(first), Some(last)) = (data.first(), data.last()) else {
             return Ok(PathBuf::new());
-        }
+        };
 
         let type_name = to_snake_case(std::any::type_name::<T>());
         Self::check_ascending_timestamps(&data, &type_name)?;
 
-        let start_ts = data.first().unwrap().ts_init();
-        let end_ts = data.last().unwrap().ts_init();
+        let start_ts = first.ts_init();
+        let end_ts = last.ts_init();
 
         let data_type = T::catalog_data_type();
         let path_prefix = parquet_data_path_prefix(&data_type);
-        let directory = path
-            .unwrap_or_else(|| PathBuf::from(self.make_path(path_prefix.as_ref(), None).unwrap()));
+
+        let directory = match path {
+            Some(path) => path,
+            None => PathBuf::from(self.make_path(path_prefix.as_ref(), None)?),
+        };
+
         let filename = timestamps_to_filename(start_ts, end_ts).replace(".parquet", ".json");
         let json_path = directory.join(&filename);
 
@@ -625,7 +709,7 @@ impl ParquetDataCatalog {
             log::info!("Writing metadata to {}", metadata_path.display());
 
             // Use object store for metadata file
-            let metadata_object_path = ObjectPath::from(metadata_path.to_string_lossy().as_ref());
+            let metadata_object_path = ObjectPath::from(local_to_object_store_path(&metadata_path));
             let metadata_json = serde_json::to_vec_pretty(&metadata)?;
             self.execute_async(|| async {
                 let _: object_store::PutResult = self
@@ -637,7 +721,7 @@ impl ParquetDataCatalog {
         }
 
         // Use object store for main JSON file
-        let json_object_path = ObjectPath::from(json_path.to_string_lossy().as_ref());
+        let json_object_path = ObjectPath::from(local_to_object_store_path(&json_path));
         let json_data = serde_json::to_vec_pretty(&serde_json::to_value(data)?)?;
         self.execute_async(|| async {
             let _: object_store::PutResult = self
@@ -660,11 +744,35 @@ impl ParquetDataCatalog {
         data: &[T],
         type_name: &str,
     ) -> anyhow::Result<()> {
-        if !data
-            .array_windows()
-            .all(|[a, b]| a.ts_init() <= b.ts_init())
+        anyhow::ensure!(
+            data.array_windows()
+                .all(|[a, b]| a.ts_init() <= b.ts_init()),
+            "{type_name} timestamps must be in ascending order"
+        );
+        Ok(())
+    }
+
+    // Rejects data whose elements carry different chunk metadata, such as two instruments or
+    // precisions, since one file stores one identity.
+    pub(crate) fn check_chunk_identity<T: EncodeToRecordBatch>(
+        data: &[T],
+        type_name: &str,
+    ) -> anyhow::Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let chunk_metadata = T::chunk_metadata(data);
+
+        if let Some(position) = data
+            .iter()
+            .position(|item| !item.matches_chunk_metadata(&chunk_metadata))
         {
-            anyhow::bail!("{type_name} timestamps must be in ascending order");
+            anyhow::bail!(
+                "Cannot write {type_name} data with mixed identities: element {position} has \
+                 metadata {:?} but the chunk has {chunk_metadata:?}; write each \
+                 instrument or bar type separately",
+                data[position].metadata(),
+            );
         }
 
         Ok(())
@@ -711,6 +819,22 @@ impl ParquetDataCatalog {
     }
 }
 
+// A custom data group prepared for writing, with its target directory and file range.
+pub(crate) struct CustomDataWrite {
+    type_name: String,
+    directory: String,
+    start_ts: UnixNanos,
+    end_ts: UnixNanos,
+    pub(crate) batches: Vec<RecordBatch>,
+}
+
+impl CustomDataWrite {
+    pub(crate) fn path(&self) -> PathBuf {
+        let filename = catalog_filename(self.start_ts, self.end_ts, None);
+        PathBuf::from(&self.directory).join(filename)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -718,7 +842,7 @@ mod tests {
         fs::File,
         sync::{
             Arc,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
     };
 
@@ -727,11 +851,15 @@ mod tests {
         datatypes::{DataType, Field, Schema},
         record_batch::RecordBatch,
     };
-    use futures::stream::BoxStream;
+    use futures::{StreamExt, TryStreamExt, stream::BoxStream};
     use nautilus_core::UnixNanos;
-    use nautilus_model::data::{
-        OrderBookDelta, OrderBookDepth,
-        stubs::{stub_delta, stub_depth10},
+    use nautilus_model::{
+        data::{
+            NautilusDataType, OrderBookDelta, OrderBookDepth, QuoteTick,
+            stubs::{stub_delta, stub_depth10},
+        },
+        identifiers::InstrumentId,
+        types::{Price, Quantity},
     };
     use nautilus_serialization::arrow::{
         DecodeFromRecordBatch, KEY_PRICE_PRECISION, KEY_SIZE_PRECISION,
@@ -838,6 +966,8 @@ mod tests {
     struct CreateRaceStore {
         inner: InMemory,
         create_calls: AtomicUsize,
+        already_exists: bool,
+        fail_head: AtomicBool,
     }
 
     impl Display for CreateRaceStore {
@@ -856,6 +986,14 @@ mod tests {
         ) -> ObjectStoreResult<PutResult> {
             if opts.mode == PutMode::Create {
                 self.create_calls.fetch_add(1, Ordering::Relaxed);
+
+                if !self.already_exists {
+                    return Err(object_store::Error::Generic {
+                        store: "create-race",
+                        source: "injected create failure".into(),
+                    });
+                }
+
                 return Err(object_store::Error::AlreadyExists {
                     path: location.to_string(),
                     source: Box::new(std::io::Error::new(
@@ -864,6 +1002,7 @@ mod tests {
                     )),
                 });
             }
+
             self.inner.put_opts(location, payload, opts).await
         }
 
@@ -880,6 +1019,13 @@ mod tests {
             location: &ObjectPath,
             options: GetOptions,
         ) -> ObjectStoreResult<GetResult> {
+            if options.head && self.fail_head.load(Ordering::Relaxed) {
+                return Err(object_store::Error::Generic {
+                    store: "create-race",
+                    source: "injected head failure".into(),
+                });
+            }
+
             self.inner.get_opts(location, options).await
         }
 
@@ -925,6 +1071,7 @@ mod tests {
             compression: parquet::basic::Compression::SNAPPY,
             max_row_group_size: 5_000,
         };
+
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new(
                 "ts_init",
@@ -961,7 +1108,10 @@ mod tests {
         let object_store = Arc::new(CreateRaceStore {
             inner: InMemory::new(),
             create_calls: AtomicUsize::new(0),
+            already_exists: true,
+            fail_head: AtomicBool::new(false),
         });
+
         let catalog = ParquetDataCatalog {
             base_path: "catalog".to_string(),
             original_uri: "memory://".to_string(),
@@ -971,6 +1121,7 @@ mod tests {
             compression: parquet::basic::Compression::SNAPPY,
             max_row_group_size: 5_000,
         };
+
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new(
                 "ts_init",
@@ -995,5 +1146,255 @@ mod tests {
             .unwrap();
 
         assert_eq!(object_store.create_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[rstest]
+    fn promotion_propagates_create_errors_other_than_already_exists() {
+        let object_store = Arc::new(CreateRaceStore {
+            inner: InMemory::new(),
+            create_calls: AtomicUsize::new(0),
+            already_exists: false,
+            fail_head: AtomicBool::new(false),
+        });
+
+        let catalog = ParquetDataCatalog {
+            base_path: "catalog".to_string(),
+            original_uri: "memory://".to_string(),
+            object_store: object_store.clone(),
+            session: DataBackendSession::new(5_000),
+            batch_size: 5_000,
+            compression: parquet::basic::Compression::SNAPPY,
+            max_row_group_size: 5_000,
+        };
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "ts_init",
+                DataType::Int64,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![1]))],
+        )
+        .unwrap();
+
+        let error = catalog
+            .write_parquet_file_checked(
+                "quotes/TEST",
+                UnixNanos::from(1),
+                UnixNanos::from(1),
+                &[batch],
+                true,
+                "Promoted file",
+                None,
+                Some("failing-replay"),
+            )
+            .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("injected create failure"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(object_store.create_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[rstest]
+    #[case::head_failure(true, None)]
+    #[case::missing_file(false, Some(false))]
+    fn file_exists_propagates_storage_errors_other_than_not_found(
+        #[case] fail_head: bool,
+        #[case] expected: Option<bool>,
+    ) {
+        let catalog = ParquetDataCatalog {
+            base_path: "catalog".to_string(),
+            original_uri: "memory://".to_string(),
+            object_store: Arc::new(CreateRaceStore {
+                inner: InMemory::new(),
+                create_calls: AtomicUsize::new(0),
+                already_exists: true,
+                fail_head: AtomicBool::new(fail_head),
+            }),
+            session: DataBackendSession::new(5_000),
+            batch_size: 5_000,
+            compression: parquet::basic::Compression::SNAPPY,
+            max_row_group_size: 5_000,
+        };
+
+        let result = catalog.file_exists("quotes/TEST/missing.parquet");
+
+        match expected {
+            Some(exists) => assert_eq!(result.unwrap(), exists),
+            None => assert!(
+                format!("{:#}", result.unwrap_err()).contains("injected head failure"),
+                "head failure must propagate"
+            ),
+        }
+    }
+
+    #[rstest]
+    fn write_propagates_head_failure_instead_of_writing() {
+        let object_store = Arc::new(CreateRaceStore {
+            inner: InMemory::new(),
+            create_calls: AtomicUsize::new(0),
+            already_exists: true,
+            fail_head: AtomicBool::new(true),
+        });
+
+        let catalog = ParquetDataCatalog {
+            base_path: "catalog".to_string(),
+            original_uri: "memory://".to_string(),
+            object_store: object_store.clone(),
+            session: DataBackendSession::new(5_000),
+            batch_size: 5_000,
+            compression: parquet::basic::Compression::SNAPPY,
+            max_row_group_size: 5_000,
+        };
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "ts_init",
+                DataType::Int64,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![1]))],
+        )
+        .unwrap();
+
+        let error = catalog
+            .write_parquet_file_checked(
+                "quotes/TEST",
+                UnixNanos::from(1),
+                UnixNanos::from(1),
+                &[batch],
+                true,
+                "Data file",
+                None,
+                None,
+            )
+            .unwrap_err();
+
+        let stored = catalog
+            .execute_async(|| async {
+                Ok(object_store
+                    .inner
+                    .list(None)
+                    .collect::<Vec<_>>()
+                    .await
+                    .len())
+            })
+            .unwrap();
+
+        assert!(
+            format!("{error:#}").contains("injected head failure"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(stored, 0);
+    }
+
+    #[rstest]
+    fn period_consolidation_stops_on_head_failure() {
+        let object_store = Arc::new(CreateRaceStore {
+            inner: InMemory::new(),
+            create_calls: AtomicUsize::new(0),
+            already_exists: true,
+            fail_head: AtomicBool::new(false),
+        });
+
+        let mut catalog = ParquetDataCatalog {
+            base_path: String::new(),
+            original_uri: "s3://test-bucket".to_string(),
+            object_store: object_store.clone(),
+            session: DataBackendSession::new(5_000),
+            batch_size: 5_000,
+            compression: parquet::basic::Compression::SNAPPY,
+            max_row_group_size: 5_000,
+        };
+
+        let quote = |ts: u64| {
+            QuoteTick::new(
+                InstrumentId::from("ETH/USDT.BINANCE"),
+                Price::from("1.0001"),
+                Price::from("1.0002"),
+                Quantity::from("100"),
+                Quantity::from("100"),
+                UnixNanos::from(ts),
+                UnixNanos::from(ts),
+            )
+        };
+
+        catalog
+            .write_to_parquet(&[quote(1)], None, None, None)
+            .unwrap();
+        catalog
+            .write_to_parquet(&[quote(2)], None, None, None)
+            .unwrap();
+        object_store.fail_head.store(true, Ordering::Relaxed);
+
+        let error = catalog
+            .consolidate_data_by_period(
+                &NautilusDataType::QuoteTick.into(),
+                Some("ETH/USDT.BINANCE"),
+                Some(86_400_000_000_000),
+                None,
+                None,
+                Some(true),
+            )
+            .unwrap_err();
+
+        let files = catalog
+            .query_files(&NautilusDataType::QuoteTick.into(), None, None, None)
+            .unwrap();
+        assert!(
+            format!("{error:#}").contains("injected head failure"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(files.len(), 2);
+    }
+
+    #[rstest]
+    fn write_to_json_normalizes_windows_separators() {
+        let catalog = ParquetDataCatalog {
+            base_path: String::new(),
+            original_uri: "memory://".to_string(),
+            object_store: Arc::new(InMemory::new()),
+            session: DataBackendSession::new(5_000),
+            batch_size: 5_000,
+            compression: parquet::basic::Compression::SNAPPY,
+            max_row_group_size: 5_000,
+        };
+
+        let quote = QuoteTick::new(
+            InstrumentId::from("ETH/USDT.BINANCE"),
+            Price::from("1.0001"),
+            Price::from("1.0002"),
+            Quantity::from("100"),
+            Quantity::from("100"),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+        );
+
+        catalog
+            .write_to_json(vec![quote], Some(r"data\quotes".into()), true)
+            .unwrap();
+
+        let mut keys = catalog
+            .execute_async(|| async {
+                Ok(catalog
+                    .object_store
+                    .list(None)
+                    .map_ok(|object| object.location.to_string())
+                    .try_collect::<Vec<_>>()
+                    .await?)
+            })
+            .unwrap();
+
+        keys.sort();
+
+        assert_eq!(
+            keys,
+            vec![
+                "data/quotes/1970-01-01T00-00-00-000000001Z_1970-01-01T00-00-00-000000001Z.json",
+                "data/quotes/1970-01-01T00-00-00-000000001Z_1970-01-01T00-00-00-000000001Z.metadata.json",
+            ]
+        );
     }
 }

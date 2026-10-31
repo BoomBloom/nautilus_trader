@@ -27,9 +27,10 @@ use nautilus_architect_ax::{
 };
 use nautilus_common::{cache::InstrumentLookupError, testing::wait_until_async};
 use nautilus_model::{
-    enums::{OrderSide, TimeInForce},
-    identifiers::{AccountId, ClientOrderId, StrategyId, TraderId, VenueOrderId},
+    enums::{OrderSide, OrderType, TimeInForce},
+    identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId, VenueOrderId},
     instruments::Instrument,
+    orders::builder::OrderTestBuilder,
     types::{Price, Quantity},
 };
 use nautilus_network::websocket::TransportBackend;
@@ -245,7 +246,7 @@ async fn test_md_connection_failure_to_invalid_url() {
 
     assert!(matches!(err, AxWsClientError::Transport(_)));
     assert!(
-        message.starts_with(&format!("Transport error: Failed to connect to {url}: ")),
+        message.starts_with("Transport error: WebSocket connection failed: ws://127.0.0.1:9999: "),
         "expected the failure to name the endpoint, was: {message}"
     );
     assert!(
@@ -850,6 +851,73 @@ async fn test_md_reconnect_replays_failed_subscription() {
 
 #[rstest]
 #[tokio::test]
+async fn test_md_close_connect_replays_subscriptions() {
+    let (addr, state) = start_test_server().await.unwrap();
+
+    let mut client = AxMdWebSocketClient::new(
+        format!("ws://{addr}/md/ws"),
+        "test_token".to_string(),
+        30,
+        TransportBackend::default(),
+        None,
+    );
+
+    client.connect().await.unwrap();
+    client
+        .subscribe_book_deltas("GBPUSD-PERP", AxMarketDataLevel::Level2)
+        .await
+        .unwrap();
+    client
+        .subscribe_candles("EURUSD-PERP", AxCandleWidth::Seconds1)
+        .await
+        .unwrap();
+    wait_until_async(
+        || async { client.subscription_count() == 2 },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let mut expected = state.get_messages().await;
+    expected.retain(|message| {
+        matches!(
+            message["type"].as_str(),
+            Some("subscribe" | "subscribe_candles")
+        )
+    });
+
+    for message in &mut expected {
+        message.as_object_mut().unwrap().remove("rid");
+    }
+
+    expected.sort_by_key(serde_json::Value::to_string);
+    assert_eq!(expected.len(), 2);
+
+    client.close().await.unwrap();
+    wait_until_async(
+        || async { *state.connection_count.lock().await == 0 },
+        Duration::from_secs(5),
+    )
+    .await;
+    state.reset().await;
+    client.connect().await.unwrap();
+    wait_until_async(
+        || async { state.get_messages().await.len() == 2 },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let mut actual = state.get_messages().await;
+    for message in &mut actual {
+        message.as_object_mut().unwrap().remove("rid");
+    }
+
+    actual.sort_by_key(serde_json::Value::to_string);
+    assert_eq!(actual, expected);
+    client.close().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_md_rapid_subscribe_unsubscribe() {
     let (addr, state) = start_test_server().await.unwrap();
     let ws_url = format!("ws://{addr}/md/ws");
@@ -1292,7 +1360,7 @@ async fn test_orders_connection_failure_to_invalid_url() {
 
     assert!(matches!(err, AxOrdersWsClientError::Transport(_)));
     assert!(
-        message.starts_with(&format!("Transport error: Failed to connect to {url}: ")),
+        message.starts_with("Transport error: WebSocket connection failed: ws://127.0.0.1:9999: "),
         "expected the failure to name the endpoint, was: {message}"
     );
     assert!(
@@ -1352,13 +1420,18 @@ async fn test_orders_submit_order() {
     client.connect("test_token").await.unwrap();
     wait_for_connection(&state).await;
 
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .trader_id(trader_id)
+        .strategy_id(StrategyId::from("TEST-STRATEGY"))
+        .instrument_id(instrument.id())
+        .client_order_id(ClientOrderId::from("TEST-001"))
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("100"))
+        .price(Price::from("50000.00"))
+        .build();
     let request_id = client
         .submit_order(
-            trader_id,
-            StrategyId::from("TEST-STRATEGY"),
-            instrument.id(),
-            ClientOrderId::from("TEST-001"),
-            OrderSide::Buy,
+            order.init_event(),
             Quantity::from("100"),
             TimeInForce::Gtc,
             Price::from("50000.00"),
@@ -1407,13 +1480,18 @@ async fn test_orders_submit_order_missing_cached_instrument_returns_lookup_error
 
     let instrument = create_test_instrument("EURUSD-PERP");
 
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .trader_id(trader_id)
+        .strategy_id(StrategyId::from("TEST-STRATEGY"))
+        .instrument_id(instrument.id())
+        .client_order_id(ClientOrderId::from("TEST-001"))
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("100"))
+        .price(Price::from("50000.00"))
+        .build();
     let result = client
         .submit_order(
-            trader_id,
-            StrategyId::from("TEST-STRATEGY"),
-            instrument.id(),
-            ClientOrderId::from("TEST-001"),
-            OrderSide::Buy,
+            order.init_event(),
             Quantity::from("100"),
             TimeInForce::Gtc,
             Price::from("50000.00"),
@@ -1463,8 +1541,10 @@ async fn test_orders_cancel_order_rejects_without_venue_order_id() {
 }
 
 #[rstest]
+#[case::caller_id(false)]
+#[case::tracked_replacement(true)]
 #[tokio::test]
-async fn test_orders_cancel_order_with_venue_order_id() {
+async fn test_orders_cancel_order_with_venue_order_id(#[case] replaced: bool) {
     let (addr, state) = start_test_server().await.unwrap();
     let ws_url = format!("ws://{addr}/orders/ws");
     let account_id = AccountId::from("AX-001");
@@ -1484,6 +1564,18 @@ async fn test_orders_cancel_order_with_venue_order_id() {
 
     let client_order_id = ClientOrderId::from("O-123");
     let venue_order_id = VenueOrderId::new("OID-123");
+    let replacement_id = VenueOrderId::from("OID-REPLACEMENT");
+
+    if replaced {
+        client.cache_instrument(create_test_instrument("EURUSD-PERP"));
+        assert!(client.register_external_order(
+            client_order_id,
+            replacement_id,
+            InstrumentId::from("EURUSD-PERP.AX"),
+            StrategyId::from("S-001")
+        ));
+    }
+
     let request_id = client
         .cancel_order(client_order_id, Some(venue_order_id))
         .await
@@ -1503,7 +1595,14 @@ async fn test_orders_cancel_order_with_venue_order_id() {
         .iter()
         .find(|m| m.get("t").and_then(|v| v.as_str()) == Some("x"))
         .expect("expected a cancel-order message");
-    assert_eq!(cancel.get("oid").and_then(|v| v.as_str()), Some("OID-123"));
+    assert_eq!(
+        cancel.get("oid").and_then(|v| v.as_str()),
+        Some(if replaced {
+            replacement_id.as_str()
+        } else {
+            "OID-123"
+        })
+    );
 
     client.close().await.expect("close WebSocket client");
 }
@@ -1726,7 +1825,8 @@ async fn test_md_client_debug() {
 
     let debug_str = format!("{client:?}");
     assert!(debug_str.contains("AxMdWebSocketClient"));
-    assert!(debug_str.contains("ws://localhost:9999/md/ws"));
+    assert!(debug_str.contains("url: \"ws://localhost:9999\""));
+    assert!(!debug_str.contains("/md/ws"));
 }
 
 #[rstest]
@@ -1745,7 +1845,8 @@ async fn test_orders_client_debug() {
 
     let debug_str = format!("{client:?}");
     assert!(debug_str.contains("AxOrdersWebSocketClient"));
-    assert!(debug_str.contains("ws://localhost:9999/orders/ws"));
+    assert!(debug_str.contains("url: \"ws://localhost:9999\""));
+    assert!(!debug_str.contains("/orders/ws"));
 }
 
 #[rstest]

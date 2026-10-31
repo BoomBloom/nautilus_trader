@@ -514,6 +514,10 @@ impl LighterOrderStatus {
             _ => None,
         }
     }
+
+    pub(crate) fn is_terminal(self) -> bool {
+        !matches!(self, Self::InProgress | Self::Pending | Self::Open)
+    }
 }
 
 /// Side string used by REST and WebSocket order payloads.
@@ -617,8 +621,8 @@ impl LighterOrderType {
     ///
     /// # Errors
     ///
-    /// Returns an error for venue-internal or algorithmic order types which
-    /// do not map to a single Nautilus order type.
+    /// Returns an error if a venue-internal or algorithmic order type does not map to a single
+    /// Nautilus order type.
     pub fn as_nautilus(self) -> anyhow::Result<OrderType> {
         match self {
             Self::Limit => Ok(OrderType::Limit),
@@ -676,6 +680,54 @@ pub enum LighterGroupingType {
     OneTriggersTheOther = 1,
     OneCancelsTheOther = 2,
     OneTriggersOneCancelsTheOther = 3,
+}
+
+/// Lighter's action when an order would self-trade.
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Display,
+    PartialEq,
+    Eq,
+    Hash,
+    AsRefStr,
+    EnumString,
+    Serialize_repr,
+    Deserialize_repr,
+)]
+#[repr(u8)]
+#[strum(serialize_all = "snake_case", ascii_case_insensitive)]
+pub enum LighterSelfTradeBehaviorMode {
+    #[default]
+    ExpireMaker = 0,
+    ExpireTaker = 1,
+    CancelBoth = 2,
+    Reduce = 3,
+}
+
+/// Lighter's account scope for self-trade prevention.
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Display,
+    PartialEq,
+    Eq,
+    Hash,
+    AsRefStr,
+    EnumString,
+    Serialize_repr,
+    Deserialize_repr,
+)]
+#[repr(u8)]
+#[strum(serialize_all = "snake_case", ascii_case_insensitive)]
+pub enum LighterSelfTradeEqualityMode {
+    #[default]
+    AccountIndex = 0,
+    MasterAccountIndex = 1,
 }
 
 /// Lighter cancel-all-orders time-in-force.

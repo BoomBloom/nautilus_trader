@@ -29,7 +29,8 @@ use super::{
     DecodeDataFromRecordBatch, EncodingError, KEY_IDENTIFIER, KEY_INSTRUMENT_ID,
     KEY_PRICE_PRECISION, decode_decimal_price, decode_required_timestamp, enum_dictionary_array,
     enum_dictionary_data_type, extract_column, extract_column_string, fixed_decimal_data_type,
-    identifier_array_from_display, price_decimal_array,
+    identifier_array_from_display, metadata_with_type_name, price_decimal_array,
+    validate_required_column,
 };
 use crate::arrow::{ArrowSchemaProvider, Data, DecodeFromRecordBatch, EncodeToRecordBatch};
 
@@ -43,10 +44,7 @@ impl ArrowSchemaProvider for InstrumentClose {
             Field::new(KEY_IDENTIFIER, DataType::Utf8, true),
         ];
 
-        match metadata {
-            Some(metadata) => Schema::new_with_metadata(fields, metadata),
-            None => Schema::new(fields),
-        }
+        Schema::new_with_metadata(fields, metadata_with_type_name("InstrumentClose", metadata))
     }
 }
 
@@ -125,6 +123,7 @@ impl DecodeFromRecordBatch for InstrumentClose {
         let close_price_values =
             extract_column::<Decimal128Array>(cols, "close_price", 0, fixed_decimal_data_type())?;
         let close_type_values = extract_column_string(cols, "close_type", 1)?;
+        validate_required_column(cols[1].as_ref(), "close_type")?;
         let ts_event_values = extract_column::<UInt64Array>(cols, "ts_event", 2, DataType::UInt64)?;
         let ts_init_values = extract_column::<UInt64Array>(cols, "ts_init", 3, DataType::UInt64)?;
 
@@ -169,7 +168,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::arrow::get_raw_price;
+    use crate::arrow::{KEY_TYPE_NAME, get_raw_price};
 
     #[rstest]
     fn test_get_schema() {
@@ -188,7 +187,9 @@ mod tests {
             Field::new(KEY_IDENTIFIER, DataType::Utf8, true),
         ];
 
-        let expected_schema = Schema::new_with_metadata(expected_fields, metadata);
+        let mut expected_metadata = metadata;
+        expected_metadata.insert(KEY_TYPE_NAME.to_string(), "InstrumentClose".to_string());
+        let expected_schema = Schema::new_with_metadata(expected_fields, expected_metadata);
         assert_eq!(schema, expected_schema);
     }
 
@@ -337,6 +338,55 @@ mod tests {
     }
 
     #[rstest]
+    fn test_decode_batch_rejects_null_close_type_with_field_and_row() {
+        use arrow::{array::StringDictionaryBuilder, datatypes::Int8Type};
+
+        let instrument_id = InstrumentId::from("AAPL.XNAS");
+        let metadata = HashMap::from([
+            (KEY_INSTRUMENT_ID.to_string(), instrument_id.to_string()),
+            (KEY_PRICE_PRECISION.to_string(), "2".to_string()),
+        ]);
+
+        let close = InstrumentClose {
+            instrument_id,
+            close_price: Price::from("150.50"),
+            close_type: InstrumentCloseType::EndOfSession,
+            ts_event: 1.into(),
+            ts_init: 2.into(),
+        };
+
+        let encoded = InstrumentClose::encode_batch(&metadata, &[close]).unwrap();
+        let mut close_type = StringDictionaryBuilder::<Int8Type>::new();
+        close_type.append_null();
+        let mut columns = encoded.columns().to_vec();
+        columns[1] = Arc::new(close_type.finish());
+
+        let fields = encoded
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| {
+                if field.name() == "close_type" {
+                    Arc::new(field.as_ref().clone().with_nullable(true))
+                } else {
+                    Arc::clone(field)
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let schema = Arc::new(Schema::new_with_metadata(fields, metadata.clone()));
+        let record_batch = RecordBatch::try_new(schema, columns).unwrap();
+
+        let result = InstrumentClose::decode_batch(&metadata, record_batch);
+
+        assert!(matches!(
+            result,
+            Err(EncodingError::ParseError("close_type", ref message))
+                if message == "row 0: required value is null"
+        ));
+    }
+
+    #[rstest]
     fn test_decode_batch_rejects_null_timestamp_with_field_and_row() {
         let instrument_id = InstrumentId::from("AAPL.XNAS");
         let metadata = HashMap::from([
@@ -361,7 +411,7 @@ mod tests {
                 if field.name() == "ts_init" {
                     Arc::new(field.as_ref().clone().with_nullable(true))
                 } else {
-                    field.clone()
+                    Arc::clone(field)
                 }
             })
             .collect::<Vec<_>>();

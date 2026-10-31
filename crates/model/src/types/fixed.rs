@@ -20,16 +20,14 @@
 //!
 //! # Raw Value Requirements
 //!
-//! When constructing value types like [`Price`] or [`Quantity`] using `from_raw`, the raw value
-//! **must** be a valid multiple of the scale factor for the given precision. Valid raw values
-//! should ideally come from:
+//! For [`Price`] and [`Quantity`], non-sentinel raw constructor inputs at precision `p` below
+//! [`FIXED_PRECISION`] must be multiples of `10^(FIXED_PRECISION - p)`. The checked constructors
+//! return an error for extra fractional digits; `from_raw` panics in both debug and release builds.
+//! Arrow and SBE decoders use the checked constructors and reject these inputs without rounding.
 //!
-//! - Calling the `raw()` accessor of an existing value (e.g., `price.raw()`)
-//! - Using the fixed-point conversion functions in this module
-//! - Values from Nautilus-produced Arrow data
-//!
-//! Raw values that are not valid multiples will cause a panic on construction in debug builds,
-//! and may result in incorrect values in release builds.
+//! Arithmetic does not implicitly increase precision. In particular, [`Quantity`] multiplication
+//! can retain finer raw digits than its declared precision. Such a result requires an explicit
+//! precision choice or rounding before reconstruction through a raw constructor.
 //!
 //! # Legacy Catalog Data and Floating-Point Errors
 //!
@@ -48,23 +46,24 @@
 //!
 //! # Raw Value Correction
 //!
-//! To handle legacy data with floating-point errors, the Arrow decode path uses correction
-//! functions ([`correct_raw_i64`], [`correct_raw_i128`], etc.) to round raw values to the
-//! nearest valid multiple. This ensures backward compatibility with existing catalogs.
-//!
-//! **Note:** This correction adds a small amount of overhead during decoding. In a future
-//! version, once catalogs have been repaired or migrated, this correction will become opt-in.
+//! Correction functions ([`correct_raw_i64`], [`correct_raw_i128`], etc.) explicitly round raw
+//! values to the nearest valid multiple. Arrow decoding does not apply this correction.
+//! Legacy catalog migration does not round raw digits. Built-in rows with extra digits fail
+//! migration, including arithmetic results with finer digits than their declared precision.
+//! Regenerate affected data or explicitly correct its precision or scaling before migration.
 //!
 //! [`Price`]: crate::types::Price
 //! [`Quantity`]: crate::types::Quantity
 
-use std::{cmp::Ordering, fmt::Display};
+use std::{borrow::Cow, cmp::Ordering, fmt::Display};
 
 use nautilus_core::correctness::{
     CorrectnessError, CorrectnessResult, CorrectnessResultExt, FAILED,
 };
 use rust_decimal::Decimal;
 
+#[cfg(feature = "defi")]
+use crate::defi::WEI_PRECISION;
 use crate::types::{price::PriceRaw, quantity::QuantityRaw};
 
 /// Indicates if high-precision mode is enabled.
@@ -92,6 +91,12 @@ pub const FIXED_PRECISION_STANDARD: u8 = 9;
 #[cfg(not(feature = "high-precision"))]
 /// The maximum fixed-point precision.
 pub const FIXED_PRECISION: u8 = FIXED_PRECISION_STANDARD;
+
+#[cfg(feature = "defi")]
+pub(crate) const MAX_PRECISION: u8 = WEI_PRECISION;
+
+#[cfg(not(feature = "defi"))]
+pub(crate) const MAX_PRECISION: u8 = FIXED_PRECISION;
 
 // -----------------------------------------------------------------------------
 // PRECISION_BYTES (size of integer backing the fixed-point values)
@@ -189,22 +194,37 @@ pub const MAX_FLOAT_PRECISION: u8 = 16;
 ///
 /// # Errors
 ///
-/// Returns an error if `precision` exceeds the maximum allowed:
-/// - With the `defi` feature: `WEI_PRECISION` (18)
-/// - Without the `defi` feature: [`FIXED_PRECISION`]
+/// Returns an error if:
+/// - The `defi` feature is enabled and `precision` exceeds `WEI_PRECISION` (18).
+/// - The `defi` feature is disabled and `precision` exceeds [`FIXED_PRECISION`].
 pub fn check_fixed_precision(precision: u8) -> CorrectnessResult<()> {
-    #[cfg(feature = "defi")]
-    if precision > crate::defi::WEI_PRECISION {
+    if precision > MAX_PRECISION {
+        let limit_name = if cfg!(feature = "defi") {
+            "WEI_PRECISION"
+        } else {
+            "FIXED_PRECISION"
+        };
+
         return Err(CorrectnessError::PredicateViolation {
-            message: format!("`precision` exceeded maximum `WEI_PRECISION` (18), was {precision}"),
+            message: format!(
+                "`precision` exceeded maximum `{limit_name}` ({MAX_PRECISION}), was {precision}"
+            ),
         });
     }
 
-    #[cfg(not(feature = "defi"))]
-    if precision > FIXED_PRECISION {
+    Ok(())
+}
+
+/// Checks that a value with the given `precision` can be converted to `f64`.
+///
+/// # Errors
+///
+/// Returns an error if `precision` exceeds [`MAX_FLOAT_PRECISION`].
+pub fn check_float_precision(precision: u8) -> CorrectnessResult<()> {
+    if precision > MAX_FLOAT_PRECISION {
         return Err(CorrectnessError::PredicateViolation {
             message: format!(
-                "`precision` exceeded maximum `FIXED_PRECISION` ({FIXED_PRECISION}), was {precision}"
+                "Fixed-point precision {precision} exceeds maximum float precision {MAX_FLOAT_PRECISION}"
             ),
         });
     }
@@ -351,14 +371,17 @@ pub(crate) fn parse_decimal_mantissa(value: &str) -> Result<(i128, u8), String> 
     if fraction.contains('.') {
         return Err(format!("Invalid decimal value '{value}'"));
     }
-    let digits = format!("{whole}{fraction}");
-    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+
+    let digits = whole.bytes().chain(fraction.bytes());
+    if (whole.is_empty() && fraction.is_empty())
+        || !digits.clone().all(|byte| byte.is_ascii_digit())
+    {
         return Err(format!("Invalid decimal value '{value}'"));
     }
     let precision = u8::try_from(fraction.len())
         .map_err(|_| format!("Decimal value '{value}' has too many fractional digits"))?;
     let mut mantissa = 0_i128;
-    for digit in digits.bytes().map(|byte| i128::from(byte - b'0')) {
+    for digit in digits.map(|byte| i128::from(byte - b'0')) {
         mantissa = if negative {
             mantissa
                 .checked_mul(10)
@@ -371,6 +394,14 @@ pub(crate) fn parse_decimal_mantissa(value: &str) -> Result<(i128, u8), String> 
         .ok_or_else(|| format!("Decimal value '{value}' exceeds i128 range"))?;
     }
     Ok((mantissa, precision))
+}
+
+pub(super) fn remove_underscores(value: &str) -> Cow<'_, str> {
+    if value.contains('_') {
+        Cow::Owned(value.replace('_', ""))
+    } else {
+        Cow::Borrowed(value)
+    }
 }
 
 pub(crate) fn format_scaled_u128(raw: u128, precision: u8) -> String {
@@ -1130,6 +1161,26 @@ mod tests {
     }
 
     #[rstest]
+    #[case("")]
+    #[case("0")]
+    #[case("-12.3400")]
+    #[case("+1e9")]
+    #[case("not decimal")]
+    fn test_remove_underscores_borrows_clean_values(#[case] input: &str) {
+        assert!(matches!(remove_underscores(input), Cow::Borrowed(value) if value == input));
+    }
+
+    #[rstest]
+    #[case("_", "")]
+    #[case("1_234.56", "1234.56")]
+    #[case("_1__2_3.4_5_", "123.45")]
+    #[case("1e_3", "1e3")]
+    #[case("_-_1_0_._0_", "-10.0")]
+    fn test_remove_underscores_removes_separators(#[case] input: &str, #[case] expected: &str) {
+        assert!(matches!(remove_underscores(input), Cow::Owned(value) if value == expected));
+    }
+
+    #[rstest]
     #[case("1.00", 100, 2)]
     #[case("+1.00", 100, 2)]
     #[case("-1.00", -100, 2)]
@@ -1400,6 +1451,33 @@ mod tests {
         let precision = WEI_PRECISION + 1;
         let result = check_fixed_precision(precision);
         assert!(result.is_err());
+    }
+
+    #[rstest]
+    fn test_check_float_precision_matches_supported_range() {
+        for precision in 0..=u8::MAX {
+            let expected = if precision <= MAX_FLOAT_PRECISION {
+                Ok(())
+            } else {
+                Err(CorrectnessError::PredicateViolation {
+                    message: format!(
+                        "Fixed-point precision {precision} exceeds maximum float precision 16"
+                    ),
+                })
+            };
+
+            assert_eq!(check_float_precision(precision), expected);
+        }
+    }
+
+    #[rstest]
+    fn test_check_float_precision_error_display() {
+        let error = check_float_precision(18).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Fixed-point precision 18 exceeds maximum float precision 16"
+        );
     }
 
     #[cfg(not(feature = "defi"))]

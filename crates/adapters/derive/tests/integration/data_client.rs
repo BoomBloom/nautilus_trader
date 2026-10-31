@@ -47,34 +47,42 @@ use nautilus_common::{
         data::{
             DataResponse, RequestBars, RequestFundingRates, RequestInstrument, RequestInstruments,
             RequestOptionChainReferencePrice, RequestQuotes, RequestTrades, SubscribeBookDeltas,
-            SubscribeBookDepth, SubscribeQuotes, SubscribeTrades, UnsubscribeBookDeltas,
-            UnsubscribeBookDepth, UnsubscribeQuotes, UnsubscribeTrades,
+            SubscribeBookDepth, SubscribeIndexPrices, SubscribeMarkPrices, SubscribeQuotes,
+            SubscribeTrades, UnsubscribeBookDeltas, UnsubscribeBookDepth, UnsubscribeQuotes,
+            UnsubscribeTrades,
         },
         system::SocketState,
     },
     testing::wait_until_async,
 };
 use nautilus_core::{Params, UUID4, UnixNanos, time::get_atomic_clock_realtime};
-use nautilus_derive::{
-    common::{
-        consts::{DERIVE_CLIENT_ID, DERIVE_VENUE},
-        enums::DeriveEnvironment,
-    },
-    config::DeriveDataClientConfig,
-    data::DeriveDataClient,
+use nautilus_live::{
+    SocketReconnectRegistry, SocketReconnectRequestOutcome, book::conformance::BookStreamChecker,
 };
-use nautilus_live::{SocketReconnectRegistry, SocketReconnectRequestOutcome};
 use nautilus_model::{
     data::{BarType, Data},
     enums::{AggressorSide, BookType},
     identifiers::{InstrumentId, OptionSeriesId, TradeId},
-    instruments::Instrument,
+    instruments::{Instrument, InstrumentAny},
     types::{Price, Quantity},
 };
 use nautilus_network::{http::HttpClient, websocket::TransportBackend};
 use rstest::rstest;
 use serde_json::{Value, json};
 use ustr::Ustr;
+
+use crate::{
+    common::{
+        consts::{DERIVE_CLIENT_ID, DERIVE_VENUE},
+        enums::DeriveEnvironment,
+        parse::parse_derive_instrument_any,
+    },
+    config::DeriveDataClientConfig,
+    data::DeriveDataClient,
+    websocket::{
+        WsSubscriptionPayload, parse_orderbook_deltas, parse_orderbook_depth, parse_orderbook_msg,
+    },
+};
 
 #[derive(Clone, Default)]
 struct RestRequest {
@@ -95,6 +103,7 @@ struct RestState {
     ticker_response: Arc<tokio::sync::Mutex<Value>>,
     ticker_calls: Arc<tokio::sync::Mutex<Vec<Value>>>,
     instruments_response: Arc<tokio::sync::Mutex<Option<Value>>>,
+    instruments_gate: Arc<tokio::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>>,
     instrument_response: Arc<tokio::sync::Mutex<Value>>,
     instrument_calls: Arc<tokio::sync::Mutex<Vec<Value>>>,
 }
@@ -128,6 +137,8 @@ impl RestState {
 #[derive(Clone)]
 struct WsState {
     connection_count: Arc<AtomicUsize>,
+    book_snapshots_missing: Arc<AtomicUsize>,
+    book_timestamp_step: Arc<AtomicUsize>,
     subscribe_frames: Arc<tokio::sync::Mutex<Vec<Value>>>,
     unsubscribe_frames: Arc<tokio::sync::Mutex<Vec<Value>>>,
     subscribe_failures: Arc<AtomicUsize>,
@@ -143,6 +154,8 @@ impl Default for WsState {
     fn default() -> Self {
         Self {
             connection_count: Arc::new(AtomicUsize::new(0)),
+            book_snapshots_missing: Arc::new(AtomicUsize::new(0)),
+            book_timestamp_step: Arc::new(AtomicUsize::new(0)),
             subscribe_frames: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             unsubscribe_frames: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             subscribe_failures: Arc::new(AtomicUsize::new(0)),
@@ -171,18 +184,33 @@ async fn handle_get_instruments(
     body: axum::body::Bytes,
 ) -> Response {
     let parsed_body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-    state
-        .requests
-        .lock()
-        .await
-        .push(RestRequest { body: parsed_body });
-
     let response = state
         .instruments_response
         .lock()
         .await
         .clone()
         .unwrap_or_else(|| load_json("common/http_get_instruments_eth_all.json"));
+    let gate = state.instruments_gate.lock().await.clone();
+    state.requests.lock().await.push(RestRequest {
+        body: parsed_body.clone(),
+    });
+
+    if let Some(gate) = gate {
+        let _permit = gate.acquire().await.unwrap();
+    }
+
+    let mut response = response;
+    if let Some(rows) = response["result"].as_array() {
+        response["result"] = json!({
+            "instruments": rows,
+            "pagination": {"count": rows.len(), "num_pages": 1},
+        });
+    }
+
+    if let Some(rows) = response["result"]["instruments"].as_array_mut() {
+        rows.retain(|row| row["instrument_type"] == parsed_body["instrument_type"]);
+    }
+
     (StatusCode::OK, Json(response)).into_response()
 }
 
@@ -241,6 +269,7 @@ async fn handle_get_tradingview_chart_data(
     }
 
     let response_value = state.candles_response.lock().await.clone();
+
     // A configured `error` envelope is returned verbatim so tests can drive
     // the REST-error path; any other value is wrapped as a `result` envelope.
     let body = if response_value.get("error").is_some() {
@@ -248,6 +277,7 @@ async fn handle_get_tradingview_chart_data(
     } else {
         json!({"id": 1, "result": response_value})
     };
+
     (StatusCode::OK, Json(body)).into_response()
 }
 
@@ -267,6 +297,7 @@ fn synth_candles_page(end_ts: i64, period: i64, per_call: usize) -> Value {
             "timestamp_bucket": bucket,
         }));
     }
+
     Value::Array(bars)
 }
 
@@ -292,6 +323,7 @@ async fn handle_get_tickers(State(state): State<RestState>, body: axum::body::By
     state.ticker_calls.lock().await.push(parsed);
 
     let response_value = state.ticker_response.lock().await.clone();
+
     // A configured `error` envelope is returned verbatim so tests can drive
     // the REST-error path; any other value is wrapped as a `result` envelope.
     let body = if response_value.get("error").is_some() {
@@ -305,6 +337,7 @@ async fn handle_get_tickers(State(state): State<RestState>, body: axum::body::By
             .unwrap_or("ETH-PERP");
         json!({"id": 1, "result": {"tickers": {instrument_name: response_value}}})
     };
+
     (StatusCode::OK, Json(body)).into_response()
 }
 
@@ -321,6 +354,7 @@ async fn handle_get_instrument(
     } else {
         json!({"id": 1, "result": response_value})
     };
+
     (StatusCode::OK, Json(body)).into_response()
 }
 
@@ -346,7 +380,7 @@ async fn start_rest_server(state: RestState) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let router = Router::new()
-        .route("/public/get_instruments", post(handle_get_instruments))
+        .route("/public/get_all_instruments", post(handle_get_instruments))
         .route("/public/get_instrument", post(handle_get_instrument))
         .route("/public/get_trade_history", post(handle_get_trade_history))
         .route(
@@ -364,6 +398,7 @@ async fn start_rest_server(state: RestState) -> SocketAddr {
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
+
     wait_for_http_health(addr).await;
 
     addr
@@ -385,6 +420,7 @@ async fn handle_ws(socket: WebSocket, state: WsState) {
                 let Ok(payload) = serde_json::from_str::<Value>(&text) else {
                     continue;
                 };
+
                 let id = payload.get("id").and_then(Value::as_u64).unwrap_or(0);
                 let method = payload.get("method").and_then(Value::as_str).unwrap_or("");
 
@@ -397,17 +433,27 @@ async fn handle_ws(socket: WebSocket, state: WsState) {
                             .and_then(Value::as_array)
                             .cloned()
                             .unwrap_or_default();
+
                         let reject = state
                             .subscribe_failures
                             .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                                 remaining.checked_sub(1)
                             })
                             .is_ok();
+
                         let reply = if reject {
                             json!({"id": id, "error": {"code": -32603, "message": "subscribe denied"}})
                         } else {
-                            json!({"id": id, "result": {"channels": channels}})
+                            {
+                                let status: serde_json::Map<String, Value> = channels
+                                    .iter()
+                                    .filter_map(Value::as_str)
+                                    .map(|channel| (channel.to_string(), json!("ok")))
+                                    .collect();
+                                json!({"id": id, "result": {"current_subscriptions": channels, "status": status}})
+                            }
                         };
+
                         let mut notifications = Vec::new();
 
                         if !reject {
@@ -420,11 +466,14 @@ async fn handle_ws(socket: WebSocket, state: WsState) {
                                     })
                                     .or_else(|| subscription_notification(channel));
 
-                                if let Some(notification) = notification {
+                                if let Some(notification) =
+                                    book_notification(channel, notification, &state).await
+                                {
                                     notifications.push(notification);
                                 }
                             }
                         }
+
                         let deferred = state
                             .deferred_subscribe_responses
                             .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
@@ -455,6 +504,7 @@ async fn handle_ws(socket: WebSocket, state: WsState) {
                             if !send_ws_message(&sender, reply).await {
                                 break;
                             }
+
                             state
                                 .subscribe_response_count
                                 .fetch_add(1, Ordering::SeqCst);
@@ -473,16 +523,28 @@ async fn handle_ws(socket: WebSocket, state: WsState) {
                                 .unsubscribe_before_subscribe_response
                                 .store(true, Ordering::SeqCst);
                         }
+
                         let reject = state
                             .unsubscribe_failures
                             .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                                 remaining.checked_sub(1)
                             })
                             .is_ok();
+
                         let reply = if reject {
                             json!({"id": id, "error": {"code": -32603, "message": "unsubscribe denied"}})
                         } else {
-                            json!({"id": id, "result": {"success": true}})
+                            let status: serde_json::Map<String, Value> =
+                                payload["params"]["channels"]
+                                    .as_array()
+                                    .unwrap()
+                                    .iter()
+                                    .map(|channel| {
+                                        (channel.as_str().unwrap().to_string(), json!("ok"))
+                                    })
+                                    .collect();
+
+                            json!({"id": id, "result": {"status": status, "remaining_subscriptions": []}})
                         };
 
                         if !send_ws_message(&sender, reply).await {
@@ -504,12 +566,23 @@ async fn send_ws_message(
     sender: &Arc<tokio::sync::Mutex<futures_util::stream::SplitSink<WebSocket, Message>>>,
     value: Value,
 ) -> bool {
-    sender
-        .lock()
-        .await
-        .send(Message::Text(value.to_string().into()))
-        .await
-        .is_ok()
+    let messages = match value {
+        Value::Array(messages) => messages,
+        message => vec![message],
+    };
+
+    let mut sender = sender.lock().await;
+    for message in messages {
+        if sender
+            .send(Message::Text(message.to_string().into()))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+
+    true
 }
 
 async fn start_ws_server(state: WsState) -> SocketAddr {
@@ -523,6 +596,7 @@ async fn start_ws_server(state: WsState) -> SocketAddr {
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
+
     wait_for_http_health(addr).await;
 
     addr
@@ -574,14 +648,48 @@ fn subscription_notification(channel: &str) -> Option<Value> {
     }))
 }
 
+async fn book_notification(
+    channel: &str,
+    notification: Option<Value>,
+    state: &WsState,
+) -> Option<Value> {
+    let mut notification = notification?;
+    if !channel.starts_with("orderbook.") {
+        return Some(notification);
+    }
+
+    if state
+        .book_snapshots_missing
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+            remaining.checked_sub(1)
+        })
+        .is_ok()
+    {
+        return None;
+    }
+
+    let step = state.book_timestamp_step.load(Ordering::SeqCst);
+    if step > 0 {
+        let timestamp = notification["params"]["data"]["timestamp"]
+            .as_i64()
+            .unwrap();
+        let count = state.subscribe_frames.lock().await.len();
+        notification["params"]["data"]["timestamp"] = json!(timestamp + (count * step) as i64);
+    }
+
+    Some(notification)
+}
+
 fn config(rest_addr: SocketAddr, ws_addr: SocketAddr) -> DeriveDataClientConfig {
     DeriveDataClientConfig {
-        base_url_rest: Some(rest_url(rest_addr)),
-        base_url_ws: Some(ws_url(ws_addr)),
+        base_url_rest: Some(rest_url(rest_addr).into()),
+        base_url_ws: Some(ws_url(ws_addr).into()),
         proxy_url: None,
         environment: DeriveEnvironment::Mainnet,
         http_timeout_secs: 5,
         ws_timeout_secs: Some(5),
+        book_snapshot_timeout_secs: 10,
+        book_stale_threshold_secs: 120,
         update_instruments_interval_mins: 60,
         currencies: Vec::new(),
         include_expired: false,
@@ -591,11 +699,12 @@ fn config(rest_addr: SocketAddr, ws_addr: SocketAddr) -> DeriveDataClientConfig 
 }
 
 fn params(values: &[(&str, Value)]) -> Params {
-    let mut params = Params::new();
-    for (key, value) in values {
-        params.insert((*key).to_string(), value.clone());
-    }
-    params
+    Params::new(
+        values
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), value.clone()))
+            .collect(),
+    )
 }
 
 fn subscribe_quotes(instrument_id: InstrumentId, params: Option<Params>) -> SubscribeQuotes {
@@ -858,13 +967,13 @@ async fn test_data_client_subscribes_dispatches_and_unsubscribes_exact_channels(
     assert_eq!(requests.len(), 3);
     let bodies: HashSet<String> = requests.iter().map(|r| r.body.to_string()).collect();
     assert!(bodies.contains(
-        &json!({"currency": "ETH", "instrument_type": "perp", "expired": false}).to_string()
+        &json!({"currency": "ETH", "instrument_type": "perp", "expired": false, "page": 1, "page_size": 1000}).to_string()
     ));
     assert!(bodies.contains(
-        &json!({"currency": "ETH", "instrument_type": "option", "expired": false}).to_string()
+        &json!({"currency": "ETH", "instrument_type": "option", "expired": false, "page": 1, "page_size": 1000}).to_string()
     ));
     assert!(bodies.contains(
-        &json!({"currency": "ETH", "instrument_type": "erc20", "expired": false}).to_string()
+        &json!({"currency": "ETH", "instrument_type": "erc20", "expired": false, "page": 1, "page_size": 1000}).to_string()
     ));
 
     client.disconnect().await.unwrap();
@@ -942,7 +1051,6 @@ async fn test_shared_orderbook_channel_unsubscribes_after_last_owner() {
         .unsubscribe_book_depth(&unsubscribe_book_depth(instrument_id))
         .unwrap();
     wait_for_unsubscribe(&ws_state, channel).await;
-
     let subscribe_count = ws_state
         .subscribes()
         .await
@@ -952,6 +1060,290 @@ async fn test_shared_orderbook_channel_unsubscribes_after_last_owner() {
     assert_eq!(subscribe_count, 1);
     assert_eq!(ws_state.unsubscribes().await.len(), 1);
 
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_last_book_owner_can_resubscribe_before_unsubscribe_runs() {
+    let ws_state = WsState::default();
+    ws_state.book_timestamp_step.store(1, Ordering::SeqCst);
+    let rest_addr = start_rest_server(RestState::default()).await;
+    let ws_addr = start_ws_server(ws_state.clone()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+    let mut client = connect_with_eth_currency(rest_addr, ws_addr).await;
+
+    while rx.try_recv().is_ok() {}
+    let instrument_id = InstrumentId::from("ETH-PERP.DERIVE");
+    let channel = "orderbook.ETH-PERP.1.10";
+    client
+        .subscribe_book_deltas(subscribe_book_deltas(instrument_id, Some(10), None))
+        .unwrap();
+    let first = recv_data(&mut rx).await;
+
+    client
+        .unsubscribe_book_deltas(&unsubscribe_book_deltas(instrument_id, None))
+        .unwrap();
+    client
+        .subscribe_book_deltas(subscribe_book_deltas(instrument_id, Some(10), None))
+        .unwrap();
+    wait_for_subscribe_count(&ws_state, channel, 2).await;
+    let second = recv_data(&mut rx).await;
+    let subscribe_count = ws_state
+        .subscribes()
+        .await
+        .iter()
+        .filter(|frame| frame["params"]["channels"][0] == channel)
+        .count();
+    let connections = ws_state.connection_count.load(Ordering::SeqCst);
+    client.disconnect().await.unwrap();
+
+    let Data::BookDeltas(first) = first else {
+        panic!("expected initial book deltas");
+    };
+
+    let Data::BookDeltas(second) = second else {
+        panic!("expected resubscribed book deltas");
+    };
+
+    assert_eq!(first.instrument_id, instrument_id);
+    assert_eq!(second.instrument_id, instrument_id);
+    assert_eq!(second.sequence, first.sequence + 1);
+    assert_eq!(subscribe_count, 2);
+    assert_eq!(ws_state.unsubscribes().await.len(), 0);
+    assert_eq!(connections, 1);
+}
+
+#[rstest]
+#[case::missing(true)]
+#[case::stale(false)]
+#[tokio::test]
+async fn test_book_recovery_keeps_shared_channel_and_active_socket(#[case] missing: bool) {
+    let rest_state = RestState::default();
+    let ws_state = WsState::default();
+    ws_state
+        .book_snapshots_missing
+        .store(usize::from(missing), Ordering::SeqCst);
+    ws_state.book_timestamp_step.store(1, Ordering::SeqCst);
+    let rest_addr = start_rest_server(rest_state).await;
+    let ws_addr = start_ws_server(ws_state.clone()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+    let mut config = config(rest_addr, ws_addr);
+    config.book_snapshot_timeout_secs = 1;
+    config.book_stale_threshold_secs = 1;
+    config.currencies = vec!["ETH".to_owned()];
+    let mut client = DeriveDataClient::new(*DERIVE_CLIENT_ID, config).unwrap();
+    client.connect().await.unwrap();
+
+    while rx.try_recv().is_ok() {}
+    let id = InstrumentId::from("ETH-PERP.DERIVE");
+    let channel = "orderbook.ETH-PERP.1.10";
+    client
+        .subscribe_book_deltas(subscribe_book_deltas(id, Some(10), None))
+        .unwrap();
+    client
+        .subscribe_book_depth(subscribe_book_depth(id, None))
+        .unwrap();
+    let mut checker = BookStreamChecker::new(BookType::L2_MBP, true);
+    checker.open(id);
+    let first = recv_data(&mut rx).await;
+
+    let Data::BookDeltas(first) = first else {
+        panic!("expected snapshot deltas");
+    };
+
+    checker.apply(&first).unwrap();
+
+    let Data::BookDepth(first_depth) = recv_data(&mut rx).await else {
+        panic!("expected shared depth snapshot");
+    };
+
+    assert_eq!(first.sequence, first_depth.sequence);
+
+    if !missing {
+        let Data::BookDeltas(recovered) = recv_data(&mut rx).await else {
+            panic!("expected recovered deltas");
+        };
+
+        checker.apply(&recovered).unwrap();
+
+        let Data::BookDepth(depth) = recv_data(&mut rx).await else {
+            panic!("expected recovered shared depth");
+        };
+
+        assert_eq!(recovered.sequence, first.sequence + 1);
+        assert_eq!(depth.sequence, recovered.sequence);
+        assert_eq!(recovered.deltas[1].order, first.deltas[1].order);
+        assert_eq!(recovered.deltas[2].order, first.deltas[2].order);
+    }
+
+    assert_eq!(ws_state.connection_count.load(Ordering::SeqCst), 1);
+    assert_eq!(ws_state.subscribes().await.len(), 2);
+    assert_eq!(ws_state.unsubscribes().await.len(), 1);
+    client
+        .unsubscribe_book_deltas(&unsubscribe_book_deltas(id, None))
+        .unwrap();
+    assert_eq!(ws_state.unsubscribes().await.len(), 1);
+    client
+        .unsubscribe_book_depth(&unsubscribe_book_depth(id))
+        .unwrap();
+    wait_until_async(
+        || async { ws_state.unsubscribes().await.len() == 2 },
+        Duration::from_secs(3),
+    )
+    .await;
+    let subscribed = ws_state.subscribes().await.len();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(ws_state.subscribes().await.len(), subscribed);
+    assert!(rx.try_recv().is_err());
+    assert_eq!(
+        ws_state.unsubscribes().await.last().unwrap()["params"]["channels"],
+        json!([channel])
+    );
+    client.disconnect().await.unwrap();
+    assert_eq!(ws_state.connection_count.load(Ordering::SeqCst), 0);
+}
+
+#[rstest]
+#[case::null_price(0, Value::Null)]
+#[case::empty_price(0, json!(""))]
+#[case::null_amount(1, Value::Null)]
+#[case::empty_amount(1, json!(""))]
+#[tokio::test]
+async fn test_missing_numeric_book_values_retry_until_valid_snapshot(
+    #[case] field: usize,
+    #[case] value: Value,
+    #[values(false, true)] empty: bool,
+) {
+    let ws_state = WsState::default();
+    let channel = "orderbook.ETH-PERP.1.10";
+    let mut valid = subscription_notification(channel).unwrap();
+    let timestamp = valid["params"]["data"]["timestamp"].as_i64().unwrap();
+    let mut malformed = valid.clone();
+    malformed["params"]["data"]["timestamp"] = json!(timestamp + 2);
+    malformed["params"]["data"]["bids"][0][field] = value;
+
+    if empty {
+        valid["params"]["data"]["bids"] = json!([]);
+        valid["params"]["data"]["asks"] = json!([]);
+    }
+
+    let payload: WsSubscriptionPayload =
+        serde_json::from_str(&valid["params"].to_string()).unwrap();
+    let expected_msg = parse_orderbook_msg(&payload).unwrap();
+    ws_state.subscription_notifications.lock().await.insert(
+        channel.to_string(),
+        vec![malformed.clone(), malformed, valid],
+    );
+    let rest_addr = start_rest_server(RestState::default()).await;
+    let ws_addr = start_ws_server(ws_state.clone()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+    let mut config = config(rest_addr, ws_addr);
+    config.currencies = vec!["ETH".to_owned()];
+    config.book_snapshot_timeout_secs = 0;
+    config.book_stale_threshold_secs = 0;
+    let mut client = DeriveDataClient::new(*DERIVE_CLIENT_ID, config).unwrap();
+    client.connect().await.unwrap();
+
+    while rx.try_recv().is_ok() {}
+    let id = InstrumentId::from("ETH-PERP.DERIVE");
+    client
+        .subscribe_book_deltas(subscribe_book_deltas(id, Some(10), None))
+        .unwrap();
+    client
+        .subscribe_book_depth(subscribe_book_depth(id, None))
+        .unwrap();
+
+    let Data::BookDeltas(deltas) = recv_data(&mut rx).await else {
+        panic!("expected recovered snapshot deltas");
+    };
+
+    let Data::BookDepth(depth) = recv_data(&mut rx).await else {
+        panic!("expected recovered shared depth snapshot");
+    };
+
+    let expected_deltas = parse_orderbook_deltas(&expected_msg, 2, 3, deltas.ts_init).unwrap();
+    let expected_depth = parse_orderbook_depth(&expected_msg, 2, 3, depth.ts_init).unwrap();
+    assert_eq!(*deltas, expected_deltas);
+    assert_eq!(*depth, expected_depth);
+    assert_eq!(ws_state.subscribes().await.len(), 3);
+    assert_eq!(ws_state.unsubscribes().await.len(), 2);
+    assert_eq!(ws_state.connection_count.load(Ordering::SeqCst), 1);
+    assert!(rx.try_recv().is_err());
+    client
+        .unsubscribe_book_deltas(&unsubscribe_book_deltas(id, None))
+        .unwrap();
+    client
+        .unsubscribe_book_depth(&unsubscribe_book_depth(id))
+        .unwrap();
+    wait_until_async(
+        || async { ws_state.unsubscribes().await.len() == 3 },
+        Duration::from_secs(3),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), client.disconnect())
+        .await
+        .expect("book recovery shutdown exceeds five seconds")
+        .unwrap();
+    assert_eq!(ws_state.connection_count.load(Ordering::SeqCst), 0);
+    assert!(rx.try_recv().is_err());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_unsubscribe_cancels_inflight_book_recovery() {
+    let ws_state = WsState::default();
+    ws_state.book_snapshots_missing.store(1, Ordering::SeqCst);
+    let rest_addr = start_rest_server(RestState::default()).await;
+    let ws_addr = start_ws_server(ws_state.clone()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+    let mut config = config(rest_addr, ws_addr);
+    config.currencies = vec!["ETH".to_owned()];
+    config.book_snapshot_timeout_secs = 1;
+    config.book_stale_threshold_secs = 0;
+    let mut client = DeriveDataClient::new(*DERIVE_CLIENT_ID, config).unwrap();
+    client.connect().await.unwrap();
+
+    while rx.try_recv().is_ok() {}
+    let id = InstrumentId::from("ETH-PERP.DERIVE");
+    let channel = "orderbook.ETH-PERP.1.10";
+    client
+        .subscribe_book_deltas(subscribe_book_deltas(id, Some(10), None))
+        .unwrap();
+    wait_until_async(
+        || async { ws_state.subscribe_response_count.load(Ordering::SeqCst) == 1 },
+        Duration::from_secs(3),
+    )
+    .await;
+    ws_state
+        .deferred_subscribe_responses
+        .store(1, Ordering::SeqCst);
+    wait_for_subscribe_count(&ws_state, channel, 2).await;
+
+    client
+        .unsubscribe_book_deltas(&unsubscribe_book_deltas(id, None))
+        .unwrap();
+    wait_until_async(
+        || async { ws_state.unsubscribes().await.len() == 2 },
+        Duration::from_secs(3),
+    )
+    .await;
+    ws_state.subscribe_response_gate.add_permits(1);
+    wait_until_async(
+        || async { ws_state.subscribe_response_count.load(Ordering::SeqCst) == 2 },
+        Duration::from_secs(3),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    assert_eq!(ws_state.subscribes().await.len(), 2);
+    assert_eq!(ws_state.unsubscribes().await.len(), 2);
+    assert_eq!(ws_state.connection_count.load(Ordering::SeqCst), 1);
+    assert!(rx.try_recv().is_err());
     client.disconnect().await.unwrap();
 }
 
@@ -1011,6 +1403,7 @@ async fn test_shared_trade_channel_survives_creator_subscribe_failure() {
         Duration::from_secs(5),
     )
     .await;
+
     assert_eq!(ws_state.unsubscribes().await.len(), 2);
 
     client.disconnect().await.unwrap();
@@ -1240,7 +1633,7 @@ fn request_option_chain_reference_price(
     instrument_id: InstrumentId,
 ) -> RequestOptionChainReferencePrice {
     RequestOptionChainReferencePrice::new(
-        OptionSeriesId::new(
+        OptionSeriesId::new_derived(
             *DERIVE_VENUE,
             Ustr::from("ETH"),
             Ustr::from("USDC"),
@@ -1268,6 +1661,7 @@ async fn recv_response_within(
             .await
             .expect("timeout waiting for response event")
             .expect("data event channel closed");
+
         if let DataEvent::Response(response) = event {
             return response;
         }
@@ -1293,7 +1687,7 @@ fn page_trade_at(trade_id: &str, timestamp: i64) -> Value {
         "trade_id": trade_id,
         "trade_price": "3500",
         "tx_hash": "0xhash",
-        "tx_status": "settled",
+        "batch_status": "Settled",
         "wallet": "0xwallet"
     })
 }
@@ -1377,6 +1771,149 @@ async fn test_ws_trades_emit_direction_as_aggressor_side() {
     wait_for_unsubscribe(&ws_state, channel).await;
     client.disconnect().await.unwrap();
 }
+
+#[rstest]
+#[case::buy("buy")]
+#[case::sell("sell")]
+#[tokio::test]
+async fn test_ws_trades_preserve_unknown_aggressor(#[case] direction: &str) {
+    let ws_state = WsState::default();
+    let channel = "trades.perp.ETH";
+    let mut notification = subscription_notification(channel).unwrap();
+    let mut row = load_json("perps/http_public_trade_eth_unknown_role.json");
+    row["direction"] = json!(direction);
+    notification["params"]["data"] = json!([row]);
+    ws_state
+        .subscription_notifications
+        .lock()
+        .await
+        .insert(channel.to_string(), vec![notification]);
+    let rest_addr = start_rest_server(RestState::default()).await;
+    let ws_addr = start_ws_server(ws_state.clone()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+    let mut client = connect_with_eth_currency(rest_addr, ws_addr).await;
+    let instrument_id = InstrumentId::from("ETH-PERP.DERIVE");
+
+    while rx.try_recv().is_ok() {}
+
+    let before = get_atomic_clock_realtime().get_time_ns();
+
+    client
+        .subscribe_trades(subscribe_trades(instrument_id))
+        .unwrap();
+
+    let Data::Trade(tick) = recv_data(&mut rx).await else {
+        panic!("expected trade data");
+    };
+
+    let after = get_atomic_clock_realtime().get_time_ns();
+    client.disconnect().await.unwrap();
+
+    assert_eq!(tick.instrument_id, instrument_id);
+    assert_eq!(tick.price, Price::from("3499.00"));
+    assert_eq!(tick.size, Quantity::from("0.500"));
+    assert_eq!(tick.aggressor_side, AggressorSide::NoAggressor);
+    assert_eq!(tick.trade_id, TradeId::from("trade-1"));
+    assert_eq!(tick.ts_event, UnixNanos::from(1_700_000_000_000_000_000));
+    assert!((before..=after).contains(&tick.ts_init));
+}
+
+#[rstest]
+#[case::buy("buy")]
+#[case::sell("sell")]
+#[tokio::test]
+async fn test_request_trades_preserves_unknown_aggressor(#[case] direction: &str) {
+    let rest_state = RestState::default();
+    let mut row = load_json("perps/http_public_trade_eth_unknown_role.json");
+    row["direction"] = json!(direction);
+    *rest_state.trade_history_pages.lock().await = vec![json!({
+        "trades": [row],
+        "pagination": {"count": 1, "num_pages": 1},
+    })];
+    let rest_addr = start_rest_server(rest_state).await;
+    let ws_addr = start_ws_server(WsState::default()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+    let mut client = connect_with_eth_currency(rest_addr, ws_addr).await;
+    let instrument_id = InstrumentId::from("ETH-PERP.DERIVE");
+    let before = get_atomic_clock_realtime().get_time_ns();
+
+    client
+        .request_trades(request_trades(instrument_id, None))
+        .unwrap();
+
+    let DataResponse::Trades(trades) = recv_response(&mut rx).await else {
+        panic!("expected trades response");
+    };
+
+    let after = get_atomic_clock_realtime().get_time_ns();
+    client.disconnect().await.unwrap();
+
+    assert_eq!(trades.data.len(), 1);
+    let tick = &trades.data[0];
+    assert_eq!(tick.instrument_id, instrument_id);
+    assert_eq!(tick.price, Price::from("3499.00"));
+    assert_eq!(tick.size, Quantity::from("0.500"));
+    assert_eq!(tick.aggressor_side, AggressorSide::NoAggressor);
+    assert_eq!(tick.trade_id, TradeId::from("trade-1"));
+    assert_eq!(tick.ts_event, UnixNanos::from(1_700_000_000_000_000_000));
+    assert!((before..=after).contains(&tick.ts_init));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_trades_continues_after_invalid_id_across_pages() {
+    let rest_state = RestState::default();
+    let ws_state = WsState::default();
+    *rest_state.trade_history_pages.lock().await = vec![
+        json!({
+            "trades": [
+                page_trade("1234567890123456789012345678901234567"),
+                page_trade_at("valid-first", 1_700_000_000_001),
+            ],
+            "pagination": {"count": 3, "num_pages": 2},
+        }),
+        json!({
+            "trades": [page_trade_at("valid-next", 1_700_000_000_002)],
+            "pagination": {"count": 3, "num_pages": 2},
+        }),
+    ];
+    let rest_addr = start_rest_server(rest_state.clone()).await;
+    let ws_addr = start_ws_server(ws_state).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+    let mut client = connect_with_eth_currency(rest_addr, ws_addr).await;
+
+    client
+        .request_trades(request_trades(InstrumentId::from("ETH-PERP.DERIVE"), None))
+        .unwrap();
+
+    let DataResponse::Trades(response) = recv_response(&mut rx).await else {
+        panic!("expected trades response");
+    };
+
+    assert_eq!(response.data.len(), 2);
+
+    for (trade, id, timestamp) in [
+        (&response.data[0], "valid-first", 1_700_000_000_001_000_000),
+        (&response.data[1], "valid-next", 1_700_000_000_002_000_000),
+    ] {
+        assert_eq!(trade.instrument_id, InstrumentId::from("ETH-PERP.DERIVE"));
+        assert_eq!(trade.trade_id.to_string(), id);
+        assert_eq!(trade.price, Price::from("3500.00"));
+        assert_eq!(trade.size, Quantity::from("0.250"));
+        assert_eq!(trade.aggressor_side, AggressorSide::Buy);
+        assert_eq!(trade.ts_event, UnixNanos::from(timestamp));
+    }
+
+    let calls = rest_state.trade_history_calls().await;
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0]["page"], json!(1));
+    assert_eq!(calls[1]["page"], json!(2));
+    client.disconnect().await.unwrap();
+}
+
 #[rstest]
 #[tokio::test]
 async fn test_request_trades_paginates_with_constant_page_size() {
@@ -1402,9 +1939,11 @@ async fn test_request_trades_paginates_with_constant_page_size() {
         .unwrap();
 
     let response = recv_response(&mut rx).await;
+
     let DataResponse::Trades(trades) = response else {
         panic!("expected trades response");
     };
+
     assert_eq!(trades.data.len(), 25);
 
     let calls = rest_state.trade_history_calls().await;
@@ -1428,8 +1967,13 @@ async fn test_request_trades_paginates_with_constant_page_size() {
 }
 
 #[rstest]
+#[case::short_history(2, 5)]
+#[case::long_history(2_000, 6_000)]
 #[tokio::test]
-async fn test_request_trades_returns_newest_unique_records_in_chronological_order() {
+async fn test_request_trades_returns_newest_unique_records_in_chronological_order(
+    #[case] num_pages: u32,
+    #[case] count: i64,
+) {
     let rest_state = RestState::default();
     let ws_state = WsState::default();
     *rest_state.trade_history_pages.lock().await = vec![
@@ -1439,7 +1983,7 @@ async fn test_request_trades_returns_newest_unique_records_in_chronological_orde
                 page_trade_at("duplicate", 1_700_000_000_200),
                 page_trade_at("duplicate", 1_700_000_000_200),
             ],
-            "pagination": {"count": 5, "num_pages": 2},
+            "pagination": {"count": count, "num_pages": num_pages},
         }),
         json!({
             "trades": [
@@ -1447,7 +1991,7 @@ async fn test_request_trades_returns_newest_unique_records_in_chronological_orde
                 page_trade_at("older", 1_700_000_000_100),
                 page_trade_at("oldest", 1_700_000_000_000),
             ],
-            "pagination": {"count": 6, "num_pages": 2},
+            "pagination": {"count": count + 1, "num_pages": num_pages},
         }),
     ];
     let rest_addr = start_rest_server(rest_state.clone()).await;
@@ -1465,9 +2009,11 @@ async fn test_request_trades_returns_newest_unique_records_in_chronological_orde
         .unwrap();
 
     let response = recv_response(&mut rx).await;
+
     let DataResponse::Trades(trades) = response else {
         panic!("expected trades response");
     };
+
     let trade_ids: Vec<&str> = trades
         .data
         .iter()
@@ -1509,6 +2055,7 @@ async fn test_request_trades_normalizes_paired_maker_first_rows_to_single_taker_
         .unwrap();
 
     let response = recv_response(&mut rx).await;
+
     let DataResponse::Trades(trades) = response else {
         panic!("expected trades response");
     };
@@ -1542,6 +2089,7 @@ async fn test_request_trades_normalizes_paired_taker_first_rows_to_identical_tic
         .unwrap();
 
     let response = recv_response(&mut rx).await;
+
     let DataResponse::Trades(trades) = response else {
         panic!("expected trades response");
     };
@@ -1573,9 +2121,11 @@ async fn test_request_trades_terminates_on_num_pages() {
         .unwrap();
 
     let response = recv_response(&mut rx).await;
+
     let DataResponse::Trades(trades) = response else {
         panic!("expected trades response");
     };
+
     assert_eq!(trades.data.len(), 5);
     assert_eq!(rest_state.trade_history_calls().await.len(), 1);
 }
@@ -1603,9 +2153,11 @@ async fn test_request_trades_terminates_on_empty_page() {
         .unwrap();
 
     let response = recv_response(&mut rx).await;
+
     let DataResponse::Trades(trades) = response else {
         panic!("expected trades response");
     };
+
     assert_eq!(trades.data.len(), 4);
     assert_eq!(rest_state.trade_history_calls().await.len(), 2);
 }
@@ -1626,6 +2178,228 @@ async fn test_request_trades_returns_err_for_missing_instrument() {
         .request_trades(request_trades(InstrumentId::from("ETH-PERP.DERIVE"), None))
         .expect_err("must reject missing instrument");
     assert!(err.to_string().contains("not found in cache"), "{err}",);
+}
+
+#[rstest]
+#[case::mark("M")]
+#[case::index("I")]
+#[tokio::test]
+async fn test_required_ticker_decimals_reject_and_recover(
+    #[case] field: &str,
+    #[values(Value::Null, json!(""))] invalid: Value,
+    #[values(false, true)] full: bool,
+) {
+    let ws_state = WsState::default();
+    let channel = "ticker_slim.ETH-PERP.1000";
+    let mut valid = subscription_notification(channel).unwrap();
+    if full {
+        valid["params"]["data"]["instrument_ticker"] = load_json("perps/ws_ticker_eth.json");
+    }
+
+    valid["params"]["data"]["timestamp"] = json!(1_700_000_000_123_i64);
+    let ticker = &mut valid["params"]["data"]["instrument_ticker"];
+    ticker[if full { "mark_price" } else { "M" }] = json!("3500.12");
+    ticker[if full { "index_price" } else { "I" }] = json!("3499.34");
+    let mut malformed = valid.clone();
+
+    let key = match (full, field) {
+        (true, "M") => "mark_price",
+        (true, _) => "index_price",
+        (false, field) => field,
+    };
+
+    malformed["params"]["data"]["instrument_ticker"][key] = invalid;
+    ws_state
+        .subscription_notifications
+        .lock()
+        .await
+        .insert(channel.to_string(), vec![json!([malformed, valid])]);
+    let rest_addr = start_rest_server(RestState::default()).await;
+    let ws_addr = start_ws_server(ws_state.clone()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+    let mut client = connect_with_eth_currency(rest_addr, ws_addr).await;
+
+    while rx.try_recv().is_ok() {}
+    let id = InstrumentId::from("ETH-PERP.DERIVE");
+    let before = get_atomic_clock_realtime().get_time_ns();
+    client
+        .subscribe_mark_prices(SubscribeMarkPrices::new(
+            id,
+            Some(*DERIVE_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+    client
+        .subscribe_index_prices(SubscribeIndexPrices::new(
+            id,
+            Some(*DERIVE_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+    let first = recv_data(&mut rx).await;
+    let second = recv_data(&mut rx).await;
+    let after = get_atomic_clock_realtime().get_time_ns();
+    client.disconnect().await.unwrap();
+
+    let (mark, index) = match (first, second) {
+        (Data::MarkPrice(mark), Data::IndexPrice(index)) => (mark, index),
+        (Data::IndexPrice(index), Data::MarkPrice(mark)) => (mark, index),
+        other => panic!("expected mark and index updates, was {other:?}"),
+    };
+
+    assert_eq!(mark.instrument_id, id);
+    assert_eq!(index.instrument_id, id);
+    assert_eq!(mark.value, Price::from("3500.12"));
+    assert_eq!(index.value, Price::from("3499.34"));
+    assert_eq!(mark.value.precision, 2);
+    assert_eq!(index.value.precision, 2);
+    assert_eq!(mark.ts_event, UnixNanos::from(1_700_000_000_123_000_000));
+    assert_eq!(index.ts_event, mark.ts_event);
+    assert_eq!(index.ts_init, mark.ts_init);
+    assert!((before..=after).contains(&mark.ts_init));
+    assert!(rx.try_recv().is_err());
+}
+
+#[rstest]
+#[case("open_price")]
+#[case("high_price")]
+#[case("low_price")]
+#[case("close_price")]
+#[case("volume_usd")]
+#[case("volume_contracts")]
+#[tokio::test]
+async fn test_required_candle_decimals_reject_and_recover(
+    #[case] field: &str,
+    #[values(Value::Null, json!(""))] invalid: Value,
+) {
+    let rest_state = RestState::default();
+    let valid = load_json("perps/http_public_candles_eth.json");
+    let mut malformed = valid.clone();
+    malformed[0][field] = invalid;
+    *rest_state.candles_response.lock().await = malformed;
+    let rest_addr = start_rest_server(rest_state.clone()).await;
+    let ws_addr = start_ws_server(WsState::default()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+    let mut client = connect_with_eth_currency(rest_addr, ws_addr).await;
+
+    while rx.try_recv().is_ok() {}
+    let bar_type = BarType::from("ETH-PERP.DERIVE-15-MINUTE-LAST-EXTERNAL");
+    client.request_bars(request_bars(bar_type, None)).unwrap();
+    wait_until_async(
+        || async { rest_state.candles_calls.lock().await.len() == 1 },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .is_err()
+    );
+    *rest_state.candles_response.lock().await = valid;
+    let request = request_bars(bar_type, None);
+    let request_id = request.request_id;
+    let before = get_atomic_clock_realtime().get_time_ns();
+    client.request_bars(request).unwrap();
+
+    let DataResponse::Bars(response) = recv_response(&mut rx).await else {
+        panic!("expected recovered bars");
+    };
+
+    let after = get_atomic_clock_realtime().get_time_ns();
+    client.disconnect().await.unwrap();
+
+    assert_eq!(response.correlation_id, request_id);
+    assert_eq!(response.client_id, *DERIVE_CLIENT_ID);
+    assert_eq!(response.bar_type, bar_type);
+    assert_eq!(response.data.len(), 3);
+    let bar = &response.data[0];
+    assert_eq!(bar.bar_type, bar_type);
+    assert_eq!(bar.open, Price::from("3500.00"));
+    assert_eq!(bar.high, Price::from("3501.50"));
+    assert_eq!(bar.low, Price::from("3499.00"));
+    assert_eq!(bar.close, Price::from("3501.00"));
+    assert_eq!(bar.volume, Quantity::from("3.527"));
+    assert_eq!(
+        [
+            bar.open.precision,
+            bar.high.precision,
+            bar.low.precision,
+            bar.close.precision
+        ],
+        [2; 4]
+    );
+    assert_eq!(bar.volume.precision, 3);
+    assert_eq!(bar.ts_event, UnixNanos::from(1_700_000_900_000_000_000));
+    assert!((before..=after).contains(&bar.ts_init));
+    assert!(rx.try_recv().is_err());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_required_funding_decimal_rejects_and_recovers(
+    #[values(Value::Null, json!(""))] invalid: Value,
+) {
+    let rest_state = RestState::default();
+    let valid = load_json("perps/http_public_funding_rate_history_eth.json");
+    let mut malformed = valid.clone();
+    malformed["funding_rate_history"][0]["funding_rate"] = invalid;
+    *rest_state.funding_rate_history_response.lock().await = malformed;
+    let rest_addr = start_rest_server(rest_state.clone()).await;
+    let ws_addr = start_ws_server(WsState::default()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+    let mut client = connect_with_eth_currency(rest_addr, ws_addr).await;
+
+    while rx.try_recv().is_ok() {}
+    let id = InstrumentId::from("ETH-PERP.DERIVE");
+    client
+        .request_funding_rates(request_funding_rates(id, None))
+        .unwrap();
+    wait_until_async(
+        || async { rest_state.funding_rate_history_calls.lock().await.len() == 1 },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .is_err()
+    );
+    *rest_state.funding_rate_history_response.lock().await = valid;
+    let request = request_funding_rates(id, None);
+    let request_id = request.request_id;
+    let before = get_atomic_clock_realtime().get_time_ns();
+    client.request_funding_rates(request).unwrap();
+
+    let DataResponse::FundingRates(response) = recv_response(&mut rx).await else {
+        panic!("expected recovered funding rates");
+    };
+
+    let after = get_atomic_clock_realtime().get_time_ns();
+    client.disconnect().await.unwrap();
+
+    assert_eq!(response.correlation_id, request_id);
+    assert_eq!(response.client_id, *DERIVE_CLIENT_ID);
+    assert_eq!(response.instrument_id, id);
+    assert_eq!(response.data.len(), 3);
+    let rate = &response.data[0];
+    assert_eq!(rate.instrument_id, id);
+    assert_eq!(rate.rate, rust_decimal_macros::dec!(0.00012));
+    assert_eq!(rate.interval, None);
+    assert_eq!(rate.next_funding_ns, None);
+    assert_eq!(rate.ts_event, UnixNanos::from(1_700_000_000_000_000_000));
+    assert!((before..=after).contains(&rate.ts_init));
+    assert!(rx.try_recv().is_err());
 }
 
 #[rstest]
@@ -1650,9 +2424,11 @@ async fn test_request_funding_rates_emits_response_with_records() {
         .unwrap();
 
     let response = recv_response(&mut rx).await;
+
     let DataResponse::FundingRates(rates) = response else {
         panic!("expected funding rates response");
     };
+
     assert_eq!(rates.data.len(), 3);
     assert_eq!(rates.data[0].rate.to_string(), "0.00012");
     assert_eq!(
@@ -1706,9 +2482,11 @@ async fn test_request_funding_rates_returns_newest_limit_in_chronological_order(
         .unwrap();
 
     let response = recv_response(&mut rx).await;
+
     let DataResponse::FundingRates(rates) = response else {
         panic!("expected funding rates response");
     };
+
     let timestamps: Vec<UnixNanos> = rates.data.iter().map(|rate| rate.ts_event).collect();
 
     assert_eq!(
@@ -1783,9 +2561,11 @@ async fn test_request_bars_emits_response_with_records() {
     client.request_bars(request_bars(bar_type, None)).unwrap();
 
     let response = recv_response(&mut rx).await;
+
     let DataResponse::Bars(bars) = response else {
         panic!("expected bars response");
     };
+
     assert_eq!(bars.bar_type, bar_type);
     assert_eq!(bars.data.len(), 3);
     assert_eq!(bars.data[0].open, Price::from("3500.00"));
@@ -1838,6 +2618,7 @@ async fn test_request_bars_excludes_forming_bucket() {
     client.request_bars(request_bars(bar_type, None)).unwrap();
 
     let response = recv_response(&mut rx).await;
+
     let DataResponse::Bars(bars) = response else {
         panic!("expected bars response");
     };
@@ -1868,9 +2649,11 @@ async fn test_request_bars_honors_limit() {
         .unwrap();
 
     let response = recv_response(&mut rx).await;
+
     let DataResponse::Bars(bars) = response else {
         panic!("expected bars response");
     };
+
     assert_eq!(bars.data.len(), 2);
 }
 
@@ -2060,6 +2843,7 @@ async fn test_request_bars_walks_multiple_pages_to_start() {
         .unwrap();
 
     let response = recv_response(&mut rx).await;
+
     let DataResponse::Bars(bars) = response else {
         panic!("expected bars response");
     };
@@ -2145,6 +2929,7 @@ async fn test_request_bars_honors_limit_across_pages() {
         .unwrap();
 
     let response = recv_response(&mut rx).await;
+
     let DataResponse::Bars(bars) = response else {
         panic!("expected bars response");
     };
@@ -2216,6 +3001,7 @@ async fn test_request_bars_dedups_overlapping_pages() {
         .unwrap();
 
     let response = recv_response(&mut rx).await;
+
     let DataResponse::Bars(bars) = response else {
         panic!("expected bars response");
     };
@@ -2224,7 +3010,7 @@ async fn test_request_bars_dedups_overlapping_pages() {
 
     let mut seen: HashSet<UnixNanos> = HashSet::new();
 
-    for bar in &bars.data {
+    for bar in bars.data.iter() {
         assert!(
             seen.insert(bar.ts_event),
             "duplicate ts_event {:?}",
@@ -2264,9 +3050,10 @@ async fn test_request_bars_terminates_at_safety_cap() {
         ))
         .unwrap();
 
-    // The 100-page walk is paced by the non-matching REST quota (10/s after the
-    // 50-request burst), so it takes ~5s; allow well beyond that.
-    let response = recv_response_within(&mut rx, Duration::from_secs(15)).await;
+    // V3 public requests share five-second windows; discovery consumes part
+    // of the first window, so the 100-page walk takes about 20s.
+    let response = recv_response_within(&mut rx, Duration::from_secs(30)).await;
+
     let DataResponse::Bars(bars) = response else {
         panic!("expected bars response");
     };
@@ -2298,9 +3085,11 @@ async fn test_option_chain_reference_price_emits_price() {
 
     let response = recv_response(&mut rx).await;
     let after_ns = clock.get_time_ns();
+
     let DataResponse::OptionChainReferencePrice(reference) = response else {
         panic!("expected option-chain reference price response");
     };
+
     assert_eq!(reference.series_id.venue, *DERIVE_VENUE);
     assert_eq!(reference.series_id.underlying, Ustr::from("ETH"));
     assert_eq!(reference.series_id.settlement_currency, Ustr::from("USDC"));
@@ -2364,9 +3153,11 @@ async fn test_option_chain_reference_price_is_none_on_rest_error() {
         .unwrap();
 
     let response = recv_response(&mut rx).await;
+
     let DataResponse::OptionChainReferencePrice(reference) = response else {
         panic!("expected option-chain reference price response");
     };
+
     assert_eq!(reference.series_id.venue, *DERIVE_VENUE);
     assert_eq!(reference.price, None);
 }
@@ -2392,9 +3183,11 @@ async fn test_option_chain_reference_price_is_none_without_option_pricing() {
         .unwrap();
 
     let response = recv_response(&mut rx).await;
+
     let DataResponse::OptionChainReferencePrice(reference) = response else {
         panic!("expected option-chain reference price response");
     };
+
     assert_eq!(reference.price, None);
 }
 
@@ -2425,9 +3218,11 @@ async fn test_option_chain_reference_price_rejects_invalid_value(#[case] value: 
         .unwrap();
 
     let response = recv_response(&mut rx).await;
+
     let DataResponse::OptionChainReferencePrice(reference) = response else {
         panic!("expected option-chain reference price response");
     };
+
     assert_eq!(reference.correlation_id, request_id);
     assert_eq!(reference.series_id, series_id);
     assert_eq!(reference.price, None);
@@ -2590,14 +3385,11 @@ async fn test_data_client_disconnect_stops_event_flow() {
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_data_client_reset_after_subscribe_clears_state() {
-    // reset() on a live client with the WS stream up and a tracked
-    // subscribe task must succeed without panic, and the client must
-    // accept a fresh connect() that resumes data flow. Exercises the
-    // `abort_pending_tasks()` and `ws_stream_handle.take().abort()`
-    // branches added in reset(), plus the connect()-time WS teardown
-    // that rebuilds out_rx after a reset.
     let rest_state = RestState::default();
     let ws_state = WsState::default();
+    ws_state
+        .deferred_subscribe_responses
+        .store(1, Ordering::SeqCst);
     let rest_addr = start_rest_server(rest_state).await;
     let ws_addr = start_ws_server(ws_state.clone()).await;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
@@ -2608,6 +3400,9 @@ async fn test_data_client_reset_after_subscribe_clears_state() {
     client
         .subscribe_trades(subscribe_trades(option_id))
         .unwrap();
+
+    wait_for_subscribe(&ws_state, "trades.option.ETH").await;
+    assert_eq!(ws_state.subscribe_response_count.load(Ordering::SeqCst), 0);
 
     client.reset().unwrap();
     assert!(!client.is_connected());
@@ -2625,7 +3420,73 @@ async fn test_data_client_reset_after_subscribe_clears_state() {
     wait_for_subscribe(&ws_state, "trades.option.ETH").await;
 
     match recv_data(&mut rx).await {
-        Data::Trade(trade) => assert_eq!(trade.instrument_id, option_id),
+        Data::Trade(trade) => {
+            assert_eq!(trade.instrument_id, option_id);
+            assert_eq!(trade.trade_id, TradeId::from("option-trade-1"));
+        }
+        other => panic!("expected trade data, was {other:?}"),
+    }
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[case(true)]
+#[case(false)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_data_client_reset_or_disconnect_clears_trade_state(#[case] reset: bool) {
+    let rest_state = RestState::default();
+    let ws_state = WsState::default();
+    let rest_addr = start_rest_server(rest_state).await;
+    let ws_addr = start_ws_server(ws_state.clone()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+
+    let mut client = connect_with_eth_currency(rest_addr, ws_addr).await;
+    let option_id = InstrumentId::from("ETH-20260627-3500-C.DERIVE");
+
+    while rx.try_recv().is_ok() {}
+
+    client
+        .subscribe_trades(subscribe_trades(option_id))
+        .unwrap();
+
+    let first = match recv_data(&mut rx).await {
+        Data::Trade(trade) => trade,
+        other => panic!("expected first trade data, was {other:?}"),
+    };
+
+    assert_eq!(first.trade_id, TradeId::from("option-trade-1"));
+
+    if reset {
+        client.reset().unwrap();
+    } else {
+        client.disconnect().await.unwrap();
+    }
+
+    assert!(!client.is_connected());
+
+    while rx.try_recv().is_ok() {}
+
+    client.connect().await.unwrap();
+    assert!(client.is_connected());
+
+    while rx.try_recv().is_ok() {}
+
+    client
+        .subscribe_trades(subscribe_trades(option_id))
+        .unwrap();
+    wait_for_subscribe(&ws_state, "trades.option.ETH").await;
+
+    match recv_data(&mut rx).await {
+        Data::Trade(trade) => {
+            assert_eq!(trade.instrument_id, option_id);
+            assert_eq!(trade.trade_id, first.trade_id);
+            assert_eq!(trade.price, first.price);
+            assert_eq!(trade.size, first.size);
+            assert_eq!(trade.aggressor_side, first.aggressor_side);
+            assert_eq!(trade.ts_event, first.ts_event);
+        }
         other => panic!("expected trade data, was {other:?}"),
     }
 
@@ -2648,10 +3509,20 @@ async fn test_data_client_stop_then_connect_clears_stale_subscriptions() {
 
     let mut client = connect_with_eth_currency(rest_addr, ws_addr).await;
     let option_id = InstrumentId::from("ETH-20260627-3500-C.DERIVE");
+
+    while rx.try_recv().is_ok() {}
+
     client
         .subscribe_trades(subscribe_trades(option_id))
         .unwrap();
     wait_for_subscribe(&ws_state, "trades.option.ETH").await;
+
+    let first = match recv_data(&mut rx).await {
+        Data::Trade(trade) => trade,
+        other => panic!("expected first trade data, was {other:?}"),
+    };
+
+    assert_eq!(first.trade_id, TradeId::from("option-trade-1"));
 
     client.stop().unwrap();
     assert!(!client.is_connected());
@@ -2672,7 +3543,14 @@ async fn test_data_client_stop_then_connect_clears_stale_subscriptions() {
     wait_for_subscribe(&ws_state, "trades.option.ETH").await;
 
     match recv_data(&mut rx).await {
-        Data::Trade(trade) => assert_eq!(trade.instrument_id, option_id),
+        Data::Trade(trade) => {
+            assert_eq!(trade.instrument_id, option_id);
+            assert_eq!(trade.trade_id, first.trade_id);
+            assert_eq!(trade.price, first.price);
+            assert_eq!(trade.size, first.size);
+            assert_eq!(trade.aggressor_side, first.aggressor_side);
+            assert_eq!(trade.ts_event, first.ts_event);
+        }
         other => panic!("expected trade data, was {other:?}"),
     }
 
@@ -2745,9 +3623,11 @@ async fn test_request_instrument_emits_response_and_caches() {
         .unwrap();
 
     let response = recv_response(&mut rx).await;
+
     let DataResponse::Instrument(boxed) = response else {
         panic!("expected instrument response");
     };
+
     assert_eq!(boxed.instrument_id, instrument_id);
     assert_eq!(boxed.data.id(), instrument_id);
     assert_eq!(boxed.data.price_precision(), 2);
@@ -2825,6 +3705,71 @@ async fn test_request_instrument_returns_err_for_non_derive_venue() {
 }
 
 #[rstest]
+#[case("mark_price")]
+#[case("index_price")]
+#[tokio::test]
+async fn test_required_rest_ticker_decimals_reject_and_recover(
+    #[case] field: &str,
+    #[values(Value::Null, json!(""))] invalid: Value,
+) {
+    let rest_state = RestState::default();
+    let valid = load_json("perps/http_ticker_eth_snapshot.json");
+    let mut malformed = valid.clone();
+    malformed[field] = invalid;
+    *rest_state.ticker_response.lock().await = malformed;
+    let rest_addr = start_rest_server(rest_state.clone()).await;
+    let ws_addr = start_ws_server(WsState::default()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+    let mut client = connect_with_eth_currency(rest_addr, ws_addr).await;
+
+    while rx.try_recv().is_ok() {}
+    let id = InstrumentId::from("ETH-PERP.DERIVE");
+    client.request_quotes(request_quotes(id)).unwrap();
+    wait_until_async(
+        || async { rest_state.ticker_calls.lock().await.len() == 1 },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .is_err()
+    );
+    *rest_state.ticker_response.lock().await = valid;
+    let request = request_quotes(id);
+    let request_id = request.request_id;
+    let before = get_atomic_clock_realtime().get_time_ns();
+    client.request_quotes(request).unwrap();
+
+    let DataResponse::Quotes(response) = recv_response(&mut rx).await else {
+        panic!("expected recovered quote");
+    };
+
+    let after = get_atomic_clock_realtime().get_time_ns();
+    client.disconnect().await.unwrap();
+
+    assert_eq!(response.correlation_id, request_id);
+    assert_eq!(response.client_id, *DERIVE_CLIENT_ID);
+    assert_eq!(response.instrument_ids, vec![id]);
+    assert_eq!(response.data.len(), 1);
+    let quote = &response.data[0];
+    assert_eq!(quote.instrument_id, id);
+    assert_eq!(quote.bid_price, Price::from("3499.50"));
+    assert_eq!(quote.ask_price, Price::from("3501.00"));
+    assert_eq!(quote.bid_size, Quantity::from("0.800"));
+    assert_eq!(quote.ask_size, Quantity::from("1.200"));
+    assert_eq!(
+        [quote.bid_price.precision, quote.ask_price.precision],
+        [2; 2]
+    );
+    assert_eq!([quote.bid_size.precision, quote.ask_size.precision], [3; 2]);
+    assert_eq!(quote.ts_event, UnixNanos::from(1_700_000_000_000_000_000));
+    assert!((before..=after).contains(&quote.ts_init));
+    assert!(rx.try_recv().is_err());
+}
+
+#[rstest]
 #[tokio::test]
 async fn test_request_quotes_emits_response_with_single_tick() {
     let rest_state = RestState::default();
@@ -2843,10 +3788,12 @@ async fn test_request_quotes_emits_response_with_single_tick() {
         .unwrap();
 
     let response = recv_response(&mut rx).await;
+
     let DataResponse::Quotes(quotes) = response else {
         panic!("expected quotes response");
     };
-    assert_eq!(quotes.instrument_id, instrument_id);
+
+    assert_eq!(quotes.instrument_ids, vec![instrument_id]);
     assert_eq!(quotes.data.len(), 1);
     assert_eq!(quotes.data[0].bid_price, Price::from("3499.50"));
     assert_eq!(quotes.data[0].ask_price, Price::from("3501.00"));
@@ -2875,6 +3822,7 @@ async fn test_request_quotes_drops_response_on_rest_error() {
     replace_data_event_sender(tx);
 
     let client = connect_with_eth_currency(rest_addr, ws_addr).await;
+
     // Drain connect-time Instrument events so the quiet-window check below
     // cannot consume one in place of a missing QuotesResponse.
     while rx.try_recv().is_ok() {}
@@ -2946,9 +3894,11 @@ async fn test_request_quotes_window_filter(
         .unwrap();
 
     let response = recv_response(&mut rx).await;
+
     let DataResponse::Quotes(quotes) = response else {
         panic!("expected quotes response");
     };
+
     assert_eq!(quotes.data.len(), expected_count);
 }
 
@@ -2968,4 +3918,528 @@ async fn test_request_quotes_returns_err_for_missing_instrument() {
         .request_quotes(request_quotes(InstrumentId::from("ETH-PERP.DERIVE")))
         .expect_err("must reject missing instrument");
     assert!(err.to_string().contains("not found in cache"), "{err}");
+}
+
+#[rstest]
+#[case::initial("initial")]
+#[case::reconnected("disconnect")]
+#[case::recovery_failed("recovery_failed")]
+#[tokio::test]
+async fn test_scheduled_instrument_refresh_publishes_and_caches_definitions(
+    #[case] reconnect: &str,
+) {
+    let rest_state = RestState::default();
+    let ws_state = WsState::default();
+    let mut row = load_json("perps/instrument_eth.json");
+    *rest_state.instruments_response.lock().await = Some(json!({"result": [row.clone()]}));
+    *rest_state.ticker_response.lock().await = load_json("perps/http_ticker_eth_snapshot.json");
+    let rest_addr = start_rest_server(rest_state.clone()).await;
+    let ws_addr = start_ws_server(ws_state.clone()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+    let mut cfg = config(rest_addr, ws_addr);
+    cfg.currencies = vec![" ETH ".to_string()];
+    cfg.update_instruments_interval_mins = 1;
+    cfg.include_expired = reconnect == "disconnect";
+    let calls_per_refresh = if cfg.include_expired { 4 } else { 3 };
+    let registry = SocketReconnectRegistry::default();
+    let mut client = registry
+        .scope(|| DeriveDataClient::new(*DERIVE_CLIENT_ID, cfg))
+        .unwrap();
+    connect_with_refresh(&mut client).await;
+    let mut started = tokio::time::Instant::now();
+    let initial = recv_instrument(&mut rx, Duration::from_secs(5)).await;
+    assert_definition(&initial, &row);
+
+    if reconnect != "initial" {
+        if reconnect == "recovery_failed" {
+            client
+                .subscribe_quotes(subscribe_quotes(
+                    InstrumentId::from("ETH-PERP.DERIVE"),
+                    None,
+                ))
+                .unwrap();
+            let _quote = recv_data(&mut rx).await;
+            ws_state.subscribe_failures.store(3, Ordering::SeqCst);
+            let handle = registry
+                .handle(*DERIVE_CLIENT_ID, Ustr::from("derive-data-streams"))
+                .unwrap();
+            assert_eq!(
+                handle.request_reconnect(),
+                SocketReconnectRequestOutcome::Accepted
+            );
+            wait_until_async(|| async { !client.is_connected() }, Duration::from_secs(5)).await;
+
+            while rx.try_recv().is_ok() {}
+        } else {
+            client.disconnect().await.unwrap();
+        }
+
+        connect_with_refresh(&mut client).await;
+        started = tokio::time::Instant::now();
+        let initial = recv_instrument(&mut rx, Duration::from_secs(5)).await;
+        assert_definition(&initial, &row);
+    }
+
+    connect_with_refresh(&mut client).await;
+    let initial_calls = rest_state.requests().await.len();
+    assert_eq!(
+        initial_calls,
+        calls_per_refresh * if reconnect == "initial" { 1 } else { 2 }
+    );
+    assert_eq!(ws_state.connection_count.load(Ordering::SeqCst), 1);
+
+    let option = load_json("common/http_get_instruments_eth_all.json")["result"][1].clone();
+    let option_id = InstrumentId::from("ETH-20260627-3500-C.DERIVE");
+    assert!(client.request_quotes(request_quotes(option_id)).is_err());
+    row["amount_step"] = json!("0.007");
+    row["tick_size"] = json!("0.0001");
+    *rest_state.instruments_response.lock().await =
+        Some(json!({"result": [row.clone(), option.clone()]}));
+    let duplicate_window = started.elapsed() + Duration::from_secs(1);
+    advance_refresh_clock(Duration::from_secs(59).saturating_sub(started.elapsed())).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .is_err()
+    );
+    assert_eq!(rest_state.requests().await.len(), initial_calls);
+    advance_refresh_clock(Duration::from_secs(60).saturating_sub(started.elapsed())).await;
+    let refreshed_option = recv_instrument(&mut rx, Duration::from_secs(5)).await;
+    let refreshed_perp = recv_instrument(&mut rx, Duration::from_secs(5)).await;
+    assert_definition(&refreshed_option, &option);
+    assert_definition(&refreshed_perp, &row);
+    let requests = rest_state.requests().await;
+    assert_eq!(requests.len(), initial_calls + calls_per_refresh);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.body["expired"] == true)
+            .count(),
+        if reconnect == "disconnect" { 3 } else { 0 },
+    );
+    assert!(
+        rest_state
+            .requests()
+            .await
+            .iter()
+            .all(|request| request.body["currency"] == "ETH")
+    );
+
+    client
+        .request_quotes(request_quotes(InstrumentId::from("ETH-PERP.DERIVE")))
+        .unwrap();
+
+    let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let DataEvent::Response(DataResponse::Quotes(response)) = event else {
+        panic!("expected quotes response");
+    };
+
+    assert_eq!(response.data.len(), 1);
+    assert_eq!(response.data[0].bid_price.precision, 4);
+    assert!(
+        tokio::time::timeout(duplicate_window, rx.recv())
+            .await
+            .is_err()
+    );
+    client.request_quotes(request_quotes(option_id)).unwrap();
+    client.disconnect().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_scheduled_instrument_refresh_recovers_after_failure() {
+    let _capture = crate::client_logging::capture_logs().await;
+    let rest_state = RestState::default();
+    let rest_addr = start_rest_server(rest_state.clone()).await;
+    let ws_addr = start_ws_server(WsState::default()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+    let mut cfg = config(rest_addr, ws_addr);
+    cfg.currencies = vec!["ETH".to_string()];
+    cfg.update_instruments_interval_mins = 1;
+    let mut client = DeriveDataClient::new(*DERIVE_CLIENT_ID, cfg).unwrap();
+    connect_with_refresh(&mut client).await;
+
+    while rx.try_recv().is_ok() {}
+    *rest_state.instruments_response.lock().await =
+        Some(json!({"error": {"code": -32602, "message": "temporary refresh failure"}}));
+
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    *rest_state.instruments_gate.lock().await = Some(Arc::clone(&gate));
+    advance_refresh_clock(Duration::from_secs(60)).await;
+    wait_until_async(
+        || {
+            let state = rest_state.clone();
+            async move { state.requests().await.len() == 6 }
+        },
+        Duration::from_secs(15),
+    )
+    .await;
+
+    assert!(rx.try_recv().is_err());
+    *rest_state.instruments_gate.lock().await = None;
+    gate.add_permits(3);
+    wait_until_async(
+        || async {
+            crate::client_logging::messages()
+                .iter()
+                .any(|(level, message)| {
+                    *level == log::Level::Warn
+                        && message.starts_with("Failed to refresh Derive instruments for ETH:")
+                })
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let retry_started = tokio::time::Instant::now();
+    let mut row = load_json("perps/instrument_eth.json");
+    row["amount_step"] = json!("0.009");
+    *rest_state.instruments_response.lock().await = Some(json!({"result": [row.clone()]}));
+    advance_refresh_clock(Duration::from_secs(59).saturating_sub(retry_started.elapsed())).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .is_err()
+    );
+    assert_eq!(rest_state.requests().await.len(), 6);
+    advance_refresh_clock(Duration::from_secs(60).saturating_sub(retry_started.elapsed())).await;
+    let refreshed = recv_instrument(&mut rx, Duration::from_secs(5)).await;
+    assert_definition(&refreshed, &row);
+    assert_eq!(rest_state.requests().await.len(), 9);
+    assert!(client.is_connected());
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[case::disconnect("disconnect", false)]
+#[case::in_flight("disconnect", true)]
+#[case::stop("stop", false)]
+#[case::reset("reset", false)]
+#[case::dispose("dispose", false)]
+#[tokio::test]
+async fn test_scheduled_instrument_refresh_shutdown(
+    #[case] shutdown: &str,
+    #[case] in_flight: bool,
+) {
+    let rest_state = RestState::default();
+    let rest_addr = start_rest_server(rest_state.clone()).await;
+    let ws_addr = start_ws_server(WsState::default()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+    let mut cfg = config(rest_addr, ws_addr);
+    cfg.currencies = vec!["ETH".to_string()];
+    cfg.update_instruments_interval_mins = 1;
+    let mut client = DeriveDataClient::new(*DERIVE_CLIENT_ID, cfg).unwrap();
+    connect_with_refresh(&mut client).await;
+
+    while rx.try_recv().is_ok() {}
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    if in_flight {
+        *rest_state.instruments_gate.lock().await = Some(Arc::clone(&gate));
+        advance_refresh_clock(Duration::from_secs(60)).await;
+        wait_until_async(
+            || {
+                let state = rest_state.clone();
+                async move { state.requests().await.len() == 6 }
+            },
+            Duration::from_secs(15),
+        )
+        .await;
+    }
+
+    match shutdown {
+        "stop" => client.stop().unwrap(),
+        "reset" => client.reset().unwrap(),
+        "dispose" => client.dispose().unwrap(),
+        "disconnect" => tokio::time::timeout(Duration::from_secs(2), client.disconnect())
+            .await
+            .unwrap()
+            .unwrap(),
+        _ => unreachable!(),
+    }
+
+    wait_until_async(
+        || async { client.session_tasks.all_finished() },
+        Duration::from_secs(5),
+    )
+    .await;
+    gate.add_permits(3);
+    let calls = rest_state.requests().await.len();
+    assert!(!client.is_connected());
+    advance_refresh_clock(Duration::from_secs(61)).await;
+    assert!(rx.try_recv().is_err());
+    assert_eq!(rest_state.requests().await.len(), calls);
+    assert_eq!(calls, if in_flight { 6 } else { 3 });
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[case::zero_interval(0, vec!["ETH".to_string()], 3)]
+#[case::lazy_loading(1, Vec::new(), 0)]
+#[tokio::test]
+async fn test_scheduled_instrument_refresh_disabled(
+    #[case] minutes: u64,
+    #[case] currencies: Vec<String>,
+    #[case] expected_calls: usize,
+) {
+    let rest_state = RestState::default();
+    let rest_addr = start_rest_server(rest_state.clone()).await;
+    let ws_addr = start_ws_server(WsState::default()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+    let mut cfg = config(rest_addr, ws_addr);
+    cfg.currencies = currencies;
+    cfg.update_instruments_interval_mins = minutes;
+    let mut client = DeriveDataClient::new(*DERIVE_CLIENT_ID, cfg).unwrap();
+    connect_with_refresh(&mut client).await;
+
+    while rx.try_recv().is_ok() {}
+
+    advance_refresh_clock(Duration::from_secs(61)).await;
+    assert!(rx.try_recv().is_err());
+    assert_eq!(rest_state.requests().await.len(), expected_calls);
+    client.disconnect().await.unwrap();
+}
+
+async fn recv_instrument(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+    within: Duration,
+) -> InstrumentAny {
+    let event = tokio::time::timeout(within, rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let DataEvent::Data(Data::Instrument(instrument)) = event else {
+        panic!("expected instrument event, was {event:?}");
+    };
+
+    *instrument
+}
+
+#[tokio::test]
+#[ignore = "requires Derive mainnet public network access"]
+async fn test_scheduled_instrument_refresh_mainnet() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+
+    let cfg = DeriveDataClientConfig {
+        environment: DeriveEnvironment::Mainnet,
+        currencies: vec!["ETH".to_string()],
+        update_instruments_interval_mins: 1,
+        ..Default::default()
+    };
+
+    let mut client = DeriveDataClient::new(*DERIVE_CLIENT_ID, cfg).unwrap();
+    let started = tokio::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(45), client.connect())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut initial = Vec::new();
+
+    while let Ok(event) = rx.try_recv() {
+        let DataEvent::Data(Data::Instrument(instrument)) = event else {
+            panic!("expected startup instrument, was {event:?}");
+        };
+
+        initial.push(instrument);
+    }
+
+    let perp_id = InstrumentId::from("ETH-PERP.DERIVE");
+    let initial_perp = initial
+        .iter()
+        .find(|instrument| instrument.id() == perp_id)
+        .unwrap();
+    let refreshed = recv_instrument(&mut rx, Duration::from_secs(90)).await;
+    tokio::time::timeout(Duration::from_secs(5), client.disconnect())
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(started.elapsed() >= Duration::from_secs(60));
+    assert!(refreshed.ts_init() > initial_perp.ts_init());
+    assert_eq!(refreshed.id().venue, *DERIVE_VENUE);
+    assert_eq!(
+        refreshed.info().unwrap().get_str("base_currency"),
+        Some("ETH")
+    );
+    assert!(!client.is_connected());
+    println!(
+        "Derive mainnet: {} startup instruments; scheduled REST refresh published a fresh definition; disconnected",
+        initial.len()
+    );
+}
+
+fn assert_definition(instrument: &InstrumentAny, row: &Value) {
+    let definition = serde_json::from_value(row.clone()).unwrap();
+    let expected = parse_derive_instrument_any(&definition, instrument.ts_init())
+        .unwrap()
+        .unwrap();
+    assert_eq!(instrument, &expected);
+    assert_eq!(
+        serde_json::to_value(instrument.info().unwrap()).unwrap(),
+        *row
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_instruments_refreshes_v3_metadata() {
+    let rest_state = RestState::default();
+    let ws_state = WsState::default();
+    let rest_addr = start_rest_server(rest_state.clone()).await;
+    let ws_addr = start_ws_server(ws_state).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+    let mut cfg = config(rest_addr, ws_addr);
+    cfg.currencies = vec!["ETH".to_string()];
+    let client = DeriveDataClient::new(*DERIVE_CLIENT_ID, cfg).unwrap();
+    let mut row = load_json("perps/instrument_eth.json");
+    row["perp_details"]
+        .as_object_mut()
+        .unwrap()
+        .remove("static_interest_rate");
+
+    for amount in ["0.003", "0.007"] {
+        row["amount_step"] = json!(amount);
+        *rest_state.instruments_response.lock().await = Some(json!({"result": {
+            "instruments": [row.clone()], "pagination": {"count": 1, "num_pages": 1},
+        }}));
+
+        let request = RequestInstruments::new(
+            None,
+            None,
+            Some(*DERIVE_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        );
+        let request_id = request.request_id;
+        client.request_instruments(request).unwrap();
+
+        let DataResponse::Instruments(response) = recv_response(&mut rx).await else {
+            panic!("expected instruments response");
+        };
+
+        let instrument = &response.data[0];
+        assert_eq!(response.correlation_id, request_id);
+        assert_eq!(response.data.len(), 1);
+        assert_eq!(instrument.size_increment(), Quantity::from(amount));
+        assert_eq!(
+            serde_json::to_value(instrument.info().unwrap()).unwrap(),
+            row
+        );
+    }
+
+    assert_eq!(rest_state.requests().await.len(), 6);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_delisted_option_by_name_without_bulk_discovery() {
+    let rest_state = RestState::default();
+    let ws_state = WsState::default();
+    let mut row = load_json("common/http_get_instruments_eth_all.json")["result"][1].clone();
+    row["is_active"] = json!(false);
+    row["option_details"]["settlement_price"] = Value::Null;
+    *rest_state.instrument_response.lock().await = row.clone();
+    let rest_addr = start_rest_server(rest_state.clone()).await;
+    let ws_addr = start_ws_server(ws_state).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+    let client = DeriveDataClient::new(*DERIVE_CLIENT_ID, config(rest_addr, ws_addr)).unwrap();
+    let instrument_id = InstrumentId::from("ETH-20260627-3500-C.DERIVE");
+
+    client
+        .request_instrument(request_instrument(instrument_id))
+        .unwrap();
+
+    let DataResponse::Instrument(response) = recv_response(&mut rx).await else {
+        panic!("expected instrument response");
+    };
+
+    assert_eq!(response.data.id(), instrument_id);
+    assert_eq!(
+        serde_json::to_value(response.data.info().unwrap()).unwrap(),
+        row
+    );
+    assert!(rest_state.requests().await.is_empty());
+    assert_eq!(
+        rest_state.instrument_calls.lock().await.as_slice(),
+        &[json!({"instrument_name": "ETH-20260627-3500-C"})]
+    );
+}
+
+#[rstest]
+#[case::disabled(0)]
+#[case::enabled(1)]
+#[tokio::test]
+async fn test_connect_registers_one_instrument_refresh(#[case] minutes: u64) {
+    let rest_addr = start_rest_server(RestState::default()).await;
+    let ws_addr = start_ws_server(WsState::default()).await;
+    let mut config = config(rest_addr, ws_addr);
+    config.currencies = vec!["ETH".to_string()];
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+    config.update_instruments_interval_mins = minutes;
+    let mut client = DeriveDataClient::new(*DERIVE_CLIENT_ID, config).unwrap();
+
+    client.connect().await.unwrap();
+    client.connect().await.unwrap();
+
+    assert_eq!(client.session_tasks.len(), 2 + usize::from(minutes != 0));
+    client.disconnect().await.unwrap();
+    assert!(client.session_tasks.is_empty());
+}
+
+async fn connect_with_refresh(client: &mut DeriveDataClient) {
+    if client.is_connected() {
+        client.connect().await.unwrap();
+        return;
+    }
+
+    // Keep the refresh timer on the test clock and retain session task ownership
+    let minutes = client.config.update_instruments_interval_mins;
+    client.config.update_instruments_interval_mins = 0;
+    client.connect().await.unwrap();
+    client.config.update_instruments_interval_mins = minutes;
+
+    if let Some(future) = client.instrument_refresh() {
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            let mut future = Box::pin(future);
+            let mut ready = Some(ready);
+            std::future::poll_fn(move |cx| {
+                let result = future.as_mut().poll(cx);
+
+                if let Some(ready) = ready.take() {
+                    let _ = ready.send(());
+                }
+
+                result
+            })
+            .await;
+        });
+
+        client
+            .session_tasks
+            .spawn(async move { tasks.join_next().await.unwrap().unwrap() })
+            .unwrap();
+        started.await.unwrap();
+    }
+}
+
+async fn advance_refresh_clock(duration: Duration) {
+    tokio::time::pause();
+    tokio::time::advance(duration).await;
+    tokio::time::resume();
+    tokio::task::yield_now().await;
 }

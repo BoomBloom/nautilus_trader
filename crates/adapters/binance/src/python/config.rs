@@ -59,14 +59,18 @@ impl BinanceInstrumentProviderConfig {
             .map(nautilus_live::python::config::coerce_json_config)
             .transpose()?
             .unwrap_or_default();
-        Ok(Self {
+
+        let config = Self {
             load_all,
             load_ids,
             filters,
             filter_callable,
             log_warnings,
             query_commission_rates,
-        })
+        };
+
+        config.validate_selections().map_err(to_pyvalue_err)?;
+        Ok(config)
     }
 
     fn __repr__(&self) -> String {
@@ -136,6 +140,7 @@ impl BinanceDataClientConfig {
         max_retries = None,
         retry_delay_initial_ms = None,
         retry_delay_max_ms = None,
+        book_snapshot_timeout_secs = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -156,6 +161,7 @@ impl BinanceDataClientConfig {
         max_retries: Option<u32>,
         retry_delay_initial_ms: Option<u64>,
         retry_delay_max_ms: Option<u64>,
+        book_snapshot_timeout_secs: Option<u64>,
     ) -> PyResult<Self> {
         let defaults = Self::default();
         let config = Self {
@@ -171,6 +177,8 @@ impl BinanceDataClientConfig {
                 .unwrap_or(defaults.instrument_refresh_interval_secs),
             instrument_status_poll_secs: instrument_status_poll_secs
                 .unwrap_or(defaults.instrument_status_poll_secs),
+            book_snapshot_timeout_secs: book_snapshot_timeout_secs
+                .unwrap_or(defaults.book_snapshot_timeout_secs),
             proxy_url: proxy_url.map(SecretString::from).or(defaults.proxy_url),
             recv_window_ms: recv_window_ms.unwrap_or(defaults.recv_window_ms),
             max_retries: max_retries.unwrap_or(defaults.max_retries),
@@ -368,7 +376,7 @@ mod tests {
     fn test_data_client_py_new_uses_defaults_for_omitted_fields() {
         let config = BinanceDataClientConfig::py_new(
             None, None, None, None, None, None, None, None, None, None, None, None, false, None,
-            None, None, None,
+            None, None, None, None,
         )
         .unwrap();
         let defaults = BinanceDataClientConfig::default();
@@ -388,6 +396,10 @@ mod tests {
         assert_eq!(
             config.instrument_status_poll_secs,
             defaults.instrument_status_poll_secs
+        );
+        assert_eq!(
+            config.book_snapshot_timeout_secs,
+            defaults.book_snapshot_timeout_secs
         );
         assert_eq!(config.proxy_url, defaults.proxy_url);
         assert_eq!(config.recv_window_ms, defaults.recv_window_ms);
@@ -414,6 +426,7 @@ mod tests {
             Some(7),
             Some(123),
             Some(456),
+            Some(0),
         )
         .unwrap();
 
@@ -446,6 +459,7 @@ mod tests {
         assert_eq!(config.max_retries, 7);
         assert_eq!(config.retry_delay_initial_ms, 123);
         assert_eq!(config.retry_delay_max_ms, 456);
+        assert_eq!(config.book_snapshot_timeout_secs, 0);
     }
 
     #[rstest]
@@ -632,6 +646,90 @@ mod tests {
             );
             assert!(!config.log_warnings);
             assert!(config.query_commission_rates);
+        });
+    }
+
+    #[rstest]
+    #[case("load_ids")]
+    #[case("symbols")]
+    #[case("contract_types")]
+    fn test_python_provider_selection_uniqueness(
+        #[case] field: &str,
+        #[values(false, true)] duplicate: bool,
+    ) {
+        Python::initialize();
+        Python::attach(|py| {
+            let mut values = vec!["first", "second"];
+            if duplicate {
+                values.push("first");
+            }
+
+            let kwargs = PyDict::new(py);
+            if field == "load_ids" {
+                kwargs.set_item("load_ids", &values).unwrap();
+            } else {
+                let filters = PyDict::new(py);
+                filters.set_item(field, &values).unwrap();
+                kwargs.set_item("filters", filters).unwrap();
+            }
+
+            let result = py
+                .get_type::<BinanceInstrumentProviderConfig>()
+                .call((), Some(&kwargs));
+
+            if duplicate {
+                let error = result.unwrap_err();
+
+                let expected = if field == "load_ids" {
+                    "instrument_provider.load_ids".to_string()
+                } else {
+                    format!("instrument_provider.filters.{field}")
+                };
+
+                assert!(error.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+                assert_eq!(
+                    error.value(py).str().unwrap().to_str().unwrap(),
+                    format!("duplicate {expected}")
+                );
+            } else {
+                let config = result.unwrap();
+                let config = config
+                    .extract::<PyRef<BinanceInstrumentProviderConfig>>()
+                    .unwrap();
+
+                if field == "load_ids" {
+                    assert_eq!(config.load_ids.as_ref().unwrap(), &values);
+                } else {
+                    assert_eq!(config.filters.get(field), Some(&serde_json::json!(values)));
+                }
+            }
+        });
+    }
+
+    #[rstest]
+    #[case("symbols", vec!["BTCUSDT", " btcusdt "])]
+    #[case("bases", vec!["BTC", " btc "])]
+    #[case("quotes", vec!["USDT", " usdt "])]
+    #[case("contract_types", vec!["PERPETUAL", " perpetual "])]
+    fn test_python_provider_rejects_normalized_duplicates(
+        #[case] field: &str,
+        #[case] values: Vec<&str>,
+    ) {
+        Python::initialize();
+        Python::attach(|py| {
+            let filters = PyDict::new(py);
+            filters.set_item(field, values).unwrap();
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("filters", filters).unwrap();
+            let error = py
+                .get_type::<BinanceInstrumentProviderConfig>()
+                .call((), Some(&kwargs))
+                .unwrap_err();
+            assert!(error.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+            assert_eq!(
+                error.value(py).str().unwrap().to_str().unwrap(),
+                format!("duplicate instrument_provider.filters.{field}")
+            );
         });
     }
 }

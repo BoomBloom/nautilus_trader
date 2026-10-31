@@ -15,6 +15,10 @@
 
 //! Instrument parsing for Polymarket markets.
 
+use std::sync::Arc;
+
+use ahash::AHashMap;
+use indexmap::IndexMap;
 use jiff::Timestamp;
 use nautilus_core::{Params, UnixNanos};
 use nautilus_model::{
@@ -26,13 +30,17 @@ use nautilus_model::{
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use ustr::Ustr;
 
-use super::models::{CryptoMarketConfig, FeeSchedule, GammaMarket, GammaTag};
+use super::models::{CryptoMarketConfig, FeeSchedule, GammaEvent, GammaMarket, GammaTag};
 use crate::common::{
-    consts::{POLYMARKET_PRICE_PRECISION, POLYMARKET_VENUE, PUSD},
+    consts::{
+        MARKET_VERSION_KEY, POLYMARKET_PRICE_PRECISION, POLYMARKET_VENUE, PUSD,
+        SUPPORTED_MARKET_VERSION,
+    },
     enums::PolymarketOutcome,
-    parse::parse_decimal_exact,
+    parse::{parse_decimal_exact, validate_market_version},
 };
 
 const DEFAULT_TICK_SIZE: Decimal = dec!(0.001);
@@ -61,8 +69,8 @@ pub struct PolymarketInstrumentDef {
     /// Original Gamma market response.
     #[serde(default)]
     pub gamma_market: String,
-    /// Original enclosing event response from event-based discovery.
-    pub gamma_event: Option<String>,
+    /// Shared `Value::String` containing the original enclosing event JSON from discovery.
+    pub gamma_event: Option<Arc<Value>>,
     /// Question ID (resolution hash).
     pub question_id: Option<String>,
     /// Outcome label.
@@ -77,10 +85,6 @@ pub struct PolymarketInstrumentDef {
     pub tick_size: Decimal,
     /// Minimum order size.
     pub min_size: Option<Decimal>,
-    /// Maker fee (decimal, not bps).
-    pub maker_fee: Option<Decimal>,
-    /// Taker fee (decimal, not bps).
-    pub taker_fee: Option<Decimal>,
     /// Market start timestamp (ISO 8601).
     pub start_date: Option<String>,
     /// Event window start timestamp (ISO 8601).
@@ -105,6 +109,8 @@ pub struct PolymarketInstrumentDef {
     /// Game ID for sport markets, kept verbatim because Gamma emits both
     /// numeric and composite `<uuid>:<away>:<home>` forms.
     pub game_id: Option<String>,
+    /// Market protocol version, which must be `v1`.
+    pub market_version: String,
 }
 
 /// Parses a Gamma market response into instrument definitions.
@@ -112,6 +118,14 @@ pub struct PolymarketInstrumentDef {
 /// Each market produces two definitions: one for the Yes outcome
 /// and one for the No outcome.
 pub fn parse_gamma_market(market: &GammaMarket) -> anyhow::Result<Vec<PolymarketInstrumentDef>> {
+    parse_gamma_market_with_event_cache(market, &mut AHashMap::new())
+}
+
+pub(super) fn parse_gamma_market_with_event_cache(
+    market: &GammaMarket,
+    event_metadata: &mut AHashMap<*const GammaEvent, Arc<Value>>,
+) -> anyhow::Result<Vec<PolymarketInstrumentDef>> {
+    validate_market_version(market.version.as_deref())?;
     let event_id = market_event_id(market);
 
     let game_id = market.game_id.clone().or_else(|| {
@@ -145,12 +159,6 @@ pub fn parse_gamma_market(market: &GammaMarket) -> anyhow::Result<Vec<Polymarket
         .unwrap_or(DEFAULT_TICK_SIZE);
     let price_precision = POLYMARKET_PRICE_PRECISION;
 
-    // Polymarket charges fees using `feeSchedule.rate` on the Gamma market.
-    // Only takers pay; makers are always zero.
-    // Reference: https://docs.polymarket.com/trading/fees
-    let maker_fee: Option<Decimal> = market.fee_schedule.as_ref().map(|_| Decimal::ZERO);
-    let taker_fee: Option<Decimal> = market.fee_schedule.as_ref().map(|fs| fs.rate);
-
     let min_size = market.order_min_size;
 
     let active = market.active.unwrap_or(false)
@@ -158,6 +166,14 @@ pub fn parse_gamma_market(market: &GammaMarket) -> anyhow::Result<Vec<Polymarket
         && market.accepting_orders.unwrap_or(false);
 
     let neg_risk = market.neg_risk;
+
+    let gamma_event = market.parent_event.as_ref().map(|event| {
+        Arc::clone(
+            event_metadata
+                .entry(Arc::as_ptr(event))
+                .or_insert_with(|| Arc::new(Value::String(event.raw.clone()))),
+        )
+    });
 
     let mut defs = Vec::with_capacity(2);
 
@@ -173,7 +189,7 @@ pub fn parse_gamma_market(market: &GammaMarket) -> anyhow::Result<Vec<Polymarket
             market_id: market.id.clone(),
             event_id,
             gamma_market: market.raw.clone(),
-            gamma_event: market.parent_event.as_ref().map(|event| event.raw.clone()),
+            gamma_event: gamma_event.clone(),
             question_id: market.question_id.clone(),
             outcome,
             question: market.question.clone(),
@@ -181,8 +197,6 @@ pub fn parse_gamma_market(market: &GammaMarket) -> anyhow::Result<Vec<Polymarket
             price_precision,
             tick_size,
             min_size,
-            maker_fee,
-            taker_fee,
             start_date: market.start_date.clone(),
             event_start_time: market.event_start_time.clone(),
             end_date: market.end_date.clone(),
@@ -194,6 +208,7 @@ pub fn parse_gamma_market(market: &GammaMarket) -> anyhow::Result<Vec<Polymarket
             crypto_market_config: market.crypto_market_config.clone(),
             fee_schedule: market.fee_schedule.clone(),
             game_id: game_id.clone(),
+            market_version: SUPPORTED_MARKET_VERSION.to_string(),
         });
     }
 
@@ -235,13 +250,26 @@ pub(crate) fn resolve_maker_rebate_rate(market: &GammaMarket) -> Decimal {
     }
 }
 
-// Ensures the market carries a fee schedule with a category-resolved rebate.
-// Existing schedules keep their rate and have their rebate overwritten.
-// Missing schedules are created for fee-enabled markets with a zero rate
-// for the CLOB fallback to fill. Fee-free and unclassifiable markets keep
-// a zero rebate and no invented schedule.
+// Create missing schedules only for a resolved fee-enabled category.
+// Keep unknown taker rates at zero; the legacy CLOB base fee cannot supply them.
 pub(crate) fn enrich_market_fee_schedule(market: &mut GammaMarket) {
     let rebate = resolve_maker_rebate_rate(market);
+    if (market.fees_enabled == Some(true) || !rebate.is_zero())
+        && market
+            .fee_type
+            .as_deref()
+            .is_none_or(|fee_type| !fee_type.trim().eq_ignore_ascii_case("zero_fees"))
+        && market
+            .fee_schedule
+            .as_ref()
+            .is_none_or(|schedule| schedule.rate.is_zero())
+    {
+        log::warn!(
+            "Missing or zero Gamma taker fee rate for fee-enabled market {}, using zero",
+            market.id
+        );
+    }
+
     match market.fee_schedule.as_mut() {
         Some(schedule) => {
             schedule.rebate_rate = rebate;
@@ -402,6 +430,7 @@ pub fn create_instrument_from_def(
     def: &PolymarketInstrumentDef,
     ts_init: UnixNanos,
 ) -> anyhow::Result<InstrumentAny> {
+    validate_market_version(Some(&def.market_version))?;
     let symbol = Symbol::new(def.symbol);
     let venue = *POLYMARKET_VENUE;
     let instrument_id = InstrumentId::new(symbol, venue);
@@ -432,7 +461,7 @@ pub fn create_instrument_from_def(
     // `min_quantity`, so leave it unset and let the venue reject out-of-bounds orders.
     let min_quantity: Option<Quantity> = None;
 
-    let info: Params = serde_json::from_value(build_info_json(def))?;
+    let info = build_info(def);
 
     let binary_option = BinaryOption::builder()
         .instrument_id(instrument_id)
@@ -452,8 +481,6 @@ pub fn create_instrument_from_def(
         .maybe_min_quantity(min_quantity)
         .max_price(max_price)
         .min_price(min_price)
-        .maybe_maker_fee(def.maker_fee)
-        .maybe_taker_fee(def.taker_fee)
         .info(info)
         .ts_event(ts_init)
         .ts_init(ts_init)
@@ -518,8 +545,6 @@ pub fn rebuild_instrument_with_tick_size(
         .min_price(min_price)
         .margin_init(bo.margin_init)
         .margin_maint(bo.margin_maint)
-        .maker_fee(bo.maker_fee)
-        .taker_fee(bo.taker_fee)
         .maybe_info(bo.info.clone())
         .ts_event(ts_event)
         .ts_init(ts_init)
@@ -546,11 +571,16 @@ pub(crate) fn tick_relative_price_bounds(tick_size: Decimal) -> anyhow::Result<(
     Ok((min_price, max_price))
 }
 
-fn build_info_json(def: &PolymarketInstrumentDef) -> serde_json::Value {
+fn build_info(def: &PolymarketInstrumentDef) -> Params {
     let mut map = serde_json::Map::new();
+    map.insert(
+        MARKET_VERSION_KEY.to_string(),
+        def.market_version.clone().into(),
+    );
     map.insert("gamma_market".to_string(), def.gamma_market.clone().into());
-    if let Some(event) = &def.gamma_event {
-        map.insert("gamma_event".to_string(), event.clone().into());
+    if def.gamma_event.is_some() {
+        // Reserve the event position under both serde_json map ordering configurations
+        map.insert("gamma_event".to_string(), Value::Null);
     }
 
     if let Some(event_id) = def.event_id {
@@ -640,7 +670,16 @@ fn build_info_json(def: &PolymarketInstrumentDef) -> serde_json::Value {
         );
     }
 
-    serde_json::Value::Object(map)
+    let mut map: IndexMap<_, _> = map
+        .into_iter()
+        .map(|(key, value)| (key, Arc::new(value)))
+        .collect();
+
+    if let Some(event) = &def.gamma_event {
+        map.insert("gamma_event".to_string(), Arc::clone(event));
+    }
+
+    Params::from_shared(map)
 }
 
 fn get_currency(code: &str) -> Currency {
@@ -810,8 +849,7 @@ mod tests {
         assert_eq!(yes_def.tick_size, dec!(0.01));
         assert_eq!(yes_def.price_precision, POLYMARKET_PRICE_PRECISION);
         assert_eq!(yes_def.min_size, Some(dec!(5.0)));
-        assert!(yes_def.maker_fee.is_none());
-        assert!(yes_def.taker_fee.is_none());
+        assert_eq!(yes_def.fee_schedule, None);
         assert!(yes_def.active);
         assert_eq!(
             yes_def.market_slug.as_deref(),
@@ -832,11 +870,6 @@ mod tests {
         assert_eq!(map_handicap_defs[0].game_id.as_deref(), Some("1427074"));
         assert_eq!(money_line_defs[0].fee_schedule, money_line.fee_schedule);
         assert_eq!(map_handicap_defs[0].fee_schedule, map_handicap.fee_schedule);
-
-        // Maker fee is always zero for feeSchedule-backed markets
-        assert_eq!(money_line_defs[0].maker_fee, Some(Decimal::ZERO));
-        // Taker fee comes from feeSchedule.rate (sports rate = 0.03)
-        assert_eq!(money_line_defs[0].taker_fee, Some(dec!(0.03)));
     }
 
     #[rstest]
@@ -1010,6 +1043,57 @@ mod tests {
     }
 
     #[rstest]
+    fn test_instrument_info_preserves_json_map_order() {
+        let market = load_gamma_market("gamma_market_crypto_twap.json");
+        let mut def = parse_gamma_market(&market).unwrap().remove(0);
+        let event = Arc::new(Value::String(market.raw));
+        def.gamma_event = Some(Arc::clone(&event));
+        def.event_id = Some(Ustr::from("event-123"));
+        let info = build_info(&def);
+        let mut expected = serde_json::Map::new();
+
+        for key in [
+            "market_version",
+            "gamma_market",
+            "gamma_event",
+            "event_id",
+            "token_id",
+            "condition_id",
+            "market_id",
+            "question_id",
+            "market_slug",
+            "description",
+            "event_start_time",
+            "end_date",
+            "neg_risk",
+            "resolution_source",
+            "crypto_market_config",
+            "min_order_size",
+            "fee_schedule",
+            "game_id",
+        ] {
+            if let Some(value) = info.get(key) {
+                expected.insert(key.to_string(), value.clone());
+            }
+        }
+
+        assert_eq!(
+            info.borrowed_entries()
+                .map(|(key, _)| key)
+                .collect::<Vec<_>>(),
+            expected.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            serde_json::to_string(&info).unwrap(),
+            serde_json::to_string(&expected).unwrap()
+        );
+        assert!(std::ptr::eq(
+            info.get("gamma_event").unwrap(),
+            event.as_ref()
+        ));
+    }
+
+    #[rstest]
     fn test_create_instrument_info_includes_resolution_and_crypto_market_config() {
         let market = load_gamma_market("gamma_market_crypto_twap.json");
 
@@ -1097,7 +1181,13 @@ mod tests {
 
         let info = binary.info.as_ref().expect("info should be Some");
         assert_eq!(info.get_str("game_id"), Some("1427074"));
-        assert!(info.get("fee_schedule").is_some());
+        let schedule = info.get("fee_schedule").unwrap();
+        let fields = schedule.as_object().unwrap();
+        assert_eq!(fields.len(), 4);
+        assert_eq!(schedule["rate"], "0.03");
+        assert_eq!(schedule["exponent"], "1");
+        assert_eq!(schedule["takerOnly"], true);
+        assert_eq!(schedule["rebateRate"], "0.25");
     }
 
     #[rstest]
@@ -1350,6 +1440,23 @@ mod tests {
         assert_eq!(schedule.rebate_rate, dec!(0.20));
         assert_eq!(schedule.exponent, Decimal::ONE);
         assert!(schedule.taker_only);
+    }
+
+    #[rstest]
+    #[case(Decimal::ZERO)]
+    #[case(dec!(0.0123))]
+    fn test_enrich_market_fee_schedule_preserves_zero_fee_values(#[case] rate: Decimal) {
+        let mut market = load_gamma_market("gamma_market_fee_zero_rate.json");
+        market.fee_type = Some("zero_fees".to_string());
+        let schedule = market.fee_schedule.as_mut().unwrap();
+        schedule.exponent = dec!(2);
+        schedule.rate = rate;
+        schedule.taker_only = false;
+        let original_schedule = market.fee_schedule.clone().unwrap();
+
+        enrich_market_fee_schedule(&mut market);
+
+        assert_eq!(market.fee_schedule, Some(original_schedule));
     }
 
     #[rstest]

@@ -331,9 +331,9 @@ impl<'a> CacheApi<'a> {
     ///
     /// # Errors
     ///
-    /// Returns:
-    /// - [`OrderLookupError::NotFound`] when the order is not present in the cache.
-    /// - [`OrderLookupError::Access`] if the cache is already mutably borrowed.
+    /// Returns an error if:
+    /// - The order is not present in the cache.
+    /// - The cache is already mutably borrowed.
     pub fn try_order(&self, client_order_id: &ClientOrderId) -> Result<OrderAny, OrderLookupError> {
         self.try_cache("try_order")?
             .try_order_owned(client_order_id)
@@ -823,9 +823,9 @@ impl<'a> CacheApi<'a> {
     ///
     /// # Errors
     ///
-    /// Returns:
-    /// - [`OrderListLookupError::NotFound`] when the order list is not present in the cache.
-    /// - [`OrderListLookupError::Access`] if the cache is already mutably borrowed.
+    /// Returns an error if:
+    /// - The order list is not present in the cache.
+    /// - The cache is already mutably borrowed.
     pub fn try_order_list(
         &self,
         order_list_id: &OrderListId,
@@ -969,9 +969,9 @@ impl<'a> CacheApi<'a> {
     ///
     /// # Errors
     ///
-    /// Returns:
-    /// - [`PositionLookupError::NotFound`] when the position is not present in the cache.
-    /// - [`PositionLookupError::Access`] if the cache is already mutably borrowed.
+    /// Returns an error if:
+    /// - The position is not present in the cache.
+    /// - The cache is already mutably borrowed.
     pub fn try_position(&self, position_id: &PositionId) -> Result<Position, PositionLookupError> {
         self.try_cache("try_position")?
             .try_position_ref(position_id)
@@ -1227,7 +1227,7 @@ impl<'a> CacheApi<'a> {
     ///
     /// Returns an error if:
     /// - The `key` is invalid.
-    /// - The cache is already mutably borrowed ([`ComponentAccessError`]).
+    /// - The cache is already mutably borrowed.
     pub fn get(&self, key: &str) -> anyhow::Result<Option<Bytes>> {
         let cache = self.try_cache("get")?;
         let value = cache.get(key)?;
@@ -1236,16 +1236,23 @@ impl<'a> CacheApi<'a> {
 
     /// Returns the price for the `instrument_id` and `price_type` (if found).
     ///
+    /// For `Mid`, returns `None` if no quote is cached or either price is a sentinel.
+    /// For quote precision `p`, the midpoint has precision `p + 1` when exactly representable,
+    /// otherwise `p`, rounded half-even if necessary. The fallback applies when the precision
+    /// limit or raw range rules out `p + 1`, and when `p` is the maximum float precision (16),
+    /// so a midpoint of a float-convertible quote stays float-convertible.
+    ///
     /// # Panics
     ///
-    /// Panics if the cache is already mutably borrowed, or if `price_type` is [`PriceType::Mid`]
-    /// and the quote price precision is already at the maximum fixed precision.
+    /// Panics if the cache is already mutably borrowed.
     #[must_use]
     pub fn price(&self, instrument_id: &InstrumentId, price_type: PriceType) -> Option<Price> {
         self.cache().price(instrument_id, price_type)
     }
 
-    /// Returns all quotes for the `instrument_id` (if found).
+    /// Returns cached quotes for the `instrument_id`, most recently added first.
+    ///
+    /// See [`Cache::quotes`] for ordering and missing-data behavior.
     ///
     /// # Panics
     ///
@@ -1255,7 +1262,9 @@ impl<'a> CacheApi<'a> {
         self.cache().quotes(instrument_id)
     }
 
-    /// Returns all trades for the `instrument_id` (if found).
+    /// Returns cached trades for the `instrument_id`, most recently added first.
+    ///
+    /// See [`Cache::trades`] for ordering and missing-data behavior.
     ///
     /// # Panics
     ///
@@ -1265,7 +1274,9 @@ impl<'a> CacheApi<'a> {
         self.cache().trades(instrument_id)
     }
 
-    /// Returns all mark price updates for the `instrument_id` (if found).
+    /// Returns cached mark price updates for the `instrument_id`, most recently added first.
+    ///
+    /// See [`Cache::mark_prices`] for ordering and missing-data behavior.
     ///
     /// # Panics
     ///
@@ -1275,7 +1286,9 @@ impl<'a> CacheApi<'a> {
         self.cache().mark_prices(instrument_id)
     }
 
-    /// Returns all index price updates for the `instrument_id` (if found).
+    /// Returns cached index price updates for the `instrument_id`, most recently added first.
+    ///
+    /// See [`Cache::index_prices`] for ordering and missing-data behavior.
     ///
     /// # Panics
     ///
@@ -1285,7 +1298,9 @@ impl<'a> CacheApi<'a> {
         self.cache().index_prices(instrument_id)
     }
 
-    /// Returns all funding rate updates for the `instrument_id` (if found).
+    /// Returns cached funding rate updates for the `instrument_id`, most recently added first.
+    ///
+    /// See [`Cache::funding_rates`] for ordering and missing-data behavior.
     ///
     /// # Panics
     ///
@@ -1295,7 +1310,9 @@ impl<'a> CacheApi<'a> {
         self.cache().funding_rates(instrument_id)
     }
 
-    /// Returns all instrument status updates for the `instrument_id` (if found).
+    /// Returns cached instrument status updates for the `instrument_id`, most recently added first.
+    ///
+    /// See [`Cache::instrument_statuses`] for ordering and missing-data behavior.
     ///
     /// # Panics
     ///
@@ -1308,7 +1325,9 @@ impl<'a> CacheApi<'a> {
         self.cache().instrument_statuses(instrument_id)
     }
 
-    /// Returns all bars for the `bar_type` (if found).
+    /// Returns cached bars for the `bar_type`, newest `ts_event` first.
+    ///
+    /// See [`Cache::bars`] for ordering and missing-data behavior.
     ///
     /// # Panics
     ///
@@ -1319,6 +1338,8 @@ impl<'a> CacheApi<'a> {
     }
 
     /// Returns an owned copy of the order book for the `instrument_id` (if found).
+    ///
+    /// See [`Cache::order_book`] for the current-state contract.
     ///
     /// # Panics
     ///
@@ -1332,9 +1353,9 @@ impl<'a> CacheApi<'a> {
     ///
     /// # Errors
     ///
-    /// Returns:
-    /// - [`OrderBookLookupError::NotFound`] when the order book is not present in the cache.
-    /// - [`OrderBookLookupError::Access`] if the cache is already mutably borrowed.
+    /// Returns an error if:
+    /// - The order book is not present in the cache.
+    /// - The cache is already mutably borrowed.
     pub fn try_order_book(
         &self,
         instrument_id: &InstrumentId,
@@ -1358,9 +1379,9 @@ impl<'a> CacheApi<'a> {
     ///
     /// # Errors
     ///
-    /// Returns:
-    /// - [`OwnOrderBookLookupError::NotFound`] when the own order book is not present in the cache.
-    /// - [`OwnOrderBookLookupError::Access`] if the cache is already mutably borrowed.
+    /// Returns an error if:
+    /// - The own order book is not present in the cache.
+    /// - The cache is already mutably borrowed.
     pub fn try_own_order_book(
         &self,
         instrument_id: &InstrumentId,
@@ -1370,7 +1391,7 @@ impl<'a> CacheApi<'a> {
             .cloned()
     }
 
-    /// Returns the latest quote for the `instrument_id` (if found).
+    /// Returns the most recently added quote for the `instrument_id` (if found).
     ///
     /// # Panics
     ///
@@ -1382,7 +1403,8 @@ impl<'a> CacheApi<'a> {
 
     /// Returns the quote at `index` for the `instrument_id` (if found).
     ///
-    /// Index 0 is the most recent.
+    /// Index 0 is the most recently added quote. See [`Cache::quote_at_index`] for ordering
+    /// and out-of-range behavior.
     ///
     /// # Panics
     ///
@@ -1392,7 +1414,7 @@ impl<'a> CacheApi<'a> {
         self.cache().quote_at_index(instrument_id, index).copied()
     }
 
-    /// Returns the latest trade for the `instrument_id` (if found).
+    /// Returns the most recently added trade for the `instrument_id` (if found).
     ///
     /// # Panics
     ///
@@ -1404,7 +1426,8 @@ impl<'a> CacheApi<'a> {
 
     /// Returns the trade at `index` for the `instrument_id` (if found).
     ///
-    /// Index 0 is the most recent.
+    /// Index 0 is the most recently added trade. See [`Cache::trade_at_index`] for ordering
+    /// and out-of-range behavior.
     ///
     /// # Panics
     ///
@@ -1414,7 +1437,7 @@ impl<'a> CacheApi<'a> {
         self.cache().trade_at_index(instrument_id, index).copied()
     }
 
-    /// Returns the latest mark price update for the `instrument_id` (if found).
+    /// Returns the most recently added mark price update for the `instrument_id` (if found).
     ///
     /// # Panics
     ///
@@ -1424,7 +1447,7 @@ impl<'a> CacheApi<'a> {
         self.cache().mark_price(instrument_id).copied()
     }
 
-    /// Returns the latest index price update for the `instrument_id` (if found).
+    /// Returns the most recently added index price update for the `instrument_id` (if found).
     ///
     /// # Panics
     ///
@@ -1434,7 +1457,7 @@ impl<'a> CacheApi<'a> {
         self.cache().index_price(instrument_id).copied()
     }
 
-    /// Returns the latest funding rate update for the `instrument_id` (if found).
+    /// Returns the most recently added funding rate update for the `instrument_id` (if found).
     ///
     /// # Panics
     ///
@@ -1444,7 +1467,7 @@ impl<'a> CacheApi<'a> {
         self.cache().funding_rate(instrument_id).copied()
     }
 
-    /// Returns the latest instrument status update for the `instrument_id` (if found).
+    /// Returns the most recently added instrument status update for the `instrument_id` (if found).
     ///
     /// # Panics
     ///
@@ -1456,6 +1479,8 @@ impl<'a> CacheApi<'a> {
 
     /// Returns the cached close for the `instrument_id` (if found).
     ///
+    /// See [`Cache::instrument_close`] for replacement behavior.
+    ///
     /// # Panics
     ///
     /// Panics if the cache is already mutably borrowed.
@@ -1464,7 +1489,7 @@ impl<'a> CacheApi<'a> {
         self.cache().instrument_close(instrument_id).copied()
     }
 
-    /// Returns the latest bar for the `bar_type` (if found).
+    /// Returns the most recent bar by `ts_event` for the `bar_type` (if found).
     ///
     /// # Panics
     ///
@@ -1476,7 +1501,8 @@ impl<'a> CacheApi<'a> {
 
     /// Returns the bar at `index` for the `bar_type` (if found).
     ///
-    /// Index 0 is the most recent.
+    /// Index 0 is the most recent bar by `ts_event`. See [`Cache::bar_at_index`] for ordering
+    /// and out-of-range behavior.
     ///
     /// # Panics
     ///
@@ -1727,9 +1753,9 @@ impl<'a> CacheApi<'a> {
     ///
     /// # Errors
     ///
-    /// Returns:
-    /// - [`CurrencyLookupError::NotFound`] when the currency is not present in the cache.
-    /// - [`CurrencyLookupError::Access`] if the cache is already mutably borrowed.
+    /// Returns an error if:
+    /// - The currency is not present in the cache.
+    /// - The cache is already mutably borrowed.
     pub fn try_currency(&self, code: &Ustr) -> Result<Currency, CurrencyLookupError> {
         self.try_cache("try_currency")?.try_currency(code).copied()
     }
@@ -1748,9 +1774,9 @@ impl<'a> CacheApi<'a> {
     ///
     /// # Errors
     ///
-    /// Returns:
-    /// - [`InstrumentLookupError::NotFound`] when the instrument is not present in the cache.
-    /// - [`InstrumentLookupError::Access`] if the cache is already mutably borrowed.
+    /// Returns an error if:
+    /// - The instrument is not present in the cache.
+    /// - The cache is already mutably borrowed.
     pub fn try_instrument(
         &self,
         instrument_id: &InstrumentId,
@@ -1841,10 +1867,10 @@ impl<'a> CacheApi<'a> {
     ///
     /// # Errors
     ///
-    /// Returns:
-    /// - [`SyntheticInstrumentLookupError::NotFound`] when the synthetic instrument is not present
+    /// Returns an error if:
+    /// - The synthetic instrument is not present
     ///   in the cache.
-    /// - [`SyntheticInstrumentLookupError::Access`] if the cache is already mutably borrowed.
+    /// - The cache is already mutably borrowed.
     pub fn try_synthetic(
         &self,
         instrument_id: &InstrumentId,
@@ -1958,9 +1984,9 @@ impl<'a> CacheApi<'a> {
     ///
     /// # Errors
     ///
-    /// Returns:
-    /// - [`AccountLookupError::NotFound`] when the account is not present in the cache.
-    /// - [`AccountLookupError::Access`] if the cache is already mutably borrowed.
+    /// Returns an error if:
+    /// - The account is not present in the cache.
+    /// - The cache is already mutably borrowed.
     pub fn try_account(&self, account_id: &AccountId) -> Result<AccountAny, AccountLookupError> {
         self.try_cache("try_account")?
             .try_account(account_id)
@@ -1968,6 +1994,8 @@ impl<'a> CacheApi<'a> {
     }
 
     /// Returns an owned copy of the account for the `venue` (if found).
+    ///
+    /// Returns `None` when more than one account is issued under the `venue`.
     ///
     /// # Panics
     ///
@@ -1978,6 +2006,8 @@ impl<'a> CacheApi<'a> {
     }
 
     /// Returns the account ID for the `venue` (if found).
+    ///
+    /// Returns `None` when more than one account is issued under the `venue`.
     ///
     /// # Panics
     ///

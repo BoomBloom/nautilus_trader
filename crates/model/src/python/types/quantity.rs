@@ -399,8 +399,8 @@ impl Quantity {
         self.raw() / scale
     }
 
-    fn __float__(&self) -> f64 {
-        self.as_f64()
+    fn __float__(&self) -> PyResult<f64> {
+        self.as_f64_checked()
     }
 
     #[pyo3(signature = (ndigits=None))]
@@ -466,15 +466,15 @@ impl Quantity {
         Self::from_str(value).map_err(to_pyvalue_err)
     }
 
-    /// Creates a new `Quantity` from a `Decimal` value with precision inferred from the decimal's scale.
+    /// Creates a `Quantity` from a `Decimal`, inferring precision up to the supported maximum.
     ///
-    /// The precision is determined by the scale of the decimal (number of decimal places).
-    /// The value is rounded to the inferred precision using banker's rounding (round half to even).
+    /// Preserves the decimal's scale up to `FIXED_PRECISION` (18 with `defi`).
+    /// Rounds excess fractional digits using round half to even.
     ///
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The inferred precision exceeds `FIXED_PRECISION`.
+    /// - The decimal value is negative.
     /// - The decimal value cannot be converted to the raw representation.
     /// - Overflow occurs during scaling.
     #[staticmethod]
@@ -531,8 +531,8 @@ impl Quantity {
     }
 
     #[pyo3(name = "as_double")]
-    fn py_as_double(&self) -> f64 {
-        self.as_f64()
+    fn py_as_double(&self) -> PyResult<f64> {
+        self.as_f64_checked()
     }
 
     #[pyo3(name = "to_formatted_str")]
@@ -639,6 +639,24 @@ mod tests {
             assert_eq!(
                 error.to_string(),
                 format!("ValueError: raw value {raw} exceeds QUANTITY_RAW_MAX={QUANTITY_RAW_MAX}")
+            );
+        });
+    }
+
+    #[rstest]
+    fn test_py_from_raw_rejects_spurious_digits() {
+        Python::initialize();
+        Python::attach(|_| {
+            let precision = FIXED_PRECISION - 1;
+            let error = Quantity::py_from_raw(1, precision).unwrap_err();
+
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "ValueError: Invalid fixed-point raw value 1 for precision {precision}: \
+                 remainder 1 when divided by scale 10. Raw value should be a multiple of 10. \
+                 This indicates data corruption or incorrect precision/scaling upstream"
+                )
             );
         });
     }

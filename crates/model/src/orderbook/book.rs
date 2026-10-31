@@ -107,6 +107,29 @@ impl OrderBook {
         }
     }
 
+    /// Returns the serialized L1 batch state for one side.
+    ///
+    /// Codes are 0 for no batch, 1 for an MBP batch, and 2 for a snapshot batch.
+    #[must_use]
+    pub fn batch_state_code(&self, side: OrderSide) -> u8 {
+        match side {
+            OrderSide::Buy => self.bids.batch_state_code(),
+            OrderSide::Sell => self.asks.batch_state_code(),
+        }
+    }
+
+    /// Restores one side's serialized L1 batch state after restoring its orders.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `code` is unknown, or nonzero on a non-L1 book.
+    pub fn set_batch_state_code(&mut self, side: OrderSide, code: u8) -> CorrectnessResult<()> {
+        match side {
+            OrderSide::Buy => self.bids.set_batch_state_code(code),
+            OrderSide::Sell => self.asks.set_batch_state_code(code),
+        }
+    }
+
     /// Resets the order book to its initial empty state.
     pub fn reset(&mut self) {
         self.bids.clear();
@@ -551,9 +574,11 @@ impl OrderBook {
     ///
     /// See [`Self::apply_delta_unchecked`] for details on why this function exists.
     ///
-    /// # Errors
-    ///
-    /// This function currently does not return errors, but returns `Result` for API consistency.
+    /// This function does not return errors, but returns `Result` for API consistency.
+    #[allow(
+        clippy::missing_errors_doc,
+        reason = "unchecked depth application returns no integrity errors"
+    )]
     pub fn apply_depth_unchecked(
         &mut self,
         depth: &OrderBookDepth,
@@ -780,8 +805,7 @@ impl OrderBook {
     ///
     /// # Errors
     ///
-    /// Returns [`BookViewError::InstrumentMismatch`] if `self` and `own_book` have different
-    /// instrument IDs.
+    /// Returns an error if `self` and `own_book` have different instrument IDs.
     ///
     /// # Panics
     ///
@@ -875,9 +899,10 @@ impl OrderBook {
         let mut public_map = group_levels(self.bids(None), group_size, depth, true);
 
         if let Some(own_book) = own_book {
+            // Leave own buckets untruncated so better-priced ones cannot evict those within depth
             filter_quantities(
                 &mut public_map,
-                own_book.bid_quantity(status, depth, Some(group_size), accepted_buffer_ns, now),
+                own_book.bid_quantity(status, None, Some(group_size), accepted_buffer_ns, now),
             );
         }
 
@@ -907,9 +932,10 @@ impl OrderBook {
         let mut public_map = group_levels(self.asks(None), group_size, depth, false);
 
         if let Some(own_book) = own_book {
+            // Leave own buckets untruncated so better-priced ones cannot evict those within depth
             filter_quantities(
                 &mut public_map,
-                own_book.ask_quantity(status, depth, Some(group_size), accepted_buffer_ns, now),
+                own_book.ask_quantity(status, None, Some(group_size), accepted_buffer_ns, now),
             );
         }
 
@@ -996,7 +1022,9 @@ impl OrderBook {
         analysis::get_worst_px_for_quantity(qty, levels)
     }
 
-    /// Calculates average price and quantity for target exposure. Returns (price, quantity, `executed_exposure`).
+    /// Calculates average price and quantity for target exposure.
+    ///
+    /// Returns (average price, quantity, last-touched price).
     #[must_use]
     pub fn get_avg_px_qty_for_exposure(
         &self,
@@ -1322,9 +1350,12 @@ impl OrderBook {
     /// Replays `deltas` through a fresh book of the given type and returns
     /// a [`QuoteTick`] for every best-bid/ask price change.
     ///
+    /// Both quote sizes use the maximum size precision at the best bid and ask.
+    /// Aggregation rescales quantities exactly without rounding.
+    ///
     /// # Panics
     ///
-    /// Panics if `deltas` is empty.
+    /// Panics if `deltas` is empty or an aggregate size cannot be represented.
     #[must_use]
     pub fn deltas_to_quotes(book_type: BookType, deltas: &[OrderBookDelta]) -> Vec<QuoteTick> {
         assert!(!deltas.is_empty(), "`deltas` must not be empty");
@@ -1350,9 +1381,27 @@ impl OrderBook {
             last_bbo = Some(bbo);
             let bid_level = book.bids.top().unwrap();
             let ask_level = book.asks.top().unwrap();
-            let precision = bid_level.first().unwrap().size.precision;
-            let bid_sz = Quantity::from_raw(bid_level.size_raw(), precision);
-            let ask_sz = Quantity::from_raw(ask_level.size_raw(), precision);
+            let precision = bid_level
+                .iter()
+                .chain(ask_level.iter())
+                .map(|order| order.size.precision)
+                .max()
+                .expect("Best bid and ask levels contain orders");
+
+            let [bid_sz, ask_sz] = [bid_level, ask_level].map(|level| {
+                level
+                    .iter()
+                    .fold(Quantity::zero(precision), |total, order| {
+                        let size = order
+                            .size
+                            .checked_rescale(precision)
+                            .expect("Book order size must fit the quote precision");
+                        total
+                            .checked_add(size)
+                            .expect("Total book size must fit the quote quantity")
+                    })
+            });
+
             let quote = QuoteTick::new(
                 instrument_id,
                 bid_px,

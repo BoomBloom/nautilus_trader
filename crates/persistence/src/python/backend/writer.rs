@@ -17,7 +17,6 @@
 
 use std::{
     cell::RefCell,
-    collections::HashMap,
     rc::Rc,
     sync::{Arc, atomic::AtomicU64},
 };
@@ -25,12 +24,13 @@ use std::{
 use nautilus_common::{clock::Clock, python::clock::PyClock};
 use nautilus_model::data::{
     Bar, CustomData, Data, IndexPriceUpdate, InstrumentClose, MarkPriceUpdate, OrderBookDelta,
-    OrderBookDepth, QuoteTick, TradeTick,
+    OrderBookDeltas, OrderBookDepth, QuoteTick, TradeTick,
 };
 use pyo3::{exceptions::PyIOError, prelude::*};
 
 use crate::{
     backend::default_writer_factories,
+    config::DataCatalogConfig,
     writer::{
         factory::{WriterBackendType, WriterConnectConfig, create_writer},
         feather::WriterClock,
@@ -43,8 +43,9 @@ type ClockBridge = (Rc<RefCell<dyn Clock>>, Arc<AtomicU64>);
 
 /// Python binding for the backend-selected streaming writer.
 ///
-/// Resolves the writer through the persistence writer-factory registry, mirroring
-/// `writer_backend` selection: `Feather`, `Parquet`, or a registered name.
+/// Appends Feather files under a local directory. With a `catalog`, the writer for that catalog's
+/// backend (`Parquet` or a registered name) also promotes the files into it; without one, the
+/// `Feather` writer keeps only the Feather files.
 #[pyclass(
     name = "StreamingWriter",
     module = "nautilus_trader.persistence",
@@ -62,24 +63,25 @@ pub struct PyStreamingWriter {
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl PyStreamingWriter {
-    /// Creates a streaming writer for the given backend name.
+    /// Creates a streaming writer for the local `path`, promoting into `catalog` when given.
     #[new]
-    #[pyo3(signature = (backend, path, clock, storage_options=None))]
+    #[pyo3(signature = (path, clock, catalog=None))]
     #[expect(clippy::needless_pass_by_value)]
     pub fn py_new(
-        backend: &str,
         path: String,
         clock: PyClock,
-        storage_options: Option<HashMap<String, String>>,
+        catalog: Option<DataCatalogConfig>,
     ) -> PyResult<Self> {
-        let backend_type = backend
-            .parse::<WriterBackendType>()
-            .map_err(|e| PyIOError::new_err(format!("Invalid writer backend: {e}")))?;
+        let backend_type = catalog.as_ref().map_or(
+            WriterBackendType::Feather,
+            DataCatalogConfig::writer_backend,
+        );
         let clock_rc = clock.clock_rc();
         let (writer_clock, shared_time) = WriterClock::from_shared_clock(&clock_rc);
+
         let config = WriterConnectConfig::new(
             path,
-            storage_options.map(|options| options.into_iter().collect()),
+            catalog.as_ref().map(DataCatalogConfig::connect_config),
         );
         let sink = create_writer(
             &backend_type,
@@ -153,6 +155,12 @@ pub(crate) fn pyobject_to_data(py: Python, data: Py<PyAny>) -> PyResult<Data> {
 
     if data.is_instance_of::<OrderBookDelta>() {
         return Ok(Data::BookDelta(data.extract::<OrderBookDelta>()?));
+    }
+
+    if data.is_instance_of::<OrderBookDeltas>() {
+        return Ok(Data::BookDeltas(Box::new(
+            data.extract::<OrderBookDeltas>()?,
+        )));
     }
 
     if data.is_instance_of::<OrderBookDepth>() {

@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::{collections::BTreeSet, fmt::Display, pin::Pin};
+use std::{collections::BTreeSet, fmt::Display, pin::Pin, sync::Arc};
 
 use alloy::primitives::{Address, U256};
 use anyhow::Context;
@@ -1306,7 +1306,7 @@ impl BlockchainCacheDatabase {
                 rows.into_iter()
                     .map(|token_row| {
                         Token::new(
-                            chain.clone(),
+                            Arc::clone(&chain),
                             token_row.address,
                             token_row.name,
                             token_row.symbol,
@@ -2442,9 +2442,7 @@ impl BlockchainCacheDatabase {
                 .try_get::<Option<String>, _>("block_timestamp")?
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "Missing block timestamp for pool snapshot {} at block {}",
-                        pool_identifier,
-                        block
+                        "Missing block timestamp for pool snapshot {pool_identifier} at block {block}"
                     )
                 })?;
             let timestamp = parse_cached_block_timestamp(&block_timestamp)
@@ -2530,7 +2528,7 @@ impl BlockchainCacheDatabase {
             let dex_name = row
                 .try_get::<Option<String>, _>("dex_name")?
                 .ok_or_else(|| {
-                    anyhow::anyhow!("Missing dex_name for pool snapshot {}", pool_identifier)
+                    anyhow::anyhow!("Missing dex_name for pool snapshot {pool_identifier}")
                 })?;
             let chain = Chain::from_chain_id(chain_id)
                 .ok_or_else(|| anyhow::anyhow!("Unknown chain_id: {chain_id}"))?;
@@ -3263,10 +3261,13 @@ impl BlockchainCacheDatabase {
 
         // Transform rows to events
         let stream = query.map(move |row_result| match row_result {
-            Ok(row) => {
-                transform_row_to_dex_pool_data(&row, chain.clone(), dex.clone(), instrument_id)
-                    .map_err(|e| anyhow::anyhow!("Steam pool event transform error: {e}"))
-            }
+            Ok(row) => transform_row_to_dex_pool_data(
+                &row,
+                Arc::clone(&chain),
+                Arc::clone(&dex),
+                instrument_id,
+            )
+            .map_err(|e| anyhow::anyhow!("Steam pool event transform error: {e}")),
             Err(e) => Err(anyhow::anyhow!("Stream pool events database error: {e}")),
         });
 
@@ -3598,8 +3599,7 @@ impl BlockchainCacheDatabase {
             && installed_version > EXECUTION_SCHEMA_VERSION
         {
             anyhow::bail!(
-                "Execution schema version {} is newer than supported version {EXECUTION_SCHEMA_VERSION}",
-                installed_version
+                "Execution schema version {installed_version} is newer than supported version {EXECUTION_SCHEMA_VERSION}"
             );
         }
 
@@ -5752,8 +5752,9 @@ impl BlockchainCacheDatabase {
     ///
     /// # Errors
     ///
-    /// Returns a stage-classified error if the signer or client order is already owned, or
-    /// persistence fails. A commit-stage error does not prove the transaction rolled back.
+    /// Returns an error if the signer or client order is already owned, or persistence fails. A
+    /// commit-stage error does not prove the transaction rolled back. The error identifies the
+    /// failure stage.
     pub async fn reserve_execution_intent(
         &self,
         intent: &ExecutionIntentInsert,

@@ -76,12 +76,14 @@ pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
 nautilus-data = { workspace = true }
+nautilus-live = { workspace = true }
 nautilus-testkit = { workspace = true, default-features = false, features = [
   "testers",
 ] }
 nautilus-trading = { workspace = true }
 
 rstest = { workspace = true }
+rust_decimal_macros = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 

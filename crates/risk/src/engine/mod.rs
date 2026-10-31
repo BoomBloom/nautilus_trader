@@ -52,7 +52,7 @@ use nautilus_model::{
         OrderDenied, OrderDeniedReason, OrderEventAny, OrderModifyRejected, OrderPriceField,
         OrderUpdated, PositionEvent,
     },
-    identifiers::{AccountId, InstrumentId},
+    identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
     orders::{LIMIT_ORDER_TYPES, Order, OrderAny, STOP_ORDER_TYPES},
     types::{Currency, Money, Price, Quantity, quantity::QuantityRaw},
@@ -80,6 +80,7 @@ pub struct RiskEngine {
     max_notional_per_order: AHashMap<InstrumentId, Decimal>,
     throttler_submit: Throttler<TradingCommand, SubmitCommandFn>,
     throttler_modify: Throttler<ModifyOrder, ModifyOrderFn>,
+    reservations: Vec<Reservation>,
     command_count: u64,
     event_count: u64,
 }
@@ -106,8 +107,10 @@ impl RiskEngine {
         clock: Rc<RefCell<dyn Clock>>,
         cache: Rc<RefCell<Cache>>,
     ) -> Self {
-        let throttler_submit = Self::create_submit_throttler(&config, clock.clone(), cache.clone());
-        let throttler_modify = Self::create_modify_throttler(&config, clock.clone(), cache.clone());
+        let throttler_submit =
+            Self::create_submit_throttler(&config, Rc::clone(&clock), Rc::clone(&cache));
+        let throttler_modify =
+            Self::create_modify_throttler(&config, Rc::clone(&clock), Rc::clone(&cache));
         let max_notional_per_order = config.max_notional_per_order.clone();
 
         Self {
@@ -119,6 +122,7 @@ impl RiskEngine {
             max_notional_per_order,
             throttler_submit,
             throttler_modify,
+            reservations: Vec::new(),
             command_count: 0,
             event_count: 0,
         }
@@ -213,7 +217,7 @@ impl RiskEngine {
 
         let failure_handler = {
             let cache = cache;
-            let clock = clock.clone();
+            let clock = Rc::clone(&clock);
             Box::new(move |command: TradingCommand| {
                 let reason = OrderDeniedReason::RateLimitExceeded.to_string();
 
@@ -292,7 +296,7 @@ impl RiskEngine {
 
         let failure_handler = {
             let cache = cache;
-            let clock = clock.clone();
+            let clock = Rc::clone(&clock);
             Box::new(move |order: ModifyOrder| {
                 let reason = "Exceeded MAX_ORDER_MODIFY_RATE";
                 log::warn!(
@@ -457,9 +461,13 @@ impl RiskEngine {
         self.throttler_submit.reset();
         self.throttler_modify.reset();
         self.max_notional_per_order = self.config.max_notional_per_order.clone();
-        self.trading_state = TradingState::Active;
+        self.reservations.clear();
         self.command_count = 0;
         self.event_count = 0;
+
+        if self.trading_state != TradingState::Active {
+            self.set_trading_state(TradingState::Active);
+        }
 
         log::info!("Reset");
     }
@@ -556,6 +564,8 @@ impl RiskEngine {
             log::debug!("{CMD}{RECV} {command}");
         }
 
+        self.release_reservations();
+
         match command {
             TradingCommand::SubmitOrder(submit_order) => self.handle_submit_order(submit_order),
             TradingCommand::SubmitOrderList(submit_order_list) => {
@@ -641,11 +651,17 @@ impl RiskEngine {
             return; // Denied
         }
 
-        if !self.check_orders_risk(&instrument, &[order], full_position_exit, RiskCheck::Submit) {
+        let Some(reservations) = self.check_orders_risk(
+            &instrument,
+            &[order],
+            full_position_exit,
+            RiskCheck::Submit,
+            command.client_id,
+        ) else {
             return; // Denied
-        }
+        };
 
-        self.execution_gateway(TradingCommand::SubmitOrder(command));
+        self.execution_gateway(TradingCommand::SubmitOrder(command), reservations);
     }
 
     fn is_full_position_exit(
@@ -726,19 +742,26 @@ impl RiskEngine {
         order: &OrderAny,
     ) -> Option<(PositionSide, Quantity)> {
         let position_id = command.position_id?;
+        let account_id =
+            self.order_account_id(order, command.client_id, command.instrument_id.venue);
+
         let position = {
             let cache = self.cache.borrow();
             if cache.position_id(&order.client_order_id()).copied() != Some(position_id) {
                 return None;
             }
-            cache.position(&position_id).map(|position| {
-                (
-                    position.is_open(),
-                    position.instrument_id,
-                    position.side,
-                    position.quantity,
-                )
-            })
+
+            cache
+                .position(&position_id)
+                .filter(|position| account_id == Some(position.account_id))
+                .map(|position| {
+                    (
+                        position.is_open(),
+                        position.instrument_id,
+                        position.side,
+                        position.quantity,
+                    )
+                })
         };
         let (is_open, position_instrument_id, position_side, position_quantity) = position?;
 
@@ -794,7 +817,7 @@ impl RiskEngine {
             instruments.insert(instrument_id, instrument);
         }
 
-        for order in &orders {
+        for (index, order) in orders.iter().enumerate() {
             let Some(instrument) = instruments.get(&order.instrument_id()) else {
                 self.deny_order(
                     order,
@@ -807,6 +830,13 @@ impl RiskEngine {
             };
 
             if !self.check_order(instrument, order, false) {
+                let reason = OrderDeniedReason::OrderListDenied {
+                    order_list_id: command.order_list.id,
+                }
+                .to_string();
+
+                self.deny_order_list(&orders[..index], &reason);
+                self.deny_order_list(&orders[index + 1..], &reason);
                 return; // Denied
             }
         }
@@ -824,7 +854,13 @@ impl RiskEngine {
             return; // Denied
         };
 
-        if !self.check_orders_risk(&representative, &orders, false, RiskCheck::Submit) {
+        let Some(reservations) = self.check_orders_risk(
+            &representative,
+            &orders,
+            false,
+            RiskCheck::Submit,
+            command.client_id,
+        ) else {
             self.deny_order_list(
                 &orders,
                 &OrderDeniedReason::OrderListDenied {
@@ -833,9 +869,9 @@ impl RiskEngine {
                 .to_string(),
             );
             return; // Denied
-        }
+        };
 
-        self.execution_gateway(TradingCommand::SubmitOrderList(command));
+        self.execution_gateway(TradingCommand::SubmitOrderList(command), reservations);
     }
 
     fn handle_modify_order(&mut self, command: ModifyOrder) {
@@ -845,7 +881,7 @@ impl RiskEngine {
         }
 
         if !self.validate_modify_order(&command)
-            || !self.check_modify_orders_risk(std::slice::from_ref(&command))
+            || !self.check_modify_orders_risk(std::slice::from_ref(&command), command.client_id)
         {
             return;
         }
@@ -868,7 +904,7 @@ impl RiskEngine {
             return;
         }
 
-        if !self.check_modify_orders_risk(&command.modifies) {
+        if !self.check_modify_orders_risk(&command.modifies, command.client_id) {
             return;
         }
 
@@ -1048,7 +1084,11 @@ impl RiskEngine {
         true
     }
 
-    fn check_modify_orders_risk(&self, commands: &[ModifyOrder]) -> bool {
+    fn check_modify_orders_risk(
+        &self,
+        commands: &[ModifyOrder],
+        client_id: Option<ClientId>,
+    ) -> bool {
         let mut originals = Vec::with_capacity(commands.len());
         let mut orders = Vec::with_capacity(commands.len());
         let cache = self.cache.borrow();
@@ -1099,7 +1139,8 @@ impl RiskEngine {
             return false;
         };
 
-        self.check_orders_risk(&instrument, &orders, false, check)
+        self.check_orders_risk(&instrument, &orders, false, check, client_id)
+            .is_some()
     }
 
     fn check_order(
@@ -1187,28 +1228,102 @@ impl RiskEngine {
         orders: &[OrderAny],
         full_position_exit: bool,
         check: RiskCheck<'_>,
-    ) -> bool {
+        client_id: Option<ClientId>,
+    ) -> Option<Vec<Reservation>> {
+        let venue = instrument.id().venue;
         let mut orders_by_account: AHashMap<Option<AccountId>, Vec<&OrderAny>> = AHashMap::new();
         for order in orders {
             orders_by_account
-                .entry(order.account_id())
+                .entry(self.order_account_id(order, client_id, venue))
                 .or_default()
                 .push(order);
         }
 
+        let mut reservations = Vec::new();
+
         for (account_id, account_orders) in &orders_by_account {
-            if !self.check_orders_risk_for_account(
+            reservations.extend(self.check_orders_risk_for_account(
                 instrument,
                 account_orders,
                 *account_id,
+                client_id,
                 full_position_exit,
                 check,
-            ) {
-                return false;
-            }
+            )?);
         }
 
-        true
+        Some(reservations)
+    }
+
+    // Holds the free balance of orders sent for execution until their account reflects them,
+    // replacing any earlier reservation of a re-checked order
+    fn record_reservations(&mut self, reservations: Vec<Reservation>) {
+        self.reservations.retain(|held| {
+            reservations
+                .iter()
+                .all(|reservation| reservation.client_order_id != held.client_order_id)
+        });
+        self.reservations.extend(reservations);
+    }
+
+    fn release_reservations(&mut self) {
+        if self.reservations.is_empty() {
+            return;
+        }
+
+        let cache = self.cache.borrow();
+        self.reservations.retain(|reservation| {
+            cache
+                .order(&reservation.client_order_id)
+                .is_some_and(|order| !reservation.is_released(&order))
+        });
+    }
+
+    // Orders under check are valued again, so their own reservations are excluded
+    fn unreflected_reservations(&self, account_id: AccountId, orders: &[&OrderAny]) -> Vec<Money> {
+        self.reservations
+            .iter()
+            .filter(|reservation| {
+                reservation.account_id == account_id
+                    && orders
+                        .iter()
+                        .all(|order| order.client_order_id() != reservation.client_order_id)
+            })
+            .map(|reservation| reservation.amount)
+            .collect()
+    }
+
+    // An order without an assigned account uses the account of the client that command routing
+    // selects: a registered command client, else the venue route or default client. An external
+    // client, or a command no registered client handles, uses the single account issued under the
+    // venue.
+    fn order_account_id(
+        &self,
+        order: &OrderAny,
+        client_id: Option<ClientId>,
+        venue: Venue,
+    ) -> Option<AccountId> {
+        if let Some(account_id) = order.account_id() {
+            return Some(account_id);
+        }
+
+        let cache = self.cache.borrow();
+
+        let routed_account_id = || {
+            cache
+                .client_id_for_venue(&venue)
+                .and_then(|client_id| cache.account_id_for_client(client_id))
+        };
+
+        let account_id = match client_id {
+            Some(client_id) if cache.is_external_exec_client(&client_id) => None,
+            Some(client_id) => cache
+                .account_id_for_client(&client_id)
+                .or_else(routed_account_id),
+            None => routed_account_id(),
+        };
+
+        account_id.or_else(|| cache.account_id(&venue)).copied()
     }
 
     #[allow(
@@ -1220,14 +1335,15 @@ impl RiskEngine {
         instrument: &InstrumentAny,
         orders: &[&OrderAny],
         account_id: Option<AccountId>,
+        client_id: Option<ClientId>,
         full_position_exit: bool,
         check: RiskCheck<'_>,
-    ) -> bool {
+    ) -> Option<Vec<Reservation>> {
         let max_notional = match self.order_notional_limit(instrument) {
             Ok(limit) => limit,
             Err(reason) => {
                 check.reject_orders(self, orders, &reason.to_string());
-                return false;
+                return None;
             }
         };
 
@@ -1244,20 +1360,12 @@ impl RiskEngine {
             market_prices.push(price);
         }
 
-        // Get account for risk checks: use explicit account_id if provided, otherwise venue lookup
-        let resolved_account = {
-            let cache = self.cache.borrow();
-
-            if let Some(account_id) = account_id {
-                cache
-                    .account(&account_id)
-                    .map(|account| account.clone_without_events())
-            } else {
-                cache
-                    .account_for_venue(&instrument.id().venue)
-                    .map(|account| account.clone_without_events())
-            }
-        };
+        let resolved_account = account_id.and_then(|account_id| {
+            self.cache
+                .borrow()
+                .account(&account_id)
+                .map(|account| account.clone_without_events())
+        });
 
         let Some(account) = resolved_account else {
             check.reject_orders(
@@ -1265,14 +1373,14 @@ impl RiskEngine {
                 orders,
                 &OrderDeniedReason::ValidationFailed {
                     detail: format!(
-                        "No account available for risk checks: instrument_id={}, account_id={account_id:?}",
+                        "No account available for risk checks: instrument_id={}, client_id={client_id:?}, account_id={account_id:?}",
                         instrument.id()
                     ),
                 }
                 .to_string(),
             );
 
-            return false;
+            return None;
         };
 
         let allow_borrowing = match &account {
@@ -1282,6 +1390,7 @@ impl RiskEngine {
 
         let available_long_qty_raw = self.available_position_quantity(
             instrument.id(),
+            account.id(),
             PositionSide::Long,
             OrderSide::Sell,
             check,
@@ -1291,6 +1400,7 @@ impl RiskEngine {
             if matches!(account, AccountAny::Margin(_) | AccountAny::Betting(_)) {
                 self.available_position_quantity(
                     instrument.id(),
+                    account.id(),
                     PositionSide::Short,
                     OrderSide::Buy,
                     check,
@@ -1298,6 +1408,12 @@ impl RiskEngine {
             } else {
                 0
             };
+
+        // Amendments are checked against the account alone and stay venue-enforced
+        let unreflected = match check {
+            RiskCheck::Submit => self.unreflected_reservations(account.id(), orders),
+            RiskCheck::Modify(_) => Vec::new(),
+        };
 
         let mut risk = AccountRisk {
             engine: self,
@@ -1316,15 +1432,17 @@ impl RiskEngine {
             cum_notional_buy: None,
             cum_notional_sell: None,
             cum_margin_required: None,
+            unreflected,
+            reservations: Vec::new(),
         };
 
         for (&order, market_price) in orders.iter().zip(market_prices) {
             if !risk.check_order(order, market_price) {
-                return false;
+                return None;
             }
         }
 
-        true
+        Some(risk.reservations)
     }
 
     fn order_notional_limit(
@@ -1346,18 +1464,31 @@ impl RiskEngine {
     fn available_position_quantity(
         &self,
         instrument_id: InstrumentId,
+        account_id: AccountId,
         position_side: PositionSide,
         order_side: OrderSide,
         check: RiskCheck<'_>,
     ) -> QuantityRaw {
         let cache = self.cache.borrow();
         let position_quantity: QuantityRaw = cache
-            .positions_open(None, Some(&instrument_id), None, None, Some(position_side))
+            .positions_open(
+                None,
+                Some(&instrument_id),
+                None,
+                Some(&account_id),
+                Some(position_side),
+            )
             .iter()
             .map(|position| position.quantity.raw())
             .sum();
         let pending_quantity: QuantityRaw = cache
-            .orders_open(None, Some(&instrument_id), None, None, Some(order_side))
+            .orders_open(
+                None,
+                Some(&instrument_id),
+                None,
+                Some(&account_id),
+                Some(order_side),
+            )
             .iter()
             .filter(|order| check.original(order).is_none())
             .map(|order| order.leaves_qty().raw())
@@ -1498,14 +1629,11 @@ impl RiskEngine {
         allow_borrowing: bool,
         order: &OrderAny,
         quantity: Quantity,
-        base_currency: Currency,
+        base_free: Money,
         cum_notional_sell: &mut Option<Money>,
-    ) -> bool {
-        let base_free = account
-            .balance_free(Some(base_currency))
-            .unwrap_or_else(|| Money::zero(base_currency));
-
-        let cash_value = match Money::from_quantity(quantity, base_free.currency) {
+    ) -> Result<Money, ()> {
+        let base_currency = base_free.currency;
+        let cash_value = match Money::from_quantity(quantity, base_currency) {
             Ok(value) => value,
             Err(e) => {
                 check.reject(
@@ -1517,7 +1645,7 @@ impl RiskEngine {
                     .to_string(),
                 );
 
-                return false;
+                return Err(());
             }
         };
 
@@ -1529,7 +1657,7 @@ impl RiskEngine {
         }
 
         if !self.accumulate_notional(check, order, cum_notional_sell, cash_value) {
-            return false;
+            return Err(());
         }
 
         if self.config.debug {
@@ -1549,10 +1677,10 @@ impl RiskEngine {
                 }
                 .to_string(),
             );
-            return false;
+            return Err(());
         }
 
-        true
+        Ok(cash_value)
     }
 
     fn accumulate_notional(
@@ -1710,13 +1838,20 @@ impl RiskEngine {
             reason
         );
 
-        if order.status() != OrderStatus::Initialized {
+        if !matches!(
+            order.status(),
+            OrderStatus::Initialized | OrderStatus::Released
+        ) {
             return;
         }
 
         // Scope the cache borrow to avoid RefCell conflict when sending to ExecEngine
         {
             let mut cache = self.cache.borrow_mut();
+            if cache.is_order_dispatched(&order.client_order_id()) {
+                return;
+            }
+
             if !cache.order_exists(&order.client_order_id())
                 && let Err(e) = cache.add_order(order.clone(), None, None, false)
             {
@@ -1768,7 +1903,7 @@ impl RiskEngine {
         msgbus::send_order_event(endpoint, denied);
     }
 
-    fn execution_gateway(&mut self, command: TradingCommand) {
+    fn execution_gateway(&mut self, command: TradingCommand, reservations: Vec<Reservation>) {
         match self.trading_state {
             TradingState::Halted => match command {
                 TradingCommand::SubmitOrder(submit_order) => {
@@ -1805,6 +1940,7 @@ impl RiskEngine {
                     };
 
                     if self.is_reducing_submission(&submit_order, &order) {
+                        self.record_reservations(reservations);
                         self.throttler_submit
                             .send(TradingCommand::SubmitOrder(submit_order));
                     } else {
@@ -1839,6 +1975,7 @@ impl RiskEngine {
             },
             TradingState::Active => match command {
                 TradingCommand::SubmitOrder(_) | TradingCommand::SubmitOrderList(_) => {
+                    self.record_reservations(reservations);
                     self.throttler_submit.send(command);
                 }
                 _ => {}
@@ -1863,6 +2000,22 @@ impl RiskEngine {
         if self.config.debug {
             log::debug!("{RECV}{EVT} {event:?}");
         }
+    }
+}
+
+// Free balance an approved order uses until its account reflects the order
+struct Reservation {
+    client_order_id: ClientOrderId,
+    account_id: AccountId,
+    amount: Money,
+    wallet: bool,
+}
+
+impl Reservation {
+    // Accounts reflect open orders, and wallet accounts also in-flight orders, in their locked
+    // balances. A closed order no longer uses free balance.
+    fn is_released(&self, order: &OrderAny) -> bool {
+        order.is_open() || order.is_closed() || (self.wallet && order.is_inflight())
     }
 }
 
@@ -1928,9 +2081,59 @@ struct AccountRisk<'a> {
     cum_notional_buy: Option<Money>,
     cum_notional_sell: Option<Money>,
     cum_margin_required: Option<Money>,
+    unreflected: Vec<Money>,
+    reservations: Vec<Reservation>,
 }
 
 impl AccountRisk<'_> {
+    // Orders approved by earlier commands still use free balance until the account reflects them
+    fn balance_free(&self, order: &OrderAny, currency: Currency) -> Result<Money, ()> {
+        let free = self
+            .account
+            .balance_free(Some(currency))
+            .unwrap_or_else(|| Money::zero(currency));
+
+        self.unreflected
+            .iter()
+            .filter(|amount| amount.currency == currency)
+            .try_fold(free, |free, amount| self.deduct_reservation(free, *amount))
+            .map_err(|detail| {
+                self.check.reject(
+                    self.engine,
+                    order,
+                    &OrderDeniedReason::NotionalCalculationFailed { detail }.to_string(),
+                );
+            })
+    }
+
+    // Wallet reservations are held at the observed balance precision, and like the wallet's own
+    // locks they cannot be deducted once the observed precision has changed
+    fn deduct_reservation(&self, free: Money, amount: Money) -> Result<Money, String> {
+        if matches!(self.account, AccountAny::Wallet(_))
+            && amount.currency.precision != free.currency.precision
+        {
+            return Err(format!(
+                "reserved balance precision {} differed from balance precision {} for {}",
+                amount.currency.precision, free.currency.precision, free.currency
+            ));
+        }
+
+        free.checked_sub(amount).ok_or_else(|| {
+            "reserved balance exceeds Money bounds or has incompatible scale".to_string()
+        })
+    }
+
+    fn reserve_balance(&mut self, order: &OrderAny, amount: Money) {
+        if amount.is_positive() {
+            self.reservations.push(Reservation {
+                client_order_id: order.client_order_id(),
+                account_id: self.account.id(),
+                amount,
+                wallet: matches!(self.account, AccountAny::Wallet(_)),
+            });
+        }
+    }
+
     fn check_order(&mut self, order: &OrderAny, market_price: Option<Price>) -> bool {
         let Ok(last_px) = self.order_price(order, market_price) else {
             return false;
@@ -2070,17 +2273,17 @@ impl AccountRisk<'_> {
                         && let Some(unleveraged) = cash_or_wallet_account(&self.account)
                         && unleveraged.base_currency().is_none()
                         && let Some(base_currency) = self.instrument.base_currency()
-                        && !self.engine.check_cash_sell_balance(
+                    {
+                        let base_free = self.balance_free(order, base_currency)?;
+                        self.engine.check_cash_sell_balance(
                             self.check,
                             unleveraged,
                             self.allow_borrowing,
                             order,
                             order.quantity(),
-                            base_currency,
+                            base_free,
                             &mut self.cum_notional_sell,
-                        )
-                    {
-                        return Err(());
+                        )?;
                     }
 
                     self.engine
@@ -2259,12 +2462,13 @@ impl AccountRisk<'_> {
             }
         }
 
+        // Limits apply to exposure, so a negative price must not reduce the notional
         let notional = match self.instrument.try_calculate_notional_value(
             effective_quantity,
             last_px,
             Some(true),
         ) {
-            Ok(notional) => notional,
+            Ok(notional) => notional.abs(),
             Err(e) => {
                 self.check.reject(
                     self.engine,
@@ -2430,10 +2634,9 @@ impl AccountRisk<'_> {
         };
 
         // Inverse instruments can require collateral in the base currency
-        let free = self
-            .account
-            .balance_free(Some(required.currency))
-            .unwrap_or_else(|| Money::zero(required.currency));
+        let Ok(free) = self.balance_free(order, required.currency) else {
+            return false;
+        };
 
         if required > free {
             self.check.reject(
@@ -2487,6 +2690,7 @@ impl AccountRisk<'_> {
             return false;
         }
 
+        self.reserve_balance(order, required);
         true
     }
 
@@ -2530,10 +2734,10 @@ impl AccountRisk<'_> {
             return false;
         };
 
-        let free = self
-            .account
-            .balance_free(Some(impact.currency))
-            .unwrap_or_else(|| Money::zero(impact.currency));
+        let Ok(free) = self.balance_free(order, impact.currency) else {
+            return false;
+        };
+
         if !self.allow_borrowing && free.as_decimal() + impact.as_decimal() < Decimal::ZERO {
             self.check.reject(
                 self.engine,
@@ -2552,7 +2756,9 @@ impl AccountRisk<'_> {
             return self.check_cumulative_balance(order, -impact);
         }
 
-        if self.account.base_currency().is_some() {
+        // Without an instrument base currency there is no asset to check, so fall through to
+        // `check_asset_balance` rather than comparing sale proceeds against free collateral.
+        if self.instrument.base_currency().is_some() && self.account.base_currency().is_some() {
             return self.check_cumulative_balance(order, impact);
         }
 
@@ -2617,6 +2823,19 @@ impl AccountRisk<'_> {
                         .to_string(),
                     );
                 })?
+        } else if let Some(funding) =
+            self.wallet_buy_funding(order, quantity, price, notional.currency)
+        {
+            let funding = funding.map_err(|detail| {
+                self.check.reject(
+                    self.engine,
+                    order,
+                    &OrderDeniedReason::NotionalCalculationFailed { detail }.to_string(),
+                );
+            })?;
+
+            // Denials report the amount checked against free balance
+            return Ok((funding, -funding));
         } else {
             match order.order_side() {
                 OrderSide::Buy => -notional,
@@ -2625,6 +2844,43 @@ impl AccountRisk<'_> {
         };
 
         Ok((notional, impact))
+    }
+
+    // A wallet locks the quote amount of a quote-quantity buy, and the notional of any other buy
+    // rounded up at the observed balance precision, so that amount is checked and reserved.
+    // Without an observed balance in the funding currency, the buy is checked against zero free
+    // balance
+    fn wallet_buy_funding(
+        &self,
+        order: &OrderAny,
+        quantity: Quantity,
+        price: Price,
+        notional_currency: Currency,
+    ) -> Option<Result<Money, String>> {
+        let AccountAny::Wallet(wallet) = &self.account else {
+            return None;
+        };
+
+        if !order.is_buy() {
+            return None;
+        }
+
+        if order.is_quote_quantity() {
+            let quote_currency = self.instrument.quote_currency();
+            let currency = wallet
+                .balance_total(Some(quote_currency))
+                .map_or(quote_currency, |observed| observed.currency);
+            return Some(
+                Money::from_quantity(order.leaves_qty(), currency).map_err(|e| e.to_string()),
+            );
+        }
+
+        wallet.balance_total(Some(notional_currency))?;
+        Some(
+            wallet
+                .calculate_balance_locked(self.instrument, OrderSide::Buy, quantity, price, None)
+                .map_err(|e| e.to_string()),
+        )
     }
 
     fn balance_increase(
@@ -2640,25 +2896,29 @@ impl AccountRisk<'_> {
         let previous = if was_reducing {
             Ok(Money::zero(impact.currency))
         } else if let AccountAny::Betting(betting) = &mut self.account {
-            betting.calculate_balance_locked(
-                self.instrument,
-                order.order_side(),
-                quantity,
-                price,
-                None,
-            )
+            betting
+                .calculate_balance_locked(
+                    self.instrument,
+                    order.order_side(),
+                    quantity,
+                    price,
+                    None,
+                )
+                .map_err(|e| e.to_string())
+        } else if let Some(funding) = self.check.original(order).and_then(|original| {
+            self.wallet_buy_funding(original, quantity, price, impact.currency)
+        }) {
+            funding
         } else {
             self.instrument
                 .try_calculate_notional_value(quantity, price, None)
+                .map_err(|e| e.to_string())
         }
-        .map_err(|e| {
+        .map_err(|detail| {
             self.check.reject(
                 self.engine,
                 order,
-                &OrderDeniedReason::NotionalCalculationFailed {
-                    detail: e.to_string(),
-                }
-                .to_string(),
+                &OrderDeniedReason::NotionalCalculationFailed { detail }.to_string(),
             );
         })?;
 
@@ -2691,13 +2951,13 @@ impl AccountRisk<'_> {
             );
         }
 
-        let free = self
-            .account
-            .balance_free(Some(required.currency))
-            .unwrap_or_else(|| Money::zero(required.currency));
+        let cumulative = *cumulative;
+        let Ok(free) = self.balance_free(order, required.currency) else {
+            return false;
+        };
 
         if !self.allow_borrowing
-            && let Some(total) = *cumulative
+            && let Some(total) = cumulative
             && total > free
         {
             self.check.reject(
@@ -2713,6 +2973,7 @@ impl AccountRisk<'_> {
             return false;
         }
 
+        self.reserve_balance(order, required);
         true
     }
 
@@ -2776,6 +3037,10 @@ impl AccountRisk<'_> {
             return true;
         };
 
+        let Ok(base_free) = self.balance_free(order, base_currency) else {
+            return false;
+        };
+
         let Some(account) = cash_or_wallet_account(&self.account) else {
             unreachable!()
         };
@@ -2785,15 +3050,20 @@ impl AccountRisk<'_> {
             _ => quantity,
         };
 
-        self.engine.check_cash_sell_balance(
+        let Ok(cash_value) = self.engine.check_cash_sell_balance(
             self.check,
             account,
             self.allow_borrowing,
             order,
             quantity,
-            base_currency,
+            base_free,
             &mut self.cum_notional_sell,
-        )
+        ) else {
+            return false;
+        };
+
+        self.reserve_balance(order, cash_value);
+        true
     }
 }
 

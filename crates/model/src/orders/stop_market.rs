@@ -405,6 +405,10 @@ impl Order for StopMarketOrder {
         self.voided_qty
     }
 
+    fn non_reopened_voided_qty(&self) -> Quantity {
+        self.non_reopened_voided_qty
+    }
+
     fn leaves_qty(&self) -> Quantity {
         self.leaves_qty
     }
@@ -447,6 +451,12 @@ impl Order for StopMarketOrder {
 
     fn events(&self) -> Vec<&OrderEventAny> {
         self.events.iter().collect()
+    }
+
+    fn last_event(&self) -> &OrderEventAny {
+        self.events
+            .last()
+            .expect("Order invariant violated: no events")
     }
 
     fn venue_order_ids(&self) -> Vec<&VenueOrderId> {
@@ -501,8 +511,7 @@ impl Order for StopMarketOrder {
         if let Some(protection_price) = event.protection_price {
             self.protection_price = Some(protection_price);
         }
-        self.quantity = event.quantity;
-        self.leaves_qty = self.quantity.saturating_sub(self.filled_qty);
+        self.core.apply_updated_quantity(event.quantity);
     }
 
     fn is_triggered(&self) -> Option<bool> {

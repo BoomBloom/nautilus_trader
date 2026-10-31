@@ -48,15 +48,29 @@ use nautilus_common::{
         data::{
             RequestBars, RequestBookSnapshot, RequestCustomData, RequestFundingRates,
             RequestInstrument, RequestInstruments, RequestTrades, SubscribeBookDeltas,
-            SubscribeCustomData, SubscribeMarkPrices, SubscribeQuotes, SubscribeTrades,
-            UnsubscribeCustomData, UnsubscribeMarkPrices,
+            SubscribeBookDepth, SubscribeCustomData, SubscribeInstrumentStatus,
+            SubscribeMarkPrices, SubscribeQuotes, SubscribeTrades, UnsubscribeCustomData,
+            UnsubscribeInstrumentStatus, UnsubscribeMarkPrices,
         },
         system::SocketState,
     },
     testing::wait_until_async,
 };
 use nautilus_core::{Params, UUID4, UnixNanos};
-use nautilus_hyperliquid::{
+use nautilus_live::{SocketReconnectRegistry, SocketReconnectRequestOutcome};
+use nautilus_model::{
+    data::{BarType, CustomData, Data, DataType, InstrumentStatus, OrderBookDeltas},
+    enums::{BookAction, BookType, MarketStatusAction, RecordFlag},
+    identifiers::InstrumentId,
+    instruments::Instrument,
+};
+use nautilus_network::http::{HttpClient, Method};
+use parking_lot::Mutex;
+use rstest::rstest;
+use serde_json::{Value, json};
+use ustr::Ustr;
+
+use crate::{
     common::{
         consts::{ASSET_INDEX_INFO_KEY, HYPERLIQUID_CLIENT_ID, HYPERLIQUID_VENUE},
         enums::HyperliquidEnvironment,
@@ -72,22 +86,11 @@ use nautilus_hyperliquid::{
         query::InfoRequest,
     },
 };
-use nautilus_live::{SocketReconnectRegistry, SocketReconnectRequestOutcome};
-use nautilus_model::{
-    data::{BarType, CustomData, Data, DataType},
-    enums::BookType,
-    identifiers::InstrumentId,
-    instruments::Instrument,
-};
-use nautilus_network::http::{HttpClient, Method};
-use parking_lot::Mutex;
-use rstest::rstest;
-use serde_json::{Value, json};
-use ustr::Ustr;
 
 #[derive(Clone, Default)]
 struct TestServerState {
     info_request_count: Arc<tokio::sync::Mutex<usize>>,
+    all_perp_metas_request_count: Arc<tokio::sync::Mutex<usize>>,
     last_request_type: Arc<tokio::sync::Mutex<Option<String>>>,
     subscriptions: Arc<tokio::sync::Mutex<Vec<Value>>>,
     unsubscriptions: Arc<tokio::sync::Mutex<Vec<Value>>>,
@@ -97,6 +100,8 @@ struct TestServerState {
     initial_bbo_message: Arc<tokio::sync::Notify>,
     healing_bbo_message: Arc<tokio::sync::Notify>,
     withhold_l2_book: Arc<tokio::sync::Mutex<bool>>,
+    // When set, `l2Book` frames carry a timestamp the adapter cannot convert
+    invalid_l2_book: Arc<tokio::sync::Mutex<bool>>,
     // When set, the `recentTrades` info endpoint responds with HTTP 422 to
     // emulate a node without the Hyperliquid indexer.
     recent_trades_unavailable: Arc<tokio::sync::Mutex<bool>>,
@@ -109,6 +114,8 @@ struct TestServerState {
     // When set, the standard perp dex lists BTC with a coarser size precision to
     // emulate the venue changing a definition between two fetches.
     btc_size_decimals_changed: Arc<tokio::sync::Mutex<bool>>,
+    // When set, the standard perp dex flags BTC with `isDelisted`.
+    btc_delisted: Arc<tokio::sync::Mutex<bool>>,
     // When set, the next `allPerpMetas` response is built, then held after
     // notifying `all_perp_metas_held` until `all_perp_metas_release` fires.
     hold_next_all_perp_metas: Arc<tokio::sync::Mutex<bool>>,
@@ -203,6 +210,10 @@ async fn standard_perp_meta(state: &TestServerState) -> Value {
         meta["universe"][0]["szDecimals"] = json!(4);
     }
 
+    if *state.btc_delisted.lock().await {
+        meta["universe"][0]["isDelisted"] = json!(true);
+    }
+
     meta
 }
 
@@ -244,6 +255,7 @@ async fn handle_info(State(state): State<TestServerState>, body: axum::body::Byt
     match request_type.as_str() {
         "meta" => Json(standard_perp_meta(&state).await).into_response(),
         "allPerpMetas" => {
+            *state.all_perp_metas_request_count.lock().await += 1;
             if *state.all_perp_metas_unavailable.lock().await {
                 return (
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -639,14 +651,7 @@ async fn handle_ws_socket(mut socket: WebSocket, state: TestServerState) {
 
                                         Some(bbo_message())
                                     }
-                                    "l2Book" => {
-                                        if *state.withhold_l2_book.lock().await {
-                                            None
-                                        } else {
-                                            let book_data = load_json("ws_book_data.json");
-                                            Some(json!({"channel": "l2Book", "data": book_data}))
-                                        }
-                                    }
+                                    "l2Book" => l2_book_message(&state).await,
                                     "activeAssetCtx" => Some(active_asset_ctx_message()),
                                     "allDexsAssetCtxs" => {
                                         Some(load_json("ws_all_dexs_asset_ctxs.json"))
@@ -717,6 +722,20 @@ fn active_asset_ctx_message() -> Value {
     })
 }
 
+async fn l2_book_message(state: &TestServerState) -> Option<Value> {
+    if *state.withhold_l2_book.lock().await {
+        return None;
+    }
+
+    let mut book_data = load_json("ws_book_data.json");
+
+    if *state.invalid_l2_book.lock().await {
+        book_data["time"] = json!(u64::MAX);
+    }
+
+    Some(json!({"channel": "l2Book", "data": book_data}))
+}
+
 fn bbo_message() -> Value {
     json!({
         "channel": "bbo",
@@ -741,10 +760,12 @@ fn create_data_client_config(addr: SocketAddr) -> HyperliquidDataClientConfig {
 }
 
 fn open_interest_data_type(instrument_id: InstrumentId) -> DataType {
-    let mut metadata = Params::new();
-    metadata.insert(
-        "instrument_id".to_string(),
-        serde_json::Value::String(instrument_id.to_string()),
+    let metadata = Params::new(
+        [(
+            "instrument_id".to_string(),
+            serde_json::Value::String(instrument_id.to_string()),
+        )]
+        .into(),
     );
     DataType::new(
         "HyperliquidOpenInterest",
@@ -754,10 +775,12 @@ fn open_interest_data_type(instrument_id: InstrumentId) -> DataType {
 }
 
 fn public_trade_data_type(instrument_id: InstrumentId) -> DataType {
-    let mut metadata = Params::new();
-    metadata.insert(
-        "instrument_id".to_string(),
-        serde_json::Value::String(instrument_id.to_string()),
+    let metadata = Params::new(
+        [(
+            "instrument_id".to_string(),
+            serde_json::Value::String(instrument_id.to_string()),
+        )]
+        .into(),
     );
     DataType::new(
         "HyperliquidPublicTrade",
@@ -767,10 +790,12 @@ fn public_trade_data_type(instrument_id: InstrumentId) -> DataType {
 }
 
 fn twap_history_data_type(user: &str) -> DataType {
-    let mut metadata = Params::new();
-    metadata.insert(
-        "user".to_string(),
-        serde_json::Value::String(user.to_string()),
+    let metadata = Params::new(
+        [(
+            "user".to_string(),
+            serde_json::Value::String(user.to_string()),
+        )]
+        .into(),
     );
     DataType::new(
         "HyperliquidTwapHistory",
@@ -780,10 +805,12 @@ fn twap_history_data_type(user: &str) -> DataType {
 }
 
 fn twap_slice_fill_data_type(user: &str) -> DataType {
-    let mut metadata = Params::new();
-    metadata.insert(
-        "user".to_string(),
-        serde_json::Value::String(user.to_string()),
+    let metadata = Params::new(
+        [(
+            "user".to_string(),
+            serde_json::Value::String(user.to_string()),
+        )]
+        .into(),
     );
     DataType::new(
         "HyperliquidTwapSliceFill",
@@ -804,7 +831,7 @@ async fn drain_initial_events(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Data
         || {
             let found = rx
                 .try_recv()
-                .is_ok_and(|event| matches!(event, DataEvent::Instrument(_)));
+                .is_ok_and(|event| matches!(event, DataEvent::Data(Data::Instrument(_))));
             async move { found }
         },
         Duration::from_secs(5),
@@ -853,6 +880,18 @@ fn btc_instrument_request() -> RequestInstrument {
     )
 }
 
+fn instruments_request() -> RequestInstruments {
+    RequestInstruments::new(
+        None,
+        None,
+        Some(*HYPERLIQUID_CLIENT_ID),
+        Some(*HYPERLIQUID_VENUE),
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+    )
+}
+
 // A market listed after connect must be published before the response, so the
 // execution client holds its asset index by the time a strategy can act on it.
 fn assert_new_listing_published_before_response(events: &[DataEvent]) {
@@ -865,7 +904,7 @@ fn assert_new_listing_published_before_response(events: &[DataEvent]) {
     let new_listing = published
         .iter()
         .find_map(|event| match event {
-            DataEvent::Instrument(instrument)
+            DataEvent::Data(Data::Instrument(instrument))
                 if instrument.id() == InstrumentId::from("NEWCOIN-USD-PERP.HYPERLIQUID") =>
             {
                 Some(instrument)
@@ -1154,7 +1193,7 @@ async fn test_data_client_emits_instruments_on_connect() {
     let mut instrument_count = 0;
 
     while let Ok(event) = rx.try_recv() {
-        if matches!(event, DataEvent::Instrument(_)) {
+        if matches!(event, DataEvent::Data(Data::Instrument(_))) {
             instrument_count += 1;
         }
     }
@@ -1185,7 +1224,7 @@ async fn test_data_client_emits_hip3_instruments() {
     let mut spot_symbols = Vec::new();
 
     while let Ok(event) = rx.try_recv() {
-        if let DataEvent::Instrument(instrument) = event {
+        if let DataEvent::Data(Data::Instrument(instrument)) = event {
             let symbol = instrument.id().symbol.to_string();
             if symbol.contains(':') {
                 hip3_settlements.push((
@@ -2020,7 +2059,9 @@ async fn test_data_client_concurrent_requests_publish_latest_definition_last() {
         .iter()
         .rev()
         .find_map(|event| match event {
-            DataEvent::Instrument(instrument) if instrument.id() == btc => Some(instrument),
+            DataEvent::Data(Data::Instrument(instrument)) if instrument.id() == btc => {
+                Some(instrument)
+            }
             _ => None,
         })
         .expect("changed BTC definition was never published");
@@ -2046,19 +2087,9 @@ async fn test_data_client_subscribe_book_deltas() {
     while rx.try_recv().is_ok() {}
 
     let instrument_id = InstrumentId::from("BTC-USD-PERP.HYPERLIQUID");
-    let cmd = SubscribeBookDeltas::new(
-        instrument_id,
-        BookType::L2_MBP,
-        Some(*HYPERLIQUID_CLIENT_ID),
-        None,
-        UUID4::new(),
-        UnixNanos::default(),
-        None,
-        false,
-        None,
-        None,
-    );
-    client.subscribe_book_deltas(cmd).unwrap();
+    client
+        .subscribe_book_deltas(book_deltas_subscription(instrument_id))
+        .unwrap();
 
     let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
         .await
@@ -2095,18 +2126,7 @@ async fn test_data_client_reports_stale_book_deltas_while_quotes_flow() {
 
     let instrument_id = InstrumentId::from("BTC-USD-PERP.HYPERLIQUID");
     client
-        .subscribe_book_deltas(SubscribeBookDeltas::new(
-            instrument_id,
-            BookType::L2_MBP,
-            Some(*HYPERLIQUID_CLIENT_ID),
-            None,
-            UUID4::new(),
-            UnixNanos::default(),
-            None,
-            false,
-            None,
-            None,
-        ))
+        .subscribe_book_deltas(book_deltas_subscription(instrument_id))
         .unwrap();
     client
         .subscribe_quotes(SubscribeQuotes::new(
@@ -2189,11 +2209,10 @@ async fn test_data_client_reports_stale_book_deltas_while_quotes_flow() {
 
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_data_client_stale_book_recovery_escalates_to_reconnect() {
+async fn test_data_client_stale_book_recovery_resubscribes_without_reconnect() {
     let _capture_guard = lock_stale_log_capture().await;
     let logger = install_capturing_warn_logger();
     let state = TestServerState::default();
-    *state.withhold_l2_book.lock().await = true;
     let addr = start_mock_server(state.clone()).await;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
     set_data_event_sender(tx);
@@ -2212,85 +2231,436 @@ async fn test_data_client_stale_book_recovery_escalates_to_reconnect() {
 
     let instrument_id = InstrumentId::from("BTC-USD-PERP.HYPERLIQUID");
     client
-        .subscribe_book_deltas(SubscribeBookDeltas::new(
-            instrument_id,
-            BookType::L2_MBP,
-            Some(*HYPERLIQUID_CLIENT_ID),
-            None,
-            UUID4::new(),
-            UnixNanos::default(),
-            None,
-            false,
-            None,
-            None,
-        ))
+        .subscribe_book_deltas(book_deltas_subscription(instrument_id))
+        .unwrap();
+    let initial = wait_for_book_deltas(&mut rx).await;
+
+    // The mock sends one snapshot per subscribe, so the stream goes quiet after each
+    // one; a depth or BBO stream would reconnect on its second recovery action.
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { count_l2_book(&state.unsubscriptions.lock().await) >= 2 }
+        },
+        Duration::from_secs(20),
+    )
+    .await;
+
+    let recovered = wait_for_book_deltas(&mut rx).await;
+
+    let messages = logger.messages();
+    assert!(
+        messages.iter().any(|message| {
+            message.contains("action=recover")
+                && message.contains("channel=deltas")
+                && message.contains("instrument_id=BTC-USD-PERP.HYPERLIQUID")
+        }),
+        "stale delta book should start book recovery, messages were: {messages:?}",
+    );
+    assert!(
+        messages
+            .iter()
+            .all(|message| !message.contains("action=reconnect")
+                && !message.contains("Requested full WebSocket reconnect")),
+        "book recovery must not escalate to a reconnect, messages were: {messages:?}",
+    );
+    assert_snapshot(&initial, instrument_id, 11);
+    assert_snapshot(&recovered, instrument_id, 11);
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_data_client_recovers_missing_initial_book_snapshot() {
+    let state = TestServerState::default();
+    *state.withhold_l2_book.lock().await = true;
+    let addr = start_mock_server(state.clone()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+
+    let mut config = create_data_client_config(addr);
+    config.stale_stream_receive_timeout_secs = 0;
+    config.book_snapshot_timeout_secs = 1;
+
+    let mut client = HyperliquidDataClient::new(*HYPERLIQUID_CLIENT_ID, config).unwrap();
+    client.connect().await.unwrap();
+    drain_initial_events(&mut rx).await;
+
+    let instrument_id = InstrumentId::from("BTC-USD-PERP.HYPERLIQUID");
+    client
+        .subscribe_book_deltas(book_deltas_subscription(instrument_id))
         .unwrap();
 
     wait_until_async(
         || {
             let state = state.clone();
-            let messages = logger.messages();
-            async move {
-                let resubscribed = state
-                    .unsubscriptions
-                    .lock()
-                    .await
-                    .iter()
-                    .any(|sub| sub.get("type").and_then(Value::as_str) == Some("l2Book"));
-                let escalated = messages.iter().any(|message| {
-                    message.contains("action=reconnect") && message.contains("channel=deltas")
-                });
-                resubscribed && escalated
-            }
-        },
-        Duration::from_secs(15),
-    )
-    .await;
-
-    let messages = logger.messages();
-    assert!(
-        messages.iter().any(|message| {
-            message.contains("action=resubscribe")
-                && message.contains("channel=deltas")
-                && message.contains("instrument_id=BTC-USD-PERP.HYPERLIQUID")
-        }),
-        "targeted resubscribe decision should be logged, messages were: {messages:?}",
-    );
-    assert!(
-        messages
-            .iter()
-            .any(|message| message.contains("Requested full WebSocket reconnect")),
-        "reconnect escalation should be logged, messages were: {messages:?}",
-    );
-
-    let unsubscriptions = state.unsubscriptions.lock().await;
-    assert!(
-        unsubscriptions
-            .iter()
-            .any(|sub| sub.get("type").and_then(Value::as_str) == Some("l2Book")),
-        "targeted recovery should send an l2Book unsubscribe, was: {unsubscriptions:?}",
-    );
-    drop(unsubscriptions);
-
-    wait_until_async(
-        || {
-            let state = state.clone();
-            async move {
-                state
-                    .subscriptions
-                    .lock()
-                    .await
-                    .iter()
-                    .filter(|sub| sub.get("type").and_then(Value::as_str) == Some("l2Book"))
-                    .count()
-                    >= 3
-            }
+            async move { count_l2_book(&state.unsubscriptions.lock().await) >= 1 }
         },
         Duration::from_secs(10),
     )
     .await;
 
+    *state.withhold_l2_book.lock().await = false;
+    let recovered = wait_for_book_deltas(&mut rx).await;
+
+    let subscriptions = count_l2_book(&state.subscriptions.lock().await);
+    let unsubscriptions = count_l2_book(&state.unsubscriptions.lock().await);
+    assert_snapshot(&recovered, instrument_id, 11);
+    assert_eq!(
+        subscriptions,
+        unsubscriptions + 1,
+        "each replacement follows the initial subscribe with one unsubscribe",
+    );
+
     client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_data_client_recovers_book_after_unparsable_frame() {
+    let state = TestServerState::default();
+    *state.invalid_l2_book.lock().await = true;
+    let addr = start_mock_server(state.clone()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+
+    let mut config = create_data_client_config(addr);
+    config.stale_stream_receive_timeout_secs = 0;
+    config.book_snapshot_timeout_secs = 30;
+
+    let mut client = HyperliquidDataClient::new(*HYPERLIQUID_CLIENT_ID, config).unwrap();
+    client.connect().await.unwrap();
+    drain_initial_events(&mut rx).await;
+
+    let instrument_id = InstrumentId::from("BTC-USD-PERP.HYPERLIQUID");
+    client
+        .subscribe_book_deltas(book_deltas_subscription(instrument_id))
+        .unwrap();
+
+    // Far inside the snapshot deadline, so only invalid frames can start recovery and fail its
+    // first attempt early.
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { count_l2_book(&state.unsubscriptions.lock().await) >= 2 }
+        },
+        Duration::from_secs(8),
+    )
+    .await;
+
+    *state.invalid_l2_book.lock().await = false;
+    let recovered = wait_for_book_deltas(&mut rx).await;
+
+    let subscriptions = count_l2_book(&state.subscriptions.lock().await);
+    let unsubscriptions = count_l2_book(&state.unsubscriptions.lock().await);
+    assert_snapshot(&recovered, instrument_id, 11);
+    assert_eq!(subscriptions, unsubscriptions + 1);
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_data_client_recovers_book_snapshot_missing_after_reconnect() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+
+    let mut config = create_data_client_config(addr);
+    config.stale_stream_receive_timeout_secs = 0;
+    config.book_snapshot_timeout_secs = 1;
+
+    let registry = SocketReconnectRegistry::default();
+    let mut client = registry
+        .scope(|| HyperliquidDataClient::new(*HYPERLIQUID_CLIENT_ID, config))
+        .unwrap();
+    client.connect().await.unwrap();
+    drain_initial_events(&mut rx).await;
+
+    let instrument_id = InstrumentId::from("BTC-USD-PERP.HYPERLIQUID");
+    client
+        .subscribe_book_deltas(book_deltas_subscription(instrument_id))
+        .unwrap();
+    wait_for_book_deltas(&mut rx).await;
+
+    // The reconnect replays the subscription, which now delivers no snapshot
+    *state.withhold_l2_book.lock().await = true;
+    let handle = registry
+        .handle(
+            *HYPERLIQUID_CLIENT_ID,
+            Ustr::from("hyperliquid-data-streams"),
+        )
+        .unwrap();
+    let reconnect = handle.request_reconnect();
+
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { count_l2_book(&state.unsubscriptions.lock().await) >= 1 }
+        },
+        Duration::from_secs(15),
+    )
+    .await;
+
+    *state.withhold_l2_book.lock().await = false;
+    let recovered = wait_for_book_deltas(&mut rx).await;
+
+    let subscriptions = count_l2_book(&state.subscriptions.lock().await);
+    let unsubscriptions = count_l2_book(&state.unsubscriptions.lock().await);
+    assert_eq!(reconnect, SocketReconnectRequestOutcome::Accepted);
+    assert_snapshot(&recovered, instrument_id, 11);
+    assert_eq!(
+        subscriptions,
+        unsubscriptions + 2,
+        "the initial subscribe and the reconnect replay precede each replacement",
+    );
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_data_client_reconnect_replays_book_after_recovery() {
+    let state = TestServerState::default();
+    *state.withhold_l2_book.lock().await = true;
+    let addr = start_mock_server(state.clone()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+
+    let mut config = create_data_client_config(addr);
+    config.stale_stream_receive_timeout_secs = 0;
+    config.book_snapshot_timeout_secs = 1;
+
+    let registry = SocketReconnectRegistry::default();
+    let mut client = registry
+        .scope(|| HyperliquidDataClient::new(*HYPERLIQUID_CLIENT_ID, config))
+        .unwrap();
+    client.connect().await.unwrap();
+    drain_initial_events(&mut rx).await;
+
+    let instrument_id = InstrumentId::from("BTC-USD-PERP.HYPERLIQUID");
+    client
+        .subscribe_book_deltas(book_deltas_subscription(instrument_id))
+        .unwrap();
+
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { count_l2_book(&state.unsubscriptions.lock().await) >= 1 }
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+
+    *state.withhold_l2_book.lock().await = false;
+    wait_for_book_deltas(&mut rx).await;
+    let subscriptions = count_l2_book(&state.subscriptions.lock().await);
+    let unsubscriptions = count_l2_book(&state.unsubscriptions.lock().await);
+
+    // A replacement keeps the stream in replay, so the reconnect alone restores the book
+    let handle = registry
+        .handle(
+            *HYPERLIQUID_CLIENT_ID,
+            Ustr::from("hyperliquid-data-streams"),
+        )
+        .unwrap();
+    let reconnect = handle.request_reconnect();
+    let replayed = wait_for_book_deltas(&mut rx).await;
+
+    assert_eq!(reconnect, SocketReconnectRequestOutcome::Accepted);
+    assert_snapshot(&replayed, instrument_id, 11);
+    assert_eq!(
+        count_l2_book(&state.subscriptions.lock().await),
+        subscriptions + 1
+    );
+    assert_eq!(
+        count_l2_book(&state.unsubscriptions.lock().await),
+        unsubscriptions
+    );
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_data_client_reset_forgets_book_subscriptions() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+
+    let mut config = create_data_client_config(addr);
+    config.stale_stream_receive_timeout_secs = 0;
+
+    let mut client = HyperliquidDataClient::new(*HYPERLIQUID_CLIENT_ID, config).unwrap();
+    client.connect().await.unwrap();
+    drain_initial_events(&mut rx).await;
+
+    let instrument_id = InstrumentId::from("BTC-USD-PERP.HYPERLIQUID");
+    client
+        .subscribe_book_deltas(book_deltas_subscription(instrument_id))
+        .unwrap();
+    wait_for_book_deltas(&mut rx).await;
+
+    // The same client reconnects without the delta subscription
+    client.reset().unwrap();
+    client.connect().await.unwrap();
+    drain_initial_events(&mut rx).await;
+    client
+        .subscribe_book_depth(book_depth_subscription(instrument_id))
+        .unwrap();
+
+    let mut deltas_after_reset = 0;
+    wait_until_async(
+        || {
+            let found = loop {
+                match rx.try_recv() {
+                    Ok(DataEvent::Data(Data::BookDepth(_))) => break true,
+                    Ok(DataEvent::Data(Data::BookDeltas(_))) => deltas_after_reset += 1,
+                    Ok(_) => {}
+                    Err(_) => break false,
+                }
+            };
+
+            async move { found }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert_eq!(deltas_after_reset, 0);
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_data_client_book_deltas_on_open_depth_stream_start_from_fresh_snapshot() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+
+    let mut config = create_data_client_config(addr);
+    config.stale_stream_receive_timeout_secs = 0;
+
+    let mut client = HyperliquidDataClient::new(*HYPERLIQUID_CLIENT_ID, config).unwrap();
+    client.connect().await.unwrap();
+    drain_initial_events(&mut rx).await;
+
+    let instrument_id = InstrumentId::from("BTC-USD-PERP.HYPERLIQUID");
+    client
+        .subscribe_book_depth(book_depth_subscription(instrument_id))
+        .unwrap();
+
+    let mut depth_only_deltas = 0;
+    wait_until_async(
+        || {
+            let found = loop {
+                match rx.try_recv() {
+                    Ok(DataEvent::Data(Data::BookDepth(_))) => break true,
+                    Ok(DataEvent::Data(Data::BookDeltas(_))) => depth_only_deltas += 1,
+                    Ok(_) => {}
+                    Err(_) => break false,
+                }
+            };
+
+            async move { found }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    client
+        .subscribe_book_deltas(book_deltas_subscription(instrument_id))
+        .unwrap();
+    let deltas = wait_for_book_deltas(&mut rx).await;
+
+    let subscriptions = count_l2_book(&state.subscriptions.lock().await);
+    let unsubscriptions = count_l2_book(&state.unsubscriptions.lock().await);
+    assert_eq!(
+        depth_only_deltas, 0,
+        "a depth-only stream must not emit deltas"
+    );
+    assert_snapshot(&deltas, instrument_id, 11);
+    assert_eq!(subscriptions, 2);
+    assert_eq!(unsubscriptions, 1);
+
+    client.disconnect().await.unwrap();
+}
+
+fn book_depth_subscription(instrument_id: InstrumentId) -> SubscribeBookDepth {
+    SubscribeBookDepth::new(
+        instrument_id,
+        BookType::L2_MBP,
+        Some(*HYPERLIQUID_CLIENT_ID),
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        false,
+        None,
+        None,
+    )
+}
+
+fn book_deltas_subscription(instrument_id: InstrumentId) -> SubscribeBookDeltas {
+    SubscribeBookDeltas::new(
+        instrument_id,
+        BookType::L2_MBP,
+        Some(*HYPERLIQUID_CLIENT_ID),
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        false,
+        None,
+        None,
+    )
+}
+
+fn count_l2_book(subscriptions: &[Value]) -> usize {
+    subscriptions
+        .iter()
+        .filter(|subscription| subscription.get("type").and_then(Value::as_str) == Some("l2Book"))
+        .count()
+}
+
+async fn wait_for_book_deltas(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+) -> OrderBookDeltas {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+
+    loop {
+        let event = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .expect("timeout waiting for book deltas")
+            .expect("data event channel closed");
+
+        if let DataEvent::Data(Data::BookDeltas(deltas)) = event {
+            return *deltas;
+        }
+    }
+}
+
+// Asserts one snapshot event group: a leading clear, then adds, closed by `F_LAST` once
+fn assert_snapshot(deltas: &OrderBookDeltas, instrument_id: InstrumentId, len: usize) {
+    let snapshot = RecordFlag::F_SNAPSHOT as u8;
+    let last = RecordFlag::F_LAST as u8;
+    let flags: Vec<u8> = deltas.deltas.iter().map(|delta| delta.flags).collect();
+    let mut expected = vec![snapshot; len];
+    expected[len - 1] |= last;
+
+    assert_eq!(deltas.instrument_id, instrument_id);
+    assert_eq!(deltas.deltas[0].action, BookAction::Clear);
+    assert!(
+        deltas.deltas[1..]
+            .iter()
+            .all(|delta| delta.action == BookAction::Add)
+    );
+    assert_eq!(flags, expected);
 }
 
 #[rstest]
@@ -2520,6 +2890,262 @@ async fn test_data_client_request_instrument() {
     client.disconnect().await.unwrap();
 }
 
+fn instrument_statuses(events: &[DataEvent]) -> Vec<InstrumentStatus> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            DataEvent::Data(Data::InstrumentStatus(status)) => Some(*status),
+            _ => None,
+        })
+        .collect()
+}
+
+fn instrument_status_subscription(instrument_id: InstrumentId) -> SubscribeInstrumentStatus {
+    SubscribeInstrumentStatus::new(
+        instrument_id,
+        Some(*HYPERLIQUID_CLIENT_ID),
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+    )
+}
+
+#[rstest]
+#[case::listed(false, MarketStatusAction::Trading)]
+#[case::delisted(true, MarketStatusAction::Close)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_data_client_subscribe_instrument_status_emits_current_status(
+    #[case] delisted: bool,
+    #[case] expected: MarketStatusAction,
+) {
+    let state = TestServerState::default();
+    *state.btc_delisted.lock().await = delisted;
+    let addr = start_mock_server(state.clone()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+
+    let config = create_data_client_config(addr);
+    let mut client = HyperliquidDataClient::new(*HYPERLIQUID_CLIENT_ID, config).unwrap();
+    client.connect().await.unwrap();
+
+    while rx.try_recv().is_ok() {}
+
+    let instrument_id = InstrumentId::from("BTC-USD-PERP.HYPERLIQUID");
+    client
+        .subscribe_instrument_status(instrument_status_subscription(instrument_id))
+        .unwrap();
+
+    let events: Vec<DataEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    let statuses = instrument_statuses(&events);
+    assert_eq!(statuses.len(), 1, "events: {events:?}");
+    assert_eq!(statuses[0].instrument_id, instrument_id);
+    assert_eq!(statuses[0].action, expected);
+    assert_eq!(
+        statuses[0].is_trading,
+        Some(expected == MarketStatusAction::Trading)
+    );
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_data_client_instrument_refresh_emits_status_change_for_subscribed() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+
+    let config = create_data_client_config(addr);
+    let mut client = HyperliquidDataClient::new(*HYPERLIQUID_CLIENT_ID, config).unwrap();
+    client.connect().await.unwrap();
+
+    let btc_id = InstrumentId::from("BTC-USD-PERP.HYPERLIQUID");
+    client
+        .subscribe_instrument_status(instrument_status_subscription(btc_id))
+        .unwrap();
+
+    while rx.try_recv().is_ok() {}
+
+    // an unchanged universe emits no status
+    client.request_instruments(instruments_request()).unwrap();
+    let events = recv_until_response(&mut rx).await;
+    assert!(
+        instrument_statuses(&events).is_empty(),
+        "events: {events:?}"
+    );
+
+    *state.btc_delisted.lock().await = true;
+    client.request_instruments(instruments_request()).unwrap();
+    let events = recv_until_response(&mut rx).await;
+    let statuses = instrument_statuses(&events);
+    assert_eq!(statuses.len(), 1, "events: {events:?}");
+    assert_eq!(statuses[0].instrument_id, btc_id);
+    assert_eq!(statuses[0].action, MarketStatusAction::Close);
+    assert_eq!(statuses[0].is_trading, Some(false));
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[case::disconnect(false)]
+#[case::reset(true)]
+#[tokio::test]
+async fn test_data_client_periodic_instrument_refresh_survives_reconnect(#[case] reset: bool) {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+    let mut config = create_data_client_config(addr);
+    config.update_instruments_interval_mins = 1;
+    config.stream_health_check_interval_secs = 0;
+    let mut client = HyperliquidDataClient::new(*HYPERLIQUID_CLIENT_ID, config).unwrap();
+    let btc_id = InstrumentId::from("BTC-USD-PERP.HYPERLIQUID");
+
+    for (size_precision, request_refresh) in [(4, true), (5, false)] {
+        connect_with_refresh(&mut client).await;
+        let started = tokio::time::Instant::now();
+
+        while rx.try_recv().is_ok() {}
+        let before = *state.all_perp_metas_request_count.lock().await;
+        connect_with_refresh(&mut client).await;
+        assert_eq!(*state.all_perp_metas_request_count.lock().await, before);
+        *state.btc_size_decimals_changed.lock().await = size_precision == 4;
+
+        // Only the post-reconnect refresh needs to wait for the periodic timer
+        if request_refresh {
+            client.request_instruments(instruments_request()).unwrap();
+        } else {
+            advance_refresh_clock(Duration::from_secs(59).saturating_sub(started.elapsed())).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), rx.recv())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(*state.all_perp_metas_request_count.lock().await, before);
+            advance_refresh_clock(Duration::from_secs(60).saturating_sub(started.elapsed())).await;
+        }
+
+        let refreshed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(DataEvent::Data(Data::Instrument(instrument))) = rx.recv().await
+                    && instrument.id() == btc_id
+                {
+                    break instrument;
+                }
+            }
+        })
+        .await
+        .expect("periodic refresh must publish the changed BTC definition");
+
+        wait_until_async(
+            || async { *state.all_perp_metas_request_count.lock().await == before + 2 },
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(refreshed.size_precision(), size_precision);
+        assert_eq!(
+            refreshed
+                .info()
+                .and_then(|info| info.get_u64(ASSET_INDEX_INFO_KEY)),
+            Some(0),
+        );
+
+        if reset {
+            client.reset().unwrap();
+        }
+
+        client.disconnect().await.unwrap();
+        let stopped = *state.all_perp_metas_request_count.lock().await;
+        assert_eq!(stopped, before + 2);
+        assert!(client.is_disconnected());
+    }
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_data_client_instrument_refresh_keeps_status_on_partial_perp_load() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+
+    let config = create_data_client_config(addr);
+    let mut client = HyperliquidDataClient::new(*HYPERLIQUID_CLIENT_ID, config).unwrap();
+    client.connect().await.unwrap();
+
+    let btc_id = InstrumentId::from("BTC-USD-PERP.HYPERLIQUID");
+    let tsla_id = InstrumentId::from("xyz:TSLA-USD-PERP.HYPERLIQUID");
+    for instrument_id in [btc_id, tsla_id] {
+        client
+            .subscribe_instrument_status(instrument_status_subscription(instrument_id))
+            .unwrap();
+    }
+
+    let events: Vec<DataEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert!(
+        instrument_statuses(&events)
+            .iter()
+            .any(|s| s.instrument_id == tsla_id && s.action == MarketStatusAction::Trading),
+        "events: {events:?}"
+    );
+
+    // the `meta` fallback only returns the standard dex, so perps are not fully loaded
+    *state.all_perp_metas_unavailable.lock().await = true;
+    *state.btc_delisted.lock().await = true;
+    client.request_instruments(instruments_request()).unwrap();
+    let events = recv_until_response(&mut rx).await;
+    let statuses = instrument_statuses(&events);
+    assert_eq!(statuses.len(), 1, "events: {events:?}");
+    assert_eq!(statuses[0].instrument_id, btc_id);
+    assert_eq!(statuses[0].action, MarketStatusAction::Close);
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_data_client_unsubscribe_instrument_status_stops_emitting() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+
+    let config = create_data_client_config(addr);
+    let mut client = HyperliquidDataClient::new(*HYPERLIQUID_CLIENT_ID, config).unwrap();
+    client.connect().await.unwrap();
+
+    let btc_id = InstrumentId::from("BTC-USD-PERP.HYPERLIQUID");
+    client
+        .subscribe_instrument_status(instrument_status_subscription(btc_id))
+        .unwrap();
+    client
+        .unsubscribe_instrument_status(&UnsubscribeInstrumentStatus::new(
+            btc_id,
+            Some(*HYPERLIQUID_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+
+    while rx.try_recv().is_ok() {}
+
+    *state.btc_delisted.lock().await = true;
+    client.request_instruments(instruments_request()).unwrap();
+    let events = recv_until_response(&mut rx).await;
+    assert!(
+        instrument_statuses(&events).is_empty(),
+        "events: {events:?}"
+    );
+
+    client.disconnect().await.unwrap();
+}
+
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_data_client_request_book_snapshot() {
@@ -2653,7 +3279,7 @@ async fn test_data_client_request_trades() {
 
     match event {
         DataEvent::Response(DataResponse::Trades(trades_response)) => {
-            assert_eq!(trades_response.instrument_id, instrument_id);
+            assert_eq!(trades_response.instrument_ids, vec![instrument_id]);
             // Fixture carries three trades; the response is sorted ascending.
             assert_eq!(trades_response.data.len(), 3);
             assert_eq!(trades_response.data[0].trade_id.to_string(), "300001");
@@ -2733,10 +3359,13 @@ async fn test_data_client_request_public_trades() {
     while rx.try_recv().is_ok() {}
 
     let instrument_id = InstrumentId::from("BTC-USD-PERP.HYPERLIQUID");
-    let mut metadata = Params::new();
-    metadata.insert(
-        "instrument_id".to_string(),
-        serde_json::Value::String(instrument_id.to_string()),
+
+    let metadata = Params::new(
+        [(
+            "instrument_id".to_string(),
+            serde_json::Value::String(instrument_id.to_string()),
+        )]
+        .into(),
     );
     let data_type = DataType::new("HyperliquidPublicTrade", Some(metadata), None);
     client
@@ -2888,7 +3517,7 @@ async fn test_data_client_request_trades_endpoint_unavailable() {
 
     match event {
         DataEvent::Response(DataResponse::Trades(trades_response)) => {
-            assert_eq!(trades_response.instrument_id, instrument_id);
+            assert_eq!(trades_response.instrument_ids, vec![instrument_id]);
             assert!(
                 trades_response.data.is_empty(),
                 "422 should yield an empty response, was: {:?}",
@@ -2957,10 +3586,12 @@ async fn test_request_funding_rates_emits_data_response_from_mock() {
     while rx.try_recv().is_ok() {}
 
     let perp_id = InstrumentId::from("BTC-USD-PERP.HYPERLIQUID");
+    let start = jiff::Timestamp::from_millisecond(1_769_908_800_000).unwrap();
+    let end = jiff::Timestamp::from_millisecond(1_769_920_000_000).unwrap();
     let cmd = RequestFundingRates::new(
         perp_id,
-        None,
-        None,
+        Some(start),
+        Some(end),
         None,
         Some(*HYPERLIQUID_CLIENT_ID),
         UUID4::new(),
@@ -2984,7 +3615,7 @@ async fn test_request_funding_rates_emits_data_response_from_mock() {
             assert!(rates.contains(&"-0.0000081".to_string()));
             assert!(rates.contains(&"0.0000033".to_string()));
 
-            for update in &response.data {
+            for update in response.data.iter() {
                 assert_eq!(update.interval, Some(60), "Hyperliquid funds hourly");
                 assert!(update.next_funding_ns.is_none());
             }
@@ -3167,4 +3798,70 @@ async fn test_data_client_reset_recreates_public_trade_stream() {
     wait_for_public_trade_event(&mut rx, instrument_id, data_type).await;
 
     client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[case::disabled(0)]
+#[case::enabled(1)]
+#[tokio::test]
+async fn test_connect_registers_one_instrument_refresh(#[case] minutes: u64) {
+    let addr = start_mock_server(TestServerState::default()).await;
+    let mut config = create_data_client_config(addr);
+    config.stream_health_check_interval_secs = 0;
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+    config.update_instruments_interval_mins = minutes;
+    let mut client = HyperliquidDataClient::new(*HYPERLIQUID_CLIENT_ID, config).unwrap();
+
+    client.connect().await.unwrap();
+    client.connect().await.unwrap();
+
+    assert_eq!(client.session_tasks.len(), 1 + usize::from(minutes != 0));
+    client.disconnect().await.unwrap();
+    assert!(client.session_tasks.is_empty());
+}
+
+async fn connect_with_refresh(client: &mut HyperliquidDataClient) {
+    if client.is_connected() {
+        client.connect().await.unwrap();
+        return;
+    }
+
+    // Keep the refresh timer on the test clock and retain session task ownership
+    let minutes = client.config.update_instruments_interval_mins;
+    client.config.update_instruments_interval_mins = 0;
+    client.connect().await.unwrap();
+    client.config.update_instruments_interval_mins = minutes;
+
+    if let Some(future) = client.instrument_refresh() {
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            let mut future = Box::pin(future);
+            let mut ready = Some(ready);
+            std::future::poll_fn(move |cx| {
+                let result = future.as_mut().poll(cx);
+
+                if let Some(ready) = ready.take() {
+                    let _ = ready.send(());
+                }
+
+                result
+            })
+            .await;
+        });
+
+        client
+            .session_tasks
+            .spawn(async move { tasks.join_next().await.unwrap().unwrap() })
+            .unwrap();
+        started.await.unwrap();
+    }
+}
+
+async fn advance_refresh_clock(duration: Duration) {
+    tokio::time::pause();
+    tokio::time::advance(duration).await;
+    tokio::time::resume();
+    tokio::task::yield_now().await;
 }

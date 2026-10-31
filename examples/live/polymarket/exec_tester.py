@@ -17,10 +17,10 @@
 Test Polymarket execution with the built-in ExecTester strategy.
 
 WARNING: This example connects to Polymarket and places REAL orders with REAL
-funds. On start it opens a position with an IOC market order quoted in pUSD; on
-stop it cancels all orders and closes all positions. Run only against a funded
-account you intend to test. The strategy has no alpha advantage whatsoever and is
-not intended for production trading.
+funds when DRY_RUN is False. On start it opens a position with an IOC market
+order quoted in pUSD; on stop it cancels all orders and closes all positions. Run
+only against a funded account you intend to test. The strategy has no alpha
+advantage whatsoever and is not intended for production trading.
 
 """
 
@@ -36,7 +36,6 @@ from nautilus_trader.adapters.polymarket import PolymarketInstrumentProviderConf
 from nautilus_trader.adapters.polymarket import PolymarketSignatureType
 from nautilus_trader.common import Environment
 from nautilus_trader.config import LiveExecutionEngineConfig
-from nautilus_trader.config import LiveRiskEngineConfig
 from nautilus_trader.live import LiveNode
 from nautilus_trader.model import ClientId
 from nautilus_trader.model import InstrumentId
@@ -48,17 +47,17 @@ from nautilus_trader.testkit import ExecTesterConfig
 
 
 # WARNING: With DRY_RUN = False, this tester submits orders to the configured
-# environment and may use real funds. Set DRY_RUN = True to connect without
+# environment and may use real funds. Keep DRY_RUN = True to connect without
 # submitting orders or sending shutdown cancel/close commands.
-DRY_RUN = False
+DRY_RUN = True
 POLYMARKET = "POLYMARKET"
 TRADER_ID = TraderId.from_str("TESTER-001")
 ACCOUNT_ID = "POLYMARKET-001"
 STRATEGY_ID = StrategyId.from_str("EXEC_TESTER-001")
-EVENT_SLUG = "fed-decision-in-september-762"
+EVENT_SLUG = "presidential-election-winner-2028"
 INSTRUMENT_ID = InstrumentId.from_str(
-    "0xac02cbb049e46d6a3627c0fdf52fa554982a9025d45968207b362acb6ca4b830-"
-    f"28239418772633645184924651434956000849078365566842629564562475378531350731731.{POLYMARKET}",
+    "0x7ad403c3508f8e3912940fd1a913f227591145ca0614074208e0b962d5fcc422-"
+    f"16040015440196279900485035793550429453516625694844857319147506590755961451627.{POLYMARKET}",
 )
 ORDER_QTY = "5"  # In pUSD for the quote-quantity market order
 TOB_OFFSET_TICKS = 5
@@ -84,7 +83,6 @@ def main() -> None:
                 position_check_interval_secs=30,
             ),
         )
-        .with_risk_engine_config(LiveRiskEngineConfig(bypass=True))
         .with_timeout_disconnection_secs(30)
         .with_delay_post_stop_secs(30)
         .add_data_client(

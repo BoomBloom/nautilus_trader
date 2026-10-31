@@ -15,11 +15,13 @@
 
 //! Python bindings for the Interactive Brokers instrument provider.
 
+use nautilus_common::python::config_error_to_pyvalue_err;
 use nautilus_core::python::to_pyruntime_err;
 use nautilus_model::{identifiers::InstrumentId, python::instruments::instrument_any_to_pyobject};
 use pyo3::{prelude::*, types::PyList};
 
 use crate::{
+    config::InteractiveBrokersInstrumentProviderConfig,
     providers::instruments::InteractiveBrokersInstrumentProvider,
     python::conversion::{contract_details_to_pyobject, py_to_contract},
 };
@@ -29,8 +31,8 @@ use crate::{
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl InteractiveBrokersInstrumentProvider {
     #[new]
-    fn py_new(config: crate::config::InteractiveBrokersInstrumentProviderConfig) -> Self {
-        Self::new(config)
+    fn py_new(config: InteractiveBrokersInstrumentProviderConfig) -> PyResult<Self> {
+        Self::new(config).map_err(config_error_to_pyvalue_err)
     }
 
     fn __repr__(&self) -> String {
@@ -108,10 +110,6 @@ impl InteractiveBrokersInstrumentProvider {
 
     /// Save the current instrument cache to disk.
     ///
-    /// # Arguments
-    ///
-    /// * `cache_path` - Path to the cache file
-    ///
     /// # Errors
     ///
     /// Returns an error if serialization or file I/O fails.
@@ -131,10 +129,6 @@ impl InteractiveBrokersInstrumentProvider {
     }
 
     /// Load instrument cache from disk if valid.
-    ///
-    /// # Arguments
-    ///
-    /// * `cache_path` - Path to the cache file
     ///
     /// # Returns
     ///

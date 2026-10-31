@@ -32,8 +32,8 @@ use super::{
     DecodeDataFromRecordBatch, EncodingError, KEY_IDENTIFIER, decode_decimal_price,
     decode_decimal_quantity, decode_required_timestamp, decode_required_u8, decode_required_u64,
     enum_dictionary_array, enum_dictionary_data_type, extract_column, extract_column_string,
-    fixed_decimal_data_type, identifier_array_from_display, parse_metadata, price_decimal_array,
-    quantity_decimal_array,
+    fixed_decimal_data_type, identifier_array_from_display, metadata_with_type_name,
+    parse_metadata, price_decimal_array, quantity_decimal_array, validate_required_column,
 };
 #[cfg(test)]
 use super::{KEY_INSTRUMENT_ID, KEY_PRICE_PRECISION};
@@ -54,10 +54,7 @@ impl ArrowSchemaProvider for OrderBookDelta {
             Field::new(KEY_IDENTIFIER, DataType::Utf8, true),
         ];
 
-        match metadata {
-            Some(metadata) => Schema::new_with_metadata(fields, metadata),
-            None => Schema::new(fields),
-        }
+        Schema::new_with_metadata(fields, metadata_with_type_name("OrderBookDelta", metadata))
     }
 }
 
@@ -178,6 +175,8 @@ impl DecodeFromRecordBatch for OrderBookDelta {
 
         let action_values = extract_column_string(cols, "action", 0)?;
         let side_values = extract_column_string(cols, "side", 1)?;
+        validate_required_column(cols[0].as_ref(), "action")?;
+        validate_required_column(cols[1].as_ref(), "side")?;
         let price_values =
             extract_column::<Decimal128Array>(cols, "price", 2, fixed_decimal_data_type())?;
         let size_values =
@@ -256,7 +255,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::arrow::get_raw_price;
+    use crate::arrow::{KEY_TYPE_NAME, get_raw_price};
 
     #[rstest]
     fn test_get_schema() {
@@ -277,7 +276,9 @@ mod tests {
             Field::new(KEY_IDENTIFIER, DataType::Utf8, true),
         ];
 
-        let expected_schema = Schema::new_with_metadata(expected_fields, metadata);
+        let mut expected_metadata = metadata;
+        expected_metadata.insert(KEY_TYPE_NAME.to_string(), "OrderBookDelta".to_string());
+        let expected_schema = Schema::new_with_metadata(expected_fields, expected_metadata);
         assert_eq!(schema, expected_schema);
     }
 
@@ -472,6 +473,44 @@ mod tests {
     }
 
     #[rstest]
+    fn test_decode_batch_rejects_null_action_with_field_and_row() {
+        use arrow::{array::StringDictionaryBuilder, datatypes::Int8Type};
+
+        let instrument_id = InstrumentId::from("AAPL.XNAS");
+        let metadata = OrderBookDelta::get_metadata(&instrument_id, 2, 0);
+        let delta = OrderBookDelta::clear(instrument_id, 0, 1.into(), 2.into());
+        let encoded = OrderBookDelta::encode_batch(&metadata, &[delta]).unwrap();
+        let mut action = StringDictionaryBuilder::<Int8Type>::new();
+        action.append_null();
+        let mut columns = encoded.columns().to_vec();
+        columns[0] = Arc::new(action.finish());
+
+        let fields = encoded
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| {
+                if field.name() == "action" {
+                    Arc::new(field.as_ref().clone().with_nullable(true))
+                } else {
+                    Arc::clone(field)
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let schema = Arc::new(Schema::new_with_metadata(fields, metadata.clone()));
+        let record_batch = RecordBatch::try_new(schema, columns).unwrap();
+
+        let result = OrderBookDelta::decode_batch(&metadata, record_batch);
+
+        assert!(matches!(
+            result,
+            Err(EncodingError::ParseError("action", ref message))
+                if message == "row 0: required value is null"
+        ));
+    }
+
+    #[rstest]
     fn test_decode_batch_rejects_null_timestamp_with_field_and_row() {
         let instrument_id = InstrumentId::from("AAPL.XNAS");
         let metadata = OrderBookDelta::get_metadata(&instrument_id, 2, 0);
@@ -500,7 +539,7 @@ mod tests {
                 if field.name() == "ts_init" {
                     Arc::new(field.as_ref().clone().with_nullable(true))
                 } else {
-                    field.clone()
+                    Arc::clone(field)
                 }
             })
             .collect::<Vec<_>>();
@@ -549,7 +588,7 @@ mod tests {
                     if schema_field.name() == field {
                         Arc::new(schema_field.as_ref().clone().with_nullable(true))
                     } else {
-                        schema_field.clone()
+                        Arc::clone(schema_field)
                     }
                 })
                 .collect::<Vec<_>>();

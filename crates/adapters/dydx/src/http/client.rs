@@ -17,7 +17,7 @@
 //! <https://docs.dydx.xyz/indexer-client/http>.
 //!
 //! This module exports two complementary HTTP clients following the standardized
-//! two-layer architecture pattern established in OKX, Bybit, and BitMEX adapters:
+//! two-layer architecture pattern:
 //!
 //! - [`DydxRawHttpClient`]: Low-level HTTP methods matching dYdX Indexer API endpoints.
 //! - [`DydxHttpClient`]: High-level methods using Nautilus domain types with instrument caching.
@@ -85,7 +85,6 @@ use nautilus_network::{
     retry::{RetryConfig, RetryError, RetryManager},
 };
 use parking_lot::Mutex;
-use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
@@ -684,8 +683,7 @@ impl DydxRawHttpClient {
 /// Provides a higher-level HTTP client for the [dYdX v4](https://dydx.trade) Indexer REST API.
 ///
 /// This client wraps the underlying `DydxRawHttpClient` to handle conversions
-/// into the Nautilus domain model, following the two-layer pattern established
-/// in OKX, Bybit, and BitMEX adapters.
+/// into the Nautilus domain model, following the standardized two-layer pattern.
 ///
 /// **Architecture:**
 /// - **Raw client** (`DydxRawHttpClient`): Low-level HTTP methods matching dYdX Indexer API endpoints.
@@ -820,8 +818,6 @@ impl DydxHttpClient {
     pub async fn request_instruments(
         &self,
         symbol: Option<String>,
-        maker_fee: Option<Decimal>,
-        taker_fee: Option<Decimal>,
     ) -> anyhow::Result<Vec<InstrumentAny>> {
         let markets_response = self.inner.get_markets().await?;
         let ts_init = self.generate_ts_init();
@@ -846,7 +842,7 @@ impl DydxHttpClient {
                 continue;
             }
 
-            match super::parse::parse_instrument_any(&market, maker_fee, taker_fee, ts_init) {
+            match super::parse::parse_instrument_any(&market, ts_init) {
                 Ok(instrument) => {
                     instruments.push(instrument);
                 }
@@ -899,7 +895,7 @@ impl DydxHttpClient {
                 continue;
             }
 
-            match super::parse::parse_instrument_any(&market, None, None, ts_init) {
+            match super::parse::parse_instrument_any(&market, ts_init) {
                 Ok(instrument) => {
                     parsed_instruments.push(instrument);
                     parsed_markets.push(market);
@@ -953,7 +949,7 @@ impl DydxHttpClient {
                 return Ok(None);
             }
 
-            let instrument = parse_instrument_any(market, None, None, ts_init)?;
+            let instrument = parse_instrument_any(market, ts_init)?;
             self.instrument_cache
                 .insert(instrument.clone(), market.clone());
 
@@ -1009,7 +1005,7 @@ impl DydxHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns None if the instrument is not found in the market params cache.
+    /// Returns `None` if the instrument is not found in the market params cache.
     #[must_use]
     pub fn get_market_params(
         &self,
@@ -1205,8 +1201,8 @@ impl DydxHttpClient {
     ///
     /// # Panics
     ///
-    /// This function will panic if the API returns a non-empty trades response
-    /// but `last()` on the trades vector returns `None` (should never happen).
+    /// Panics if the API returns a non-empty trades response but `last()` on the trades vector
+    /// returns `None` (should never happen).
     pub async fn request_trade_ticks(
         &self,
         instrument_id: InstrumentId,

@@ -149,14 +149,18 @@ impl HasTsInit for BinanceBar {
 }
 
 pub(crate) fn binance_bar_data_type(bar_type: BarType) -> DataType {
-    let mut metadata = Params::new();
-    metadata.insert(
-        "bar_type".to_string(),
-        serde_json::Value::String(bar_type.to_string()),
-    );
-    metadata.insert(
-        "instrument_id".to_string(),
-        serde_json::Value::String(bar_type.instrument_id().to_string()),
+    let metadata = Params::new(
+        [
+            (
+                "bar_type".to_string(),
+                serde_json::Value::String(bar_type.to_string()),
+            ),
+            (
+                "instrument_id".to_string(),
+                serde_json::Value::String(bar_type.instrument_id().to_string()),
+            ),
+        ]
+        .into(),
     );
     DataType::new("BinanceBar", Some(metadata), Some(bar_type.to_string()))
 }
@@ -311,6 +315,7 @@ mod tests {
         assert_eq!(restored_bar, &bar);
     }
 
+    #[cfg(feature = "arrow")]
     #[rstest]
     fn test_binance_bar_catalog_round_trip() {
         use std::sync::Arc;

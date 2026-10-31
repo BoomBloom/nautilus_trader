@@ -13,6 +13,8 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+#![warn(clippy::clone_on_ref_ptr)]
+
 // Links the workspace core from one shared library to collapse the binary's link time.
 use std::sync::Arc;
 
@@ -25,10 +27,10 @@ use nautilus_core::{Params, UnixNanos};
 #[cfg(feature = "arrow-display")]
 use nautilus_model::data::NautilusDataType;
 use nautilus_model::{
-    data::{CustomDataTrait, Data, HasTsInit},
+    data::{CustomDataTrait, Data, HasTsInit, registry::encode_custom_to_arrow},
     enums::{AggressorSide, CurrencyType},
     identifiers::InstrumentId,
-    types::{Currency, Money, Price, Quantity},
+    types::{Currency, Money, PRICE_UNDEF, Price, QUANTITY_UNDEF, Quantity},
 };
 #[cfg(feature = "arrow-display")]
 use nautilus_serialization::arrow::catalog_display::catalog_record_batch_to_display;
@@ -151,6 +153,70 @@ fn manual_custom_data_for_decode() -> ManualCustomData {
 }
 
 #[rstest]
+#[case::nulls(false, false)]
+#[case::nulls_first(false, true)]
+#[case::undefined(true, false)]
+#[case::undefined_first(true, true)]
+fn registered_encoding_round_trips_nullable_fixed_fields(
+    #[case] undefined: bool,
+    #[case] reversed: bool,
+) {
+    ensure_custom_data_registered::<ManualCustomData>();
+    let mut first = manual_custom_data_for_decode();
+    first.price = Price::from("1.25");
+    first.quantity = Quantity::from("2.375");
+    first.optional_price = Some(Price::from("3.4567"));
+    first.optional_quantity = Some(Quantity::from("4.56789"));
+    let mut second = first.clone();
+    second.optional_price = None;
+    second.optional_quantity = None;
+    if undefined {
+        second.price = Price::from_raw(PRICE_UNDEF, 0);
+        second.quantity = Quantity::from_raw(QUANTITY_UNDEF, 0);
+    }
+
+    let mut original = vec![first, second];
+    if reversed {
+        original.reverse();
+    }
+
+    let custom: Vec<Arc<dyn CustomDataTrait>> = original
+        .iter()
+        .cloned()
+        .map(|item| Arc::new(item) as Arc<dyn CustomDataTrait>)
+        .collect();
+
+    let batch = encode_custom_to_arrow(ManualCustomData::type_name_static(), &custom)
+        .unwrap()
+        .unwrap();
+    let metadata = batch.schema().metadata().clone();
+    let decoded = ManualCustomData::decode_data_batch(&metadata, batch).unwrap();
+
+    assert_eq!(decoded.len(), original.len());
+
+    for (actual, expected) in decoded.iter().zip(&original) {
+        let Data::Custom(custom) = actual else {
+            panic!("expected custom data")
+        };
+
+        let actual = custom
+            .data
+            .as_any()
+            .downcast_ref::<ManualCustomData>()
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            actual.optional_price.map(|p| p.precision),
+            expected.optional_price.map(|p| p.precision)
+        );
+        assert_eq!(
+            actual.optional_quantity.map(|q| q.precision),
+            expected.optional_quantity.map(|q| q.precision)
+        );
+    }
+}
+
+#[rstest]
 fn arrow_custom_data_supports_manual_model_implementations() {
     ensure_custom_data_registered::<ManualCustomData>();
     #[cfg(feature = "high-precision")]
@@ -181,7 +247,7 @@ fn arrow_custom_data_supports_manual_model_implementations() {
         optional_small_signed: None,
         optional_label: Some("native".to_string()),
         optional_instrument_id: Some(InstrumentId::from("ETHUSDT.BINANCE")),
-        optional_params: Some(Params::new()),
+        optional_params: Some(Params::empty()),
         optional_timestamp: Some(UnixNanos::from(150)),
         payload: vec![0, 1, 2, 255],
         ts_event: UnixNanos::from(100),
@@ -316,8 +382,9 @@ fn arrow_custom_data_supports_manual_model_implementations() {
 #[rstest]
 fn arrow_custom_data_round_trips_all_optional_some_fields() {
     ensure_custom_data_registered::<ManualCustomData>();
-    let mut optional_params = Params::new();
-    optional_params.insert("source".to_string(), serde_json::json!("unit-test"));
+    let optional_params =
+        Params::new([("source".to_string(), serde_json::json!("unit-test"))].into());
+
     let original = ManualCustomData {
         values: vec![("optional".to_string(), 11)],
         curve: vec![3.0, 4.0],

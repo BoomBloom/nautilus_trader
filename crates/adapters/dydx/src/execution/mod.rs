@@ -72,7 +72,9 @@ use nautilus_live::{
 use nautilus_model::{
     accounts::AccountAny,
     enums::{AccountType, OmsType, OrderStatus, OrderType, TimeInForce},
-    events::{AccountState, OrderAccepted, OrderCanceled, OrderEventAny, OrderExpired},
+    events::{
+        AccountState, OrderAccepted, OrderCanceled, OrderDeniedReason, OrderEventAny, OrderExpired,
+    },
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Symbol, Venue, VenueOrderId,
     },
@@ -142,9 +144,6 @@ const DYDX_INDEXER_REPORT_LIMIT: u32 = 1_000;
 /// The client follows a two-layer execution model:
 /// 1. **Synchronous validation** - Immediate checks and event generation.
 /// 2. **Async submission** - Non-blocking gRPC calls via `TransactionManager`, `TxBroadcaster`, and `OrderMessageBuilder`.
-///
-/// This matches the pattern used in OKX and other exchange adapters, ensuring
-/// consistent behavior across the Nautilus ecosystem.
 #[derive(Debug)]
 pub struct DydxExecutionClient {
     core: ExecutionClientCore,
@@ -185,6 +184,8 @@ impl DydxExecutionClient {
         wallet_address: String,
         subaccount_number: u32,
     ) -> anyhow::Result<Self> {
+        config.validate()?;
+
         let trader_id = core.trader_id;
         let account_id = core.account_id;
         let clock = get_atomic_clock_realtime();
@@ -879,7 +880,7 @@ impl DydxExecutionClient {
             if let Err(e) = fut.await {
                 if is_definitive_broadcast_rejection(&e) {
                     let error_msg = format!("{label} failed: {e:?}");
-                    log::error!("{error_msg}");
+                    log::warn!("{error_msg}");
 
                     let ts_event = clock.get_time_ns();
                     emitter.emit_order_rejected_event(
@@ -1103,7 +1104,8 @@ async fn broadcast_partitioned_cancels(
                     }
                     Err(e) => {
                         let msg = format!("Short-term batch cancel failed: {e:?}");
-                        log::error!("{msg}");
+                        log::warn!("{msg}");
+
                         // A CheckTx rejection refuses the whole transaction
                         // atomically: a venue result for every cancel in it.
                         if e.is_definitive_broadcast_rejection() {
@@ -1153,7 +1155,7 @@ async fn broadcast_partitioned_cancels(
                     }
                     Err(e) => {
                         let msg = format!("Long-term batch cancel failed: {e:?}");
-                        log::error!("{msg}");
+                        log::warn!("{msg}");
 
                         if e.is_definitive_broadcast_rejection() {
                             emit_partitioned_cancel_rejections(
@@ -1299,9 +1301,9 @@ impl ExecutionClient for DydxExecutionClient {
         }
 
         if order.is_quote_quantity() {
-            let reason = "Quote quantity orders are not supported by dYdX";
-            log::error!("{reason}");
-            self.emitter.emit_order_denied(&order, reason);
+            let reason = OrderDeniedReason::unsupported_quote_quantity().to_string();
+            log::warn!("{reason}");
+            self.emitter.emit_order_denied(&order, &reason);
             return Ok(());
         }
 
@@ -1317,7 +1319,7 @@ impl ExecutionClient for DydxExecutionClient {
         };
 
         if let Some(reason) = unsupported_tif_reason {
-            log::error!("{reason}");
+            log::warn!("{reason}");
             self.emitter.emit_order_denied(&order, reason);
             return Ok(());
         }
@@ -1331,13 +1333,13 @@ impl ExecutionClient for DydxExecutionClient {
             | OrderType::LimitIfTouched => {}
             OrderType::TrailingStopMarket | OrderType::TrailingStopLimit => {
                 let reason = "Trailing stop orders not supported by dYdX v4 protocol";
-                log::error!("{reason}");
+                log::warn!("{reason}");
                 self.emitter.emit_order_denied(&order, reason);
                 return Ok(());
             }
             order_type => {
                 let reason = format!("Order type {order_type:?} not supported by dYdX");
-                log::error!("{reason}");
+                log::warn!("{reason}");
                 self.emitter.emit_order_denied(&order, &reason);
                 return Ok(());
             }
@@ -1633,7 +1635,7 @@ impl ExecutionClient for DydxExecutionClient {
 
         for order in &orders {
             if order.order_type() != OrderType::Limit {
-                log::warn!(
+                log::debug!(
                     "Order {} has type {:?}, falling back to individual submission",
                     order.client_order_id(),
                     order.order_type()
@@ -1663,8 +1665,10 @@ impl ExecutionClient for DydxExecutionClient {
             }
 
             if order.is_quote_quantity() {
-                self.emitter
-                    .emit_order_denied(order, "Quote quantity orders are not supported by dYdX");
+                self.emitter.emit_order_denied(
+                    order,
+                    &OrderDeniedReason::unsupported_quote_quantity().to_string(),
+                );
                 continue;
             }
 
@@ -1793,7 +1797,7 @@ impl ExecutionClient for DydxExecutionClient {
                         {
                             if e.is_definitive_broadcast_rejection() {
                                 let error_msg = format!("Order submission failed: {e:?}");
-                                log::error!("{error_msg}");
+                                log::warn!("{error_msg}");
                                 let ts_event = clock.get_time_ns();
                                 emitter.emit_order_rejected_event(
                                     strategy_id,
@@ -1852,7 +1856,7 @@ impl ExecutionClient for DydxExecutionClient {
                         // A CheckTx rejection refuses the whole transaction
                         // atomically: a venue result for every order in it.
                         let error_msg = format!("Batch order submission failed: {e:?}");
-                        log::error!("{error_msg}");
+                        log::warn!("{error_msg}");
                         let ts_event = clock.get_time_ns();
 
                         for (client_order_id, instrument_id, strategy_id) in order_info {
@@ -1882,7 +1886,7 @@ impl ExecutionClient for DydxExecutionClient {
     /// Strategies should handle `OrderModifyRejected` by canceling and resubmitting.
     fn modify_order(&self, cmd: ModifyOrder) -> anyhow::Result<()> {
         let reason = "dYdX does not support order modification. Use cancel and resubmit instead.";
-        log::error!("{reason}");
+        log::warn!("{reason}");
 
         self.send_modify_rejected(
             cmd.strategy_id,
@@ -1965,7 +1969,7 @@ impl ExecutionClient for DydxExecutionClient {
         // Stored flags remain authoritative after the order expires
         let order_flags = self.get_order_context(client_id_u32).map_or_else(
             || {
-                log::warn!(
+                log::debug!(
                     "Order context not found for {client_order_id}, deriving flags from order"
                 );
                 types::OrderLifetime::from_time_in_force(
@@ -2017,7 +2021,7 @@ impl ExecutionClient for DydxExecutionClient {
                     log::debug!("Successfully cancelled order: {client_order_id}");
                 }
                 Err(e) if e.is_definitive_broadcast_rejection() => {
-                    log::error!("Failed to cancel order {client_order_id}: {e:?}");
+                    log::warn!("Failed to cancel order {client_order_id}: {e:?}");
 
                     let ts_event = clock.get_time_ns();
                     emitter.emit_order_cancel_rejected_event(
@@ -3274,10 +3278,7 @@ mod tests {
             OrderEventAny::Denied(event) => {
                 assert_eq!(event.client_order_id, order.client_order_id());
                 assert_eq!(event.instrument_id, instrument_id);
-                assert_eq!(
-                    event.reason,
-                    "Quote quantity orders are not supported by dYdX"
-                );
+                assert_eq!(event.reason, "UNSUPPORTED_QUOTE_QUANTITY");
             }
             event => panic!("Expected order denied event, was {event:?}"),
         }
@@ -3425,6 +3426,92 @@ mod tests {
             }
             event => panic!("Expected order denied event, was {event:?}"),
         }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_submit_order_list_denies_quote_quantity() {
+        use nautilus_model::{
+            identifiers::OrderListId,
+            orders::{OrderList, builder::OrderTestBuilder},
+        };
+
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_requests = Arc::clone(&requests);
+        let router = Router::new().fallback(move || {
+            observed_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            async { axum::http::StatusCode::NOT_FOUND }
+        });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let grpc = DydxGrpcClient::new(format!("http://{addr}")).await.unwrap();
+        let (mut client, cache, mut rx) = create_execution_client();
+        client.tx_manager = Some(Arc::new(
+            TransactionManager::new(
+                grpc.clone(),
+                &DydxExecutionClient::resolve_private_key(&client.config).unwrap(),
+                client.wallet_address.clone(),
+                client.get_chain_id(),
+            )
+            .unwrap(),
+        ));
+        client.broadcaster = Some(Arc::new(TxBroadcaster::new(
+            grpc,
+            client.config.grpc_quota(),
+        )));
+        client.order_builder = Some(Arc::new(OrderMessageBuilder::new(
+            client.http_client.clone(),
+            client.wallet_address.clone(),
+            client.subaccount_number,
+            client.block_time_monitor.clone(),
+        )));
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::from("BTC-USD-PERP.DYDX"))
+            .quantity(Quantity::from("100"))
+            .price(Price::from("50000"))
+            .quote_quantity(true)
+            .build();
+        cache_order(&cache, order.clone());
+
+        let order_list = OrderList::new(
+            OrderListId::from("OL-QUOTE"),
+            order.instrument_id(),
+            order.strategy_id(),
+            vec![order.client_order_id()],
+            UnixNanos::default(),
+        );
+
+        let command = SubmitOrderList::new(
+            order.trader_id(),
+            Some(*DYDX_CLIENT_ID),
+            order.strategy_id(),
+            order_list,
+            vec![order.init_event().clone()],
+            None,
+            None,
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        );
+
+        client.submit_order_list(command).unwrap();
+
+        let OrderEventAny::Denied(denied) = recv_order_event(&mut rx) else {
+            panic!("Expected order denial");
+        };
+
+        assert_eq!(denied.client_order_id, order.client_order_id());
+        assert_eq!(denied.instrument_id, order.instrument_id());
+        assert_eq!(denied.reason.as_str(), "UNSUPPORTED_QUOTE_QUANTITY");
+        assert_eq!(
+            rx.try_recv().unwrap_err(),
+            tokio::sync::mpsc::error::TryRecvError::Empty
+        );
+        assert_eq!(requests.load(std::sync::atomic::Ordering::Relaxed), 0);
+        server.abort();
     }
 
     // `submit_order_list` mirrors the single-submit TIF gate; an order in the

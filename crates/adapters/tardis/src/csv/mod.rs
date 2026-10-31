@@ -13,11 +13,13 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-pub mod convert;
 pub mod load;
 pub mod stream;
 
 mod record;
+
+#[cfg(feature = "arrow")]
+pub mod convert;
 
 use std::{
     ffi::OsStr,
@@ -90,7 +92,8 @@ fn create_csv_reader<P: AsRef<Path>>(
                             path_ref.display()
                         );
                     }
-                    log::warn!(
+
+                    log::debug!(
                         "Attempt {attempt}/{max_retries} failed to open file '{}': {e}. Retrying after {delay_ms}ms...",
                         path_ref.display()
                     );
@@ -133,7 +136,8 @@ fn create_csv_reader<P: AsRef<Path>>(
                         filepath_ref.display()
                     );
                 }
-                log::warn!(
+
+                log::debug!(
                     "Attempt {attempt}/{MAX_RETRIES} failed to read header from '{}': {e}. Retrying after {DELAY_MS}ms...",
                     filepath_ref.display()
                 );
@@ -159,7 +163,8 @@ fn create_csv_reader<P: AsRef<Path>>(
                         filepath_ref.display()
                     );
                 }
-                log::warn!(
+
+                log::debug!(
                     "Attempt {attempt}/{MAX_RETRIES} failed to seek in '{}': {e}. Retrying after {DELAY_MS}ms...",
                     filepath_ref.display()
                 );
@@ -285,8 +290,8 @@ fn parse_trade_record(
         derive_trade_id(
             data.symbol,
             ts_event.as_u64(),
-            data.price,
-            data.amount,
+            &data.price.to_string(),
+            &data.amount.to_string(),
             &data.side,
         )
     } else {

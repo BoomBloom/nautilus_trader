@@ -192,6 +192,11 @@ impl ExecutionClient for BacktestExecutionClient {
         Ok(())
     }
 
+    fn reset(&mut self) -> anyhow::Result<()> {
+        self.queued_events.borrow_mut().clear();
+        Ok(())
+    }
+
     fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
         // Buffer the OrderSubmitted event for deferred processing to avoid
         // RefCell re-entrancy (exec_engine holds a borrow during execute)
@@ -301,9 +306,13 @@ impl ExecutionClient for BacktestExecutionClient {
 mod tests {
     use nautilus_common::{clock::VirtualClock, messages::execution::QueryOrder};
     use nautilus_core::{DurationNanos, UUID4};
-    use nautilus_execution::models::latency::{LatencyModelHandle, StaticLatencyModel};
+    use nautilus_execution::models::{
+        fee::{FeeModelAny, MakerTakerFeeModel},
+        latency::{LatencyModelHandle, StaticLatencyModel},
+    };
     use nautilus_model::{
         enums::{AccountType, BookType, OmsType},
+        events::OrderSubmitted,
         identifiers::{InstrumentId, StrategyId},
         stubs::TestDefault,
         types::{Currency, Money},
@@ -329,6 +338,7 @@ mod tests {
             .book_type(BookType::L2_MBP)
             .starting_balances(vec![Money::new(1_000.0, Currency::USD())])
             .latency_model(LatencyModelHandle::new(latency_model))
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
             .build()
             .unwrap();
         let exchange = Rc::new(RefCell::new(
@@ -389,6 +399,21 @@ mod tests {
             .into();
 
         assert!(Rc::ptr_eq(&upgraded, &exchange));
+    }
+
+    #[rstest]
+    fn test_reset_clears_buffered_order_events_across_clones() {
+        let (client, _exchange) = setup_client_with_latency();
+        let mut cloned = client.clone();
+        let event = OrderEventAny::Submitted(OrderSubmitted::test_default());
+        let handler = client.order_event_handler();
+        handler(event.clone());
+        assert_eq!(*client.queued_events.borrow(), vec![event]);
+
+        cloned.reset().unwrap();
+
+        assert_eq!(*client.queued_events.borrow(), Vec::<OrderEventAny>::new());
+        assert_eq!(*cloned.queued_events.borrow(), Vec::<OrderEventAny>::new());
     }
 
     #[rstest]

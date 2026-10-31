@@ -103,11 +103,14 @@ pub fn precision_from_increment(increment: &str) -> u8 {
     }
 }
 
-/// Converts a Coinbase order side to a Nautilus aggressor side.
+/// Converts a Coinbase market trade side to a Nautilus aggressor side.
+///
+/// Coinbase reports the maker side on public market trades, so the aggressor is the
+/// opposite side.
 pub fn coinbase_side_to_aggressor(side: &CoinbaseOrderSide) -> AggressorSide {
     match side {
-        CoinbaseOrderSide::Buy => AggressorSide::Buy,
-        CoinbaseOrderSide::Sell => AggressorSide::Sell,
+        CoinbaseOrderSide::Buy => AggressorSide::Sell,
+        CoinbaseOrderSide::Sell => AggressorSide::Buy,
         CoinbaseOrderSide::Unknown => AggressorSide::NoAggressor,
     }
 }
@@ -493,7 +496,7 @@ pub fn parse_order_side_optional(side: &CoinbaseOrderSide) -> Option<OrderSide> 
 ///
 /// # Errors
 ///
-/// Returns an error when Coinbase supplies an unknown side.
+/// Returns an error if Coinbase supplies an unknown side.
 pub fn parse_order_side(side: &CoinbaseOrderSide) -> anyhow::Result<OrderSide> {
     match side {
         CoinbaseOrderSide::Buy => Ok(OrderSide::Buy),
@@ -574,8 +577,7 @@ pub fn parse_order_type(order_type: CoinbaseOrderType) -> OrderType {
 ///
 /// # Errors
 ///
-/// Returns an error when any numeric field cannot be parsed against the
-/// instrument precision.
+/// Returns an error if any numeric field cannot be parsed against the instrument precision.
 pub fn parse_order_status_report(
     order: &Order,
     instrument: &InstrumentAny,
@@ -690,7 +692,8 @@ pub fn parse_order_status_report(
 ///
 /// # Errors
 ///
-/// Returns an error when the price or size cannot be parsed, or the commission cannot be converted to `Money`.
+/// Returns an error if the price or size cannot be parsed, or the commission cannot be converted to
+/// `Money`.
 pub fn parse_fill_report(
     fill: &Fill,
     instrument: &InstrumentAny,
@@ -742,8 +745,8 @@ pub fn parse_fill_report(
 ///
 /// # Errors
 ///
-/// Returns an error when building a balance fails after all accounts have
-/// been exhausted (i.e. every entry was malformed).
+/// Returns an error if building a balance fails after all accounts have been exhausted (i.e. every
+/// entry was malformed).
 pub fn parse_account_state(
     accounts: &[Account],
     account_id: AccountId,
@@ -864,7 +867,7 @@ fn warn_if_liquidation_buffer_low(account_id: AccountId, buffer_percentage: Deci
 ///
 /// # Errors
 ///
-/// Returns an error when any balance cannot be built as [`Money`].
+/// Returns an error if any balance cannot be built as [`Money`].
 pub fn parse_cfm_margin_balances(
     summary: &CfmBalanceSummary,
 ) -> anyhow::Result<Vec<MarginBalance>> {
@@ -946,7 +949,7 @@ pub fn parse_cfm_account_state(
 ///
 /// # Errors
 ///
-/// Returns an error when any component balance cannot be constructed.
+/// Returns an error if any component balance cannot be constructed.
 pub fn parse_ws_cfm_account_state(
     summary: &WsFcmBalanceSummary,
     account_id: AccountId,
@@ -1014,8 +1017,8 @@ pub fn parse_ws_cfm_account_state(
 ///
 /// # Errors
 ///
-/// Returns an error when the quantity or average entry price cannot be
-/// represented with the instrument's precision.
+/// Returns an error if the quantity or average entry price cannot be represented with the
+/// instrument's precision.
 pub fn parse_cfm_position_status_report(
     position: &CfmPosition,
     instrument: &InstrumentAny,
@@ -1476,18 +1479,21 @@ mod tests {
         let instrument_id = InstrumentId::new(Symbol::new("BTC-USD"), coinbase_venue());
         let ts_init = UnixNanos::default();
 
-        for trade_data in &response.trades {
-            let trade = parse_trade_tick(trade_data, instrument_id, 2, 8, ts_init).unwrap();
-            match trade_data.side {
-                CoinbaseOrderSide::Buy => {
-                    assert_eq!(trade.aggressor_side, AggressorSide::Buy);
-                }
-                CoinbaseOrderSide::Sell => {
-                    assert_eq!(trade.aggressor_side, AggressorSide::Sell);
-                }
-                _ => {}
-            }
-        }
+        let aggressor_sides: Vec<AggressorSide> = response
+            .trades
+            .iter()
+            .map(|t| {
+                parse_trade_tick(t, instrument_id, 2, 8, ts_init)
+                    .unwrap()
+                    .aggressor_side
+            })
+            .collect();
+
+        // Fixture sides are SELL, SELL, BUY (maker sides)
+        assert_eq!(
+            aggressor_sides,
+            vec![AggressorSide::Buy, AggressorSide::Buy, AggressorSide::Sell],
+        );
     }
 
     #[rstest]

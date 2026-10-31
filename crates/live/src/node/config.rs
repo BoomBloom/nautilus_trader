@@ -30,7 +30,10 @@ use nautilus_common::{
     msgbus::MessageBusConfig,
     throttler::RateLimit,
 };
-use nautilus_core::{DurationNanos, UUID4, datetime::secs_to_nanos};
+use nautilus_core::{
+    DurationNanos, UUID4,
+    datetime::{get_timezone, secs_to_nanos},
+};
 use nautilus_data::engine::config::DataEngineConfig;
 use nautilus_execution::{
     engine::config::ExecutionEngineConfig, order_emulator::config::OrderEmulatorConfig,
@@ -106,6 +109,8 @@ pub struct LiveDataEngineConfig {
     /// Keys are `BarAggregation` variant names, values are offset durations in nanoseconds.
     #[builder(default)]
     pub time_bars_origin_offset: HashMap<String, u64>,
+    /// The IANA time zone for day and longer bars, defaulting to UTC.
+    pub time_bars_time_zone: Option<String>,
     /// If data timestamp sequencing should be validated and handled.
     #[builder(default)]
     pub validate_data_sequence: bool,
@@ -158,6 +163,7 @@ impl From<LiveDataEngineConfig> for DataEngineConfig {
             time_bars_interval_type: config.time_bars_interval_type,
             time_bars_build_delay: config.time_bars_build_delay,
             time_bars_origin_offset,
+            time_bars_time_zone: config.time_bars_time_zone,
             validate_data_sequence: config.validate_data_sequence,
             buffer_deltas: config.buffer_deltas,
             emit_quotes_from_book: config.emit_quotes_from_book,
@@ -304,6 +310,7 @@ pub(crate) fn validate_max_notional_per_order(
 
     for (instrument_id, notional) in max_notional_per_order {
         let entry_path = format!("{field}[{instrument_id}]");
+
         if let Err(e) = InstrumentId::from_str(instrument_id) {
             collector.push(ConfigError::invalid_reference(
                 entry_path.clone(),
@@ -457,7 +464,6 @@ pub struct LiveExecutionEngineConfig {
     #[builder(default = 5)]
     pub inflight_check_retries: u32,
     /// Policy when a submitted order exhausts automatic recovery.
-    /// Reserved for future use; the runtime currently resolves locally for both variants.
     #[builder(default)]
     pub submission_recovery_policy: SubmissionRecoveryPolicy,
     /// The interval (seconds) between checks for open orders at the venue.
@@ -503,10 +509,12 @@ pub struct LiveExecutionEngineConfig {
     pub purge_account_events_interval_mins: Option<u32>,
     /// The time buffer (minutes) before account events can be purged.
     pub purge_account_events_lookback_mins: Option<u32>,
-    /// If purge operations should also delete from the backing database.
+    /// If purging also deletes orders and positions from the backing database.
+    /// Redis and PostgreSQL retain persisted account events for replay.
     #[builder(default)]
     pub purge_from_database: bool,
-    /// The interval (seconds) between auditing own books against public order books.
+    /// The interval (seconds) between audits that remove own-book orders the cache no longer
+    /// holds as active.
     pub own_books_audit_interval_secs: Option<f64>,
     /// The queue size for the engine's internal queue buffers.
     #[builder(default = 100_000)]
@@ -787,6 +795,7 @@ pub struct LiveNodeConfig {
     #[builder(default = Duration::from_secs(10))]
     pub timeout_disconnection: Duration,
     /// The delay after stopping the node to await residual events before final shutdown.
+    /// Retained submissions still unresolved at this boundary cause shutdown to return an error.
     #[builder(default = Duration::from_secs(10))]
     pub delay_post_stop: Duration,
     /// The timeout to await pending tasks cancellation during shutdown.
@@ -852,7 +861,7 @@ impl LiveNodeConfig {
     ///
     /// # Errors
     ///
-    /// Returns an error when a config field would otherwise be ignored at runtime, or when a
+    /// Returns an error if a config field would otherwise be ignored at runtime, or when a
     /// supported field holds a value that cannot be converted to its engine-side representation.
     pub(crate) fn validate_runtime_support(&self) -> ConfigResult<()> {
         let mut collector = ConfigErrorCollector::new();
@@ -920,6 +929,15 @@ impl PluginConfig {
 impl LiveDataEngineConfig {
     fn validate_runtime_support(&self) -> ConfigResult<()> {
         let mut collector = ConfigErrorCollector::new();
+        if let Some(name) = &self.time_bars_time_zone
+            && let Err(e) = get_timezone(name)
+        {
+            collector.push(ConfigError::invalid_reference(
+                "LiveDataEngineConfig.time_bars_time_zone",
+                "IANA time zone",
+                e.to_string(),
+            ));
+        }
 
         for agg_str in self.time_bars_origin_offset.keys() {
             if let Err(e) = BarAggregation::from_str(agg_str) {
@@ -1066,11 +1084,6 @@ impl LiveExecutionEngineConfig {
 
         let default = Self::default();
         collector.collect(check_supported_field(
-            "LiveExecutionEngineConfig.purge_from_database",
-            self.purge_from_database == default.purge_from_database,
-            RUST_RUNTIME_UNSUPPORTED,
-        ));
-        collector.collect(check_supported_field(
             "LiveExecutionEngineConfig.qsize",
             self.qsize == default.qsize,
             RUST_RUNTIME_UNSUPPORTED,
@@ -1177,6 +1190,33 @@ mod tests {
     use super::*;
 
     #[rstest]
+    #[case(None)]
+    #[case(Some("America/New_York"))]
+    #[case(Some("UTC"))]
+    fn test_calendar_time_zone_config_reaches_data_engine(#[case] name: Option<&str>) {
+        let config = LiveDataEngineConfig::builder()
+            .maybe_time_bars_time_zone(name.map(str::to_owned))
+            .build();
+        assert_eq!(config.validate_runtime_support(), Ok(()));
+        let converted: DataEngineConfig = config.into();
+        assert_eq!(converted.time_bars_time_zone, name.map(str::to_owned));
+    }
+
+    #[rstest]
+    fn test_calendar_time_zone_config_rejects_unknown_zone() {
+        let config = LiveDataEngineConfig::builder()
+            .time_bars_time_zone("Not/A_Zone".to_owned())
+            .build();
+        let error = config.validate_runtime_support().unwrap_err();
+        let expected = ConfigError::invalid_reference(
+            "LiveDataEngineConfig.time_bars_time_zone",
+            "IANA time zone",
+            get_timezone("Not/A_Zone").unwrap_err().to_string(),
+        );
+        assert_eq!(error, expected);
+    }
+
+    #[rstest]
     fn test_trading_node_config_default() {
         let config = LiveNodeConfig::default();
 
@@ -1277,6 +1317,19 @@ mean_dispatch_ns_clear = 700
     }
 
     #[rstest]
+    fn test_validate_runtime_support_accepts_database_purge() {
+        let config = LiveNodeConfig {
+            exec_engine: LiveExecutionEngineConfig {
+                purge_from_database: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(config.validate_runtime_support().is_ok());
+    }
+
+    #[rstest]
     fn test_validate_runtime_support_accepts_msgbus_config() {
         let config = LiveNodeConfig {
             msgbus: Some(MessageBusConfig::default()),
@@ -1304,8 +1357,8 @@ mean_dispatch_ns_clear = 700
     fn test_validate_runtime_support_accepts_streaming_config() {
         let config = LiveNodeConfig {
             streaming: Some(StreamingConfig::new(
-                "catalog".to_string(),
-                "file".to_string(),
+                "stream".to_string(),
+                None,
                 1_000,
                 false,
                 RotationConfig::NoRotation,

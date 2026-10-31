@@ -21,7 +21,11 @@ use nautilus_core::{
     string::{parsing::precision_from_str, secret::REDACTED, urlencoding},
 };
 use nautilus_model::instruments::InstrumentAny;
-use nautilus_network::http::{HttpClient, HttpRedirectPolicy, create_standard_nautilus_headers};
+use nautilus_network::{
+    ConnectionUrl,
+    http::{HttpClient, HttpRedirectPolicy, create_standard_nautilus_headers},
+    url_origin,
+};
 
 use super::{
     error::{Error, TardisErrorResponse},
@@ -43,6 +47,9 @@ use crate::{
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+// Deribit's all-symbol instrument list decompresses to about 284 MB
+const MAX_DECOMPRESSED_BYTES: usize = 1024 * 1024 * 1024;
+
 /// A Tardis HTTP API client.
 /// See <https://docs.tardis.dev/api/http>.
 #[cfg_attr(
@@ -55,7 +62,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 )]
 #[derive(Clone)]
 pub struct TardisHttpClient {
-    base_url: String,
+    base_url: ConnectionUrl,
     credential: Option<Credential>,
     client: HttpClient,
     normalize_symbols: bool,
@@ -114,10 +121,11 @@ impl TardisHttpClient {
             .default_quota(*TARDIS_REST_QUOTA)
             .maybe_timeout_secs(timeout_secs.or(Some(60)))
             .maybe_proxy_url(proxy_url)
+            .max_decompressed_bytes(MAX_DECOMPRESSED_BYTES)
             .build()?;
 
         Ok(Self {
-            base_url,
+            base_url: base_url.into(),
             credential,
             client,
             normalize_symbols,
@@ -143,8 +151,7 @@ impl TardisHttpClient {
         symbol: Option<&str>,
         filter: Option<&InstrumentFilter>,
     ) -> Result<Vec<TardisInstrumentInfo>> {
-        let mut url = format!("{}/instruments/{exchange}", self.base_url);
-
+        let mut url = format!("{}/instruments/{exchange}", self.base_url.expose());
         if let Some(symbol) = symbol {
             url.push_str(&format!("/{symbol}"));
         }
@@ -154,20 +161,25 @@ impl TardisHttpClient {
         {
             url.push_str(&format!("?filter={}", urlencoding::encode(&filter_json)));
         }
-        log::debug!("Requesting: {url}");
+
+        log::debug!("Requesting: {}", url_origin(&url));
 
         let rate_keys = Some(vec![TARDIS_REST_RATE_KEY.to_string()]);
+
         let response = self
             .client
             .get(url, None, None, None, rate_keys)
             .await
-            .map_err(|e| Error::Request(e.to_string()))?;
+            .map_err(|e| {
+                Error::Request(format!("Request to {} failed: {e}", self.base_url.origin()))
+            })?;
 
         let status = response.status.as_u16();
         log::debug!("Response status: {status}");
 
+        let body = &response.body;
         if !response.status.is_success() {
-            let body = String::from_utf8_lossy(&response.body).to_string();
+            let body = String::from_utf8_lossy(body).to_string();
             return if let Ok(error) = serde_json::from_str::<TardisErrorResponse>(&body) {
                 Err(Error::ApiError {
                     status,
@@ -183,7 +195,7 @@ impl TardisHttpClient {
             };
         }
 
-        let body = String::from_utf8_lossy(&response.body);
+        let body = String::from_utf8_lossy(body);
         log::trace!("{body}");
 
         if let Ok(instrument) = serde_json::from_str::<TardisInstrumentInfo>(&body) {
@@ -193,7 +205,7 @@ impl TardisHttpClient {
         match serde_json::from_str(&body) {
             Ok(parsed) => Ok(parsed),
             Err(e) => {
-                log::error!("Failed to parse response: {e}");
+                log::debug!("Failed to parse response: {e}");
                 log::debug!("Response body was: {body}");
                 Err(Error::ResponseParse(e.to_string()))
             }
@@ -306,8 +318,25 @@ impl TardisHttpClient {
 #[cfg(test)]
 mod tests {
     use nautilus_testkit::http::assert_http_redirect_rejected;
+    use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    #[case("https://api.example.com/v1", "https://api.example.com")]
+    #[case(
+        "https://SYN-user:SYN-password@api.example.com:8443/SYN-path?token=SYN-query#SYN-fragment",
+        "https://api.example.com:8443"
+    )]
+    fn test_debug_preserves_url_origin(#[case] url: &str, #[case] origin: &str) {
+        let client =
+            TardisHttpClient::new(Some("SYN-api-key"), Some(url), Some(1), true, None).unwrap();
+        let debug = format!("{client:?}");
+        assert!(debug.contains(&format!("base_url: {origin:?}")));
+        assert!(!debug.contains("SYN-"));
+        assert_eq!(client.base_url.expose(), url);
+    }
+
     #[tokio::test]
     async fn test_authenticated_client_rejects_redirects() {
         let client = TardisHttpClient::new(Some("test-key"), None, Some(3), false, None)

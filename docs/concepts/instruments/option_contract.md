@@ -28,8 +28,6 @@ Examples include equity options, index options, and futures options.
 | `lot_size`        | `Quantity`         | `Quantity`         | Required         | Rounded lot or contract lot size.        |
 | `margin_init`     | `Option<Decimal>`  | `Decimal \| None`  | `0`              | Initial margin rate.                     |
 | `margin_maint`    | `Option<Decimal>`  | `Decimal \| None`  | `0`              | Maintenance margin rate.                 |
-| `maker_fee`       | `Option<Decimal>`  | `Decimal \| None`  | `0`              | Maker fee rate. Negative values rebate.  |
-| `taker_fee`       | `Option<Decimal>`  | `Decimal \| None`  | `0`              | Taker fee rate. Negative values rebate.  |
 | `max_quantity`    | `Option<Quantity>` | `Quantity \| None` | `None`           | Maximum order quantity.                  |
 | `min_quantity`    | `Option<Quantity>` | `Quantity \| None` | `1`              | Minimum order quantity.                  |
 | `max_price`       | `Option<Price>`    | `Price \| None`    | `None`           | Maximum valid quote or order price.      |
@@ -39,7 +37,7 @@ Examples include equity options, index options, and futures options.
 | `ts_event`        | `UnixNanos`        | `int`              | Required         | Event timestamp in nanoseconds.          |
 | `ts_init`         | `UnixNanos`        | `int`              | Required         | Initialization timestamp in nanoseconds. |
 
-*Note: Python constructors use `instrument_id`; Rust stores the same value as `id`.*
+**Note**: Python constructors use `instrument_id`. Rust stores the same value as `id`.
 
 ## Behavior
 
@@ -119,7 +117,7 @@ aapl_call = OptionContract(
 
 ## Adapters
 
-Representative adapters that create or consume `OptionContract` instruments include:
+**Adapters that create or consume `OptionContract` instruments include**:
 
 - [Databento](../../integrations/databento.md) for listed options data.
 - [Interactive Brokers](../../integrations/interactive_brokers.md) for listed option contracts.

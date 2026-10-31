@@ -80,11 +80,13 @@ same type return `Decimal`:
 
 The same pattern applies to `Quantity` and `Money`.
 
-These operations do not return the original type because the result has different
-dimensional meaning. Multiplying a price by a price produces "price squared", not
-a price. Dividing a quantity by a quantity produces a dimensionless ratio, not a
-quantity. Returning `Decimal` makes the unit change explicit and prevents
-misinterpretation of the result as a value with the original unit.
+These operations return `Decimal` because the result has different dimensional meaning:
+
+- Multiplying a price by a price produces "price squared", not a price.
+- Dividing a quantity by a quantity produces a dimensionless ratio, not a quantity.
+
+Returning `Decimal` makes the unit change explicit and prevents misinterpretation of the result as a value
+with the original unit.
 
 ### Unary operations
 
@@ -123,9 +125,9 @@ print(type(+qty))  # <class 'nautilus_trader.model.Quantity'>
 ### Mixed-type operations
 
 When operating with other numeric types, the result type follows Python's
-[numeric tower](https://docs.python.org/3/library/numbers.html) conventions. The general
-principle is that operations widen to the more general type: `float` operations return
-`float`, while `int` and `Decimal` operations return `Decimal` for precision preservation.
+[numeric tower](https://docs.python.org/3/library/numbers.html) conventions. Operations widen to the more
+general type. `float` operations return `float`, while `int` and `Decimal` operations return `Decimal` for
+precision preservation.
 
 This applies to all six binary operators (`+`, `-`, `*`, `/`, `//`, `%`) and works
 in both directions (`value op scalar` and `scalar op value`):
@@ -161,17 +163,16 @@ print(type(result3))  # <class 'decimal.Decimal'>
 
 ## Precision handling
 
-Each value type carries a precision indicating the number of decimal places:
-`Price` and `Quantity` store an explicit `precision` field, while `Money` uses its
-currency's precision. Precision is set at construction and is immutable. There is
-no "unspecified" precision.
+`Price` and `Quantity` store an explicit, immutable `precision` field that indicates the number of decimal
+places. `Money` uses its currency's precision for default rounding and minimum display precision. Its exact
+constructors can retain finer amounts without changing the currency. The types have no "unspecified" precision.
 
 ### Fixed-point representation
 
-Value types are stored internally as integers scaled to a global fixed precision
-(e.g., 10^16 in high-precision mode), not floating-point numbers. The precision
-tracks the number of decimal places used at construction, controlling display
-formatting and serialization, but the underlying raw value always uses the global scale.
+Value types use scaled integers instead of floating-point numbers. The global scale is 10^9 in standard
+mode and 10^16 in high-precision mode. DeFi values with higher supported precision use that precision as
+their scale. For `Price` and `Quantity`, the explicit precision controls display formatting and serialization.
+`Money` displays at least its currency precision and retains finer stored digits.
 
 ```python
 from nautilus_trader.model import Price
@@ -184,19 +185,17 @@ str(p1)  # "1.23"
 str(p2)  # "1.230"
 ```
 
-**Precision controls display, not identity.** Two prices with the same decimal value but
-different precisions are equal. The `precision` field determines string formatting and
-how many decimal places are shown, but equality is based on the underlying numeric value.
+**Precision and identity**: two prices with the same decimal value but different precisions are equal.
+Precision controls display, not identity. The `precision` field determines string formatting and how many
+decimal places are shown. Equality is based on the underlying numeric value.
 
-**Market data serialization uses precision metadata.** When market data types (quotes,
-trades, order book deltas) are written to Parquet or Arrow format, precision is stored in
-the file metadata so that values can be correctly decoded. All market data values within
-a single file must share the same precision.
+**Market data serialization**: when market data types (such as quotes, trades, and order book deltas) are
+written to Parquet or Arrow, file metadata stores their precision. This lets readers decode the values
+correctly. All market data values within a single file must share the same precision.
 
 :::warning
-If a venue changes an instrument's tick size (and thus its precision), data files written
-before and after the change will have different precision metadata and should not be
-consolidated into a single file.
+If a venue changes an instrument's tick size (and thus its precision), data files written before and after the
+change have different precision metadata. Do not consolidate them into a single file.
 :::
 
 For how instrument-level precision constrains valid prices and quantities, see the
@@ -258,6 +257,27 @@ result = usd_amount + Money(25.00, USD)
 result = usd_amount + eur_amount
 ```
 
+Use `Money.from_decimal_exact` or `Money.from_str_exact` to preserve amounts finer than the currency precision:
+
+```python
+from decimal import Decimal
+
+from nautilus_trader.model import Currency, Money
+
+USD = Currency.from_str("USD")
+exact = Money.from_decimal_exact(Decimal("1.0001"), USD)
+
+assert str(exact) == "1.0001 USD"
+assert exact.currency.precision == 2
+assert Money.from_str("1.0001 USD") == Money.from_str("1.00 USD")
+```
+
+Exact constructors reject precision loss and out-of-range amounts. USD supports 9 decimal places in standard
+mode and 16 in high-precision mode. DeFi currencies use their currency scale when it is higher.
+`Money.from_decimal_exact` requires a `Decimal` and raises `TypeError` for other types. `Money(...)`,
+`Money.from_str`, and `Money.from_decimal` round to the currency precision.
+String serialization preserves stored finer digits; deserialization restores them without currency rounding.
+
 ## Common patterns
 
 ### Accumulating values
@@ -296,6 +316,13 @@ float_value = price.as_double()
 # Convert to string
 string_value = str(price)  # "123.456"
 ```
+
+Float conversion supports precision up to 16. `float()`, `as_double()`, and arithmetic with a
+`float` operand raise `ValueError` for precision 17 or 18 rather than round away the extra digits.
+Conversions at precision 16 or below can still round, since a float holds about 16 significant
+digits. Use `as_decimal()` to avoid binary-float conversion. The conversion uses Rust `Decimal`, whose
+96-bit mantissa can lose fractional digits when a value has too many significant digits. String
+serialization preserves the full stored `Money` amount.
 
 ### Creating from strings
 

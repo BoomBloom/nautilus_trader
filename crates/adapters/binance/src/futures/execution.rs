@@ -28,6 +28,7 @@ use ahash::AHashSet;
 use anyhow::Context;
 use async_trait::async_trait;
 use dashmap::DashMap;
+use indexmap::IndexMap;
 use nautilus_common::{
     cache::fifo::FifoCache,
     clients::ExecutionClient,
@@ -109,7 +110,7 @@ use crate::{
         },
         credential::resolve_credentials,
         dispatch::{OrderIdentity, PendingOperation, PendingRequest, WsDispatchState},
-        encoder::encode_broker_id,
+        encoder::{encode_broker_id, legacy_client_order_id},
         enums::{
             BinanceEnvironment, BinanceFuturesOrderType, BinancePositionSide, BinancePriceMatch,
             BinanceProductType, BinanceSide, BinanceTimeInForce, BinanceWorkingType,
@@ -316,6 +317,37 @@ impl BinanceFuturesExecutionClient {
         })
     }
 
+    fn restore_active_orders(&self) -> anyhow::Result<()> {
+        for order in crate::common::execution::active_orders(&self.core) {
+            let Some(instrument) = self
+                .http_client
+                .instrument_reconciliation(&order.instrument_id())
+            else {
+                continue;
+            };
+
+            let (_, venue_position_id) = resolve_order_position_identity(
+                self.is_hedge_mode(),
+                self.config.use_position_ids,
+                &order,
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to restore Binance Futures order {}: {e}",
+                    order.client_order_id()
+                )
+            })?;
+
+            self.dispatch_state.restore_order(
+                &order,
+                venue_position_id,
+                instrument.price_precision(),
+            );
+        }
+
+        Ok(())
+    }
+
     /// Returns whether the account is in hedge mode (dual side position).
     #[must_use]
     pub fn is_hedge_mode(&self) -> bool {
@@ -406,7 +438,8 @@ impl BinanceFuturesExecutionClient {
             margins.push(MarginBalance::new(initial, maintenance, None));
         }
 
-        let mut info = Params::new();
+        let mut info = IndexMap::new();
+
         let mut push_decimal = |key: &str, val: Option<Decimal>| {
             if let Some(decimal) = val {
                 info.insert(
@@ -430,7 +463,12 @@ impl BinanceFuturesExecutionClient {
         push_decimal("total_cross_unpnl", account_info.total_cross_un_pnl);
         push_decimal("available_balance", account_info.available_balance);
         push_decimal("max_withdraw_amount", account_info.max_withdraw_amount);
-        let info = if info.is_empty() { None } else { Some(info) };
+
+        let info = if info.is_empty() {
+            None
+        } else {
+            Some(Params::new(info))
+        };
 
         AccountState::new(
             account_id,
@@ -449,10 +487,7 @@ impl BinanceFuturesExecutionClient {
     async fn refresh_account_state(&self) -> anyhow::Result<AccountState> {
         let account_info = match self.http_client.query_account().await {
             Ok(info) => info,
-            Err(e) => {
-                log::error!("Binance Futures account state request failed: {e}");
-                anyhow::bail!("Binance Futures account state request failed: {e}");
-            }
+            Err(e) => anyhow::bail!("Binance Futures account state request failed: {e}"),
         };
 
         Ok(self.create_account_state(&account_info))
@@ -567,6 +602,7 @@ impl BinanceFuturesExecutionClient {
                 order_type,
                 price,
                 quantity,
+                is_quote_quantity: false,
                 venue_position_id,
             },
         );
@@ -664,7 +700,7 @@ impl BinanceFuturesExecutionClient {
                     .await
                 {
                     dispatch_state.pending_requests.remove(&request_id);
-                    log::error!("WS submit request failed for {client_order_id}: {e}");
+                    log::warn!("WS submit request failed for {client_order_id}: {e}");
                     anyhow::bail!("WS submit order failed: {e}");
                 }
                 Ok(())
@@ -846,13 +882,49 @@ impl BinanceFuturesExecutionClient {
                 },
             );
 
+            let http_client = self.http_client.clone();
             self.spawn_task("cancel_order_ws", async move {
-                if let Err(e) = ws_client
-                    .cancel_order_with_id(request_id.clone(), params)
+                let mut params = params;
+                http_client
+                    .inner()
+                    .resolve_order_identity(
+                        &params.symbol,
+                        &mut params.order_id,
+                        &mut params.orig_client_order_id,
+                        false,
+                    )
                     .await
-                {
+                    .inspect_err(|e| {
+                        dispatch_state.pending_requests.remove(&request_id);
+                        let ts_now = clock.get_time_ns();
+
+                        let rejected = OrderCancelRejected::new(
+                            trader_id,
+                            command.strategy_id,
+                            command.instrument_id,
+                            command.client_order_id,
+                            format!(
+                                "cancel identity lookup failed before submission: {}",
+                                sanitize_reason(&e.to_string())
+                            )
+                            .into(),
+                            UUID4::new(),
+                            ts_now,
+                            ts_now,
+                            false,
+                            command.venue_order_id,
+                            Some(account_id),
+                        );
+                        emitter.send_order_event(OrderEventAny::CancelRejected(rejected));
+                    })?;
+
+                let result = ws_client
+                    .cancel_order_with_id(request_id.clone(), params)
+                    .await;
+
+                if let Err(e) = result {
                     dispatch_state.pending_requests.remove(&request_id);
-                    log::error!("WS cancel request failed for {client_order_id}: {e}");
+                    log::warn!("WS cancel request failed for {client_order_id}: {e}");
                     anyhow::bail!("WS cancel order failed: {e}");
                 }
                 Ok(())
@@ -864,25 +936,9 @@ impl BinanceFuturesExecutionClient {
         let http_client = self.http_client.clone();
 
         self.spawn_task("cancel_order", async move {
-            let result = if use_algo_cancel {
-                // Try algo cancel first; if it fails, the order may have been triggered
-                // before this session started, so fall back to regular cancel
-                match http_client.cancel_algo_order(client_order_id).await {
-                    Ok(()) => Ok(()),
-                    Err(algo_err) => {
-                        log::debug!("Algo cancel failed, trying regular cancel: {algo_err}");
-                        http_client
-                            .cancel_order(instrument_id, venue_order_id, Some(client_order_id))
-                            .await
-                            .map(|_| ())
-                    }
-                }
-            } else {
-                http_client
-                    .cancel_order(instrument_id, venue_order_id, Some(client_order_id))
-                    .await
-                    .map(|_| ())
-            };
+            let result = cancel_order_http(
+                &http_client, instrument_id, venue_order_id, client_order_id, use_algo_cancel,
+            ).await;
 
             match result {
                 Ok(()) => {
@@ -936,9 +992,13 @@ impl BinanceFuturesExecutionClient {
             let mut regular = Vec::new();
             let mut algo = Vec::new();
 
-            for order in
-                cache.orders_open(None, Some(&cmd.instrument_id), None, None, cmd.order_side)
-            {
+            for order in cache.orders_open(
+                None,
+                Some(&cmd.instrument_id),
+                None,
+                Some(&self.core.account_id),
+                cmd.order_side,
+            ) {
                 let cancel = CancelOrder {
                     trader_id: order.trader_id(),
                     client_id: cmd.client_id,
@@ -1508,7 +1568,7 @@ fn build_futures_order_list_batch(
     let mut batch_items = Vec::with_capacity(orders.len());
     for order in orders {
         if price_match.is_some() && order.is_post_only() {
-            return Err("price_match cannot be combined with post-only orders".to_string());
+            return Err(OrderDeniedReason::unsupported_post_only().to_string());
         }
 
         if price_match.is_some() && order.order_type() != OrderType::Limit {
@@ -1614,9 +1674,7 @@ fn determine_futures_order_lifetime(
     }
 
     if post_only {
-        return Err(OrderDeniedReason::ValidationFailed {
-            detail: "Binance Futures GTD cannot be post-only".to_string(),
-        });
+        return Err(OrderDeniedReason::unsupported_post_only());
     }
 
     if product_type != BinanceProductType::UsdM {
@@ -1851,6 +1909,8 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
         }
         self.core.set_instruments_initialized();
 
+        self.restore_active_orders()?;
+
         // Apply configured leverage and margin types
         self.apply_futures_config()
             .await
@@ -2070,7 +2130,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                     })?;
                 }
                 Err(e) => {
-                    log::error!(
+                    log::warn!(
                         "Failed to connect WS trading API: {e}. \
                          Order operations will use HTTP fallback"
                     );
@@ -3329,6 +3389,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                     order_type: order.order_type(),
                     price: order.price(),
                     quantity: order.quantity(),
+                    is_quote_quantity: false,
                     venue_position_id,
                 },
             );
@@ -3541,13 +3602,49 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                 },
             );
 
+            let http_client = self.http_client.clone();
             self.spawn_task("modify_order_ws", async move {
-                if let Err(e) = ws_client
-                    .modify_order_with_id(request_id.clone(), params)
+                let mut params = params;
+                http_client
+                    .inner()
+                    .resolve_order_identity(
+                        &params.symbol,
+                        &mut params.order_id,
+                        &mut params.orig_client_order_id,
+                        true,
+                    )
                     .await
-                {
+                    .inspect_err(|e| {
+                        dispatch_state.pending_requests.remove(&request_id);
+                        let ts_now = clock.get_time_ns();
+
+                        let rejected = OrderModifyRejected::new(
+                            trader_id,
+                            command.strategy_id,
+                            command.instrument_id,
+                            command.client_order_id,
+                            format!(
+                                "modify identity lookup failed before submission: {}",
+                                sanitize_reason(&e.to_string())
+                            )
+                            .into(),
+                            UUID4::new(),
+                            ts_now,
+                            ts_now,
+                            false,
+                            command.venue_order_id,
+                            Some(account_id),
+                        );
+                        emitter.send_order_event(OrderEventAny::ModifyRejected(rejected));
+                    })?;
+
+                let result = ws_client
+                    .modify_order_with_id(request_id.clone(), params)
+                    .await;
+
+                if let Err(e) = result {
                     dispatch_state.pending_requests.remove(&request_id);
-                    log::error!(
+                    log::warn!(
                         "WS modify request failed for {}: {e}",
                         command.client_order_id
                     );
@@ -3575,7 +3672,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
 
             match result {
                 Ok(report) => {
-                    if !dispatch_state.record_order_update(command.client_order_id, report.venue_order_id, quantity, price, None) {
+                    if dispatch_state.record_order_update(command.client_order_id, report.venue_order_id, quantity, price, None) != Some(true) {
                         return Ok(());
                     }
                     let ts_now = clock.get_time_ns();
@@ -3790,13 +3887,26 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                             }
                         }
                         Err(e) => {
-                            // Log per classification and continue with the remaining chunks:
-                            // a whole-request failure says nothing about unsent sibling chunks
                             match classify_futures_http_failure(&e) {
                                 CommandFailure::NotSent(reason) => {
-                                    log::warn!(
-                                        "Batch cancel command failed before sending for {batch_len} orders: {reason}",
-                                    );
+                                    for cancel in &batch_cancels {
+                                        let ts_now = clock.get_time_ns();
+
+                                        let rejected = OrderCancelRejected::new(
+                                            trader_id,
+                                            cancel.strategy_id,
+                                            cancel.instrument_id,
+                                            cancel.client_order_id,
+                                            format!("batch-cancel-error: {}", sanitize_reason(&reason)).into(),
+                                            UUID4::new(),
+                                            ts_now,
+                                            ts_now,
+                                            false,
+                                            cancel.venue_order_id,
+                                            Some(account_id),
+                                        );
+                                        emitter.send_order_event(OrderEventAny::CancelRejected(rejected));
+                                    }
                                 }
                                 CommandFailure::VenueRejected(reason)
                                 | CommandFailure::Ambiguous(reason) => {
@@ -3909,9 +4019,7 @@ fn validate_order(
         let order_type = order.order_type();
 
         if order.is_post_only() {
-            return Err(OrderDeniedReason::ValidationFailed {
-                detail: "price_match cannot be combined with post-only orders".to_string(),
-            });
+            return Err(OrderDeniedReason::unsupported_post_only());
         }
 
         if order_type != OrderType::Limit {
@@ -4031,6 +4139,61 @@ fn user_trades_complete_start(ts_init: UnixNanos, ts_now: UnixNanos) -> UnixNano
         .saturating_sub(USER_TRADES_COMPLETE_INTERVAL)
 }
 
+async fn cancel_order_http(
+    http_client: &BinanceFuturesHttpClient,
+    instrument_id: InstrumentId,
+    venue_order_id: Option<VenueOrderId>,
+    client_order_id: ClientOrderId,
+    use_algo_cancel: bool,
+) -> anyhow::Result<()> {
+    if !use_algo_cancel {
+        return http_client
+            .cancel_order(instrument_id, venue_order_id, Some(client_order_id))
+            .await
+            .map(|_| ());
+    }
+
+    // The algo may have triggered before this session, so a regular cancel can still be needed
+    let algo_err = match http_client.cancel_algo_order(client_order_id).await {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+
+    if !should_retry_regular_cancel(client_order_id, &algo_err) {
+        return Err(algo_err);
+    }
+
+    log::debug!("Algo cancel failed, trying regular cancel: {algo_err}");
+
+    match http_client
+        .cancel_order(instrument_id, venue_order_id, Some(client_order_id))
+        .await
+        .map(|_| ())
+    {
+        Err(e)
+            if matches!(
+                e.downcast_ref::<BinanceFuturesHttpError>(),
+                Some(BinanceFuturesHttpError::RateLimitBlocked)
+            ) =>
+        {
+            Err(algo_err)
+        }
+        result => result,
+    }
+}
+
+fn should_retry_regular_cancel(client_order_id: ClientOrderId, error: &anyhow::Error) -> bool {
+    let encoded = encode_broker_id(&client_order_id, BINANCE_NAUTILUS_FUTURES_BROKER_ID);
+    legacy_client_order_id(&encoded, BINANCE_NAUTILUS_FUTURES_BROKER_ID).is_none()
+        || matches!(
+            error.downcast_ref::<BinanceFuturesHttpError>(),
+            Some(BinanceFuturesHttpError::BinanceError {
+                code: -2011 | -2013,
+                ..
+            })
+        )
+}
+
 fn should_use_algo_cancel(is_algo: bool, is_triggered: bool, has_promoted_id: bool) -> bool {
     is_algo && !is_triggered && !has_promoted_id
 }
@@ -4086,8 +4249,8 @@ mod tests {
         events::OrderEventAny,
         identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId, VenueOrderId},
         instruments::stubs::{
-            crypto_future_btcusdt, crypto_perpetual_ethusdt, currency_pair_btcusdt,
-            perpetual_contract_eurusd, xbtusd_bitmex,
+            btcusd_bybit, crypto_future_btcusdt, crypto_perpetual_ethusdt, currency_pair_btcusdt,
+            perpetual_contract_eurusd,
         },
         orders::{OrderTestBuilder, stubs::TestOrderEventStubs},
         types::{Price, Quantity},
@@ -4205,6 +4368,39 @@ mod tests {
             info.get_str("max_withdraw_amount"),
             Some("9.0000000000000009")
         );
+    }
+
+    #[rstest]
+    #[case(-2011, true)]
+    #[case(-2013, true)]
+    #[case(-2015, false)]
+    #[case(-1007, false)]
+    fn test_tagged_algo_cancel_fallback_requires_missing_order(
+        #[case] code: i64,
+        #[case] expected: bool,
+    ) {
+        let id = ClientOrderId::new("O-20260922-160119-V2-000-8");
+        let error = anyhow::anyhow!(BinanceFuturesHttpError::BinanceError {
+            code,
+            message: "test".to_string(),
+            status: 400,
+            retry_after: None,
+        });
+        assert_eq!(should_retry_regular_cancel(id, &error), expected);
+        assert!(!should_retry_regular_cancel(
+            id,
+            &anyhow::anyhow!(BinanceFuturesHttpError::Timeout("lookup".into()))
+        ));
+        assert!(!should_retry_regular_cancel(
+            id,
+            &anyhow::anyhow!(BinanceFuturesHttpError::ValidationError(
+                "ambiguous identity".into()
+            ))
+        ));
+        assert!(should_retry_regular_cancel(
+            ClientOrderId::new("legacy-order"),
+            &error
+        ));
     }
 
     #[rstest]
@@ -4388,7 +4584,7 @@ mod tests {
         OrderType::Limit,
         UnixNanos::from_seconds(1_700_000_601),
         true,
-        "cannot be post-only"
+        "UNSUPPORTED_POST_ONLY"
     )]
     fn test_futures_order_lifetime_rejects_invalid_gtd(
         #[case] product_type: BinanceProductType,
@@ -4502,7 +4698,7 @@ mod tests {
     fn test_instrument_product_matching_distinguishes_futures_products_from_spot() {
         let usdm = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
         let generic_perpetual = InstrumentAny::PerpetualContract(perpetual_contract_eurusd());
-        let coinm = InstrumentAny::CryptoPerpetual(xbtusd_bitmex());
+        let coinm = InstrumentAny::CryptoPerpetual(btcusd_bybit());
         let delivery =
             || crypto_future_btcusdt(2, 6, Price::from("0.01"), Quantity::from("0.000001"));
         let usdm_delivery = InstrumentAny::CryptoFuture(delivery());

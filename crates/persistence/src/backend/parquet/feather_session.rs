@@ -23,35 +23,63 @@
     reason = "session registration keeps backend-specific ordering logic together"
 )]
 
-use std::{borrow::Cow, sync::Arc};
+use std::{collections::HashMap, fs, io, sync::Arc};
 
-use datafusion::arrow::{datatypes::Schema, record_batch::RecordBatch};
+use ahash::AHashMap;
+use datafusion::arrow::{
+    array::{
+        Array, ArrayRef, FixedSizeListArray, GenericListArray, LargeListArray, ListArray,
+        OffsetSizeTrait, StructArray, UInt64Array,
+    },
+    compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices, take_record_batch},
+    datatypes::{DataType, Field, Schema},
+    record_batch::RecordBatch,
+};
 use futures::StreamExt;
 use indexmap::IndexMap;
+use nautilus_common::enums::Environment;
 use nautilus_core::UnixNanos;
-use nautilus_model::data::{
-    Bar, Data, FundingRateUpdate, HasTsInit, IndexPriceUpdate, InstrumentStatus, MarkPriceUpdate,
-    OptionGreeks, OrderBookDelta, OrderBookDepth, QuoteTick, TradeTick, close::InstrumentClose,
-    to_variant,
+#[cfg(feature = "defi")]
+use nautilus_model::data::NautilusRecordType;
+use nautilus_model::{
+    data::{
+        Bar, Data, FundingRateUpdate, HasTsInit, IndexPriceUpdate, InstrumentStatus,
+        MarkPriceUpdate, NautilusDataType, OptionGreeks, OrderBookDelta, OrderBookDepth, QuoteTick,
+        TradeTick, close::InstrumentClose, to_variant,
+    },
+    enums::BookAction,
 };
 use nautilus_serialization::arrow::{
-    DecodeDataFromRecordBatch, DecodeTypedFromRecordBatch, U64ColumnRef,
+    DecodeDataFromRecordBatch, DecodeTypedFromRecordBatch, KEY_TYPE_NAME, U64ColumnRef,
+    extract_column_by_name, extract_column_string, extract_decimal_column,
+    record_batch_without_identifier_column,
 };
 use object_store::path::Path as ObjectPath;
 
 use crate::{
     backend::parquet::{
         catalog::ParquetDataCatalog,
-        paths::{make_object_store_path, urisafe_instrument_id},
+        intervals::are_intervals_disjoint,
+        io::read_parquet_from_object_store,
+        paths::{
+            catalog_filename, make_object_store_path, query_intersects_filename,
+            urisafe_instrument_id,
+        },
     },
-    catalog::types::{CatalogDataType, parquet_data_path_prefix, record_path_prefix},
+    catalog::types::{
+        CatalogDataType, instrument_path_prefix, parquet_data_path_prefix, record_path_prefix,
+    },
     common::{
         conversion::FeatherConversionSummary,
         custom::decode_custom_batches_to_data,
-        datafusion::identifiers_from_record_batches,
-        paths::{identifier_from_session_feather_path, type_name_from_session_feather_path},
+        datafusion::{filter_record_batch_by_identifier, identifiers_from_record_batches},
+        paths::{
+            catalog_data_type_from_session_feather_path, environment_directory,
+            identifier_from_session_feather_path,
+        },
     },
     writer::{
+        feather::recover_partial_feather_files,
         materializer::{
             StreamConversionOptions, apply_stream_conversion_transform,
             coalesce_stream_conversion_batches, read_feather_record_batches,
@@ -60,6 +88,8 @@ use crate::{
         run::FeatherSessionSource,
     },
 };
+
+const PROMOTION_ROW_INDEX: &str = "nautilus_promotion_row_index";
 
 impl ParquetDataCatalog {
     pub(crate) fn promote_feather_file(
@@ -70,21 +100,22 @@ impl ParquetDataCatalog {
         use_ts_event_for_ts_init: bool,
         replay_identity: &str,
     ) -> anyhow::Result<Option<FeatherConversionSummary>> {
+        let batches = Self::restore_staged_batches(batches)?;
         if batches.is_empty() {
             return Ok(None);
         }
-        let batches = Self::restore_staged_batches(batches)?;
-        let type_name =
-            type_name_from_session_feather_path(feather_path, &source.kind, &source.instance_id)?;
-        let catalog_data_name = Self::canonical_stream_data_name(&type_name);
-        anyhow::ensure!(
-            Self::is_supported_stream_data_type(catalog_data_name),
-            "Unknown data class: {type_name}"
-        );
+
+        let data_type = catalog_data_type_from_session_feather_path(
+            feather_path,
+            source.environment,
+            &source.instance_id,
+        )?;
+        Self::ensure_stream_data_type(&data_type)?;
+
         let identifier = Self::identifier_from_batch_or_path(
             &batches[0],
             feather_path,
-            &source.kind,
+            source.environment,
             &source.instance_id,
         )
         .filter(|identifier| {
@@ -92,7 +123,7 @@ impl ParquetDataCatalog {
                 Self::identifier_from_batch_or_path(
                     batch,
                     feather_path,
-                    &source.kind,
+                    source.environment,
                     &source.instance_id,
                 )
                 .as_ref()
@@ -101,16 +132,16 @@ impl ParquetDataCatalog {
         });
 
         self.convert_feather_batches_to_parquet(
-            &source.kind,
+            source.environment,
             &source.instance_id,
-            catalog_data_name,
+            &data_type,
             feather_path,
             &batches,
             use_ts_event_for_ts_init,
             Some(replay_identity),
         )?;
         Ok(Some(FeatherConversionSummary {
-            type_name,
+            data_type,
             identifier,
             feather_path: feather_path.to_string(),
             native_version: None,
@@ -129,13 +160,15 @@ impl ParquetDataCatalog {
     ///
     /// # Returns
     ///
-    /// Returns a vector of `Data` objects from the live run, sorted by timestamp,
-    /// or an error if the operation fails.
+    /// Returns a vector of `Data` objects from the live run, sorted by timestamp, or an empty
+    /// vector if the run does not exist. Returns an error if the operation fails.
     ///
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The instance ID doesn't exist.
+    /// - The instance ID is empty, is `.` or `..`, or contains `/`, `\`, `:`, or a NUL character.
+    /// - The `live` run root does not resolve strictly inside the catalog.
+    /// - The run directory does not resolve strictly inside the `live` run root.
     /// - Feather file reading fails.
     /// - Data deserialization fails.
     ///
@@ -168,7 +201,7 @@ impl ParquetDataCatalog {
     /// # Ok::<(), anyhow::Error>(())
     /// ```
     pub fn read_live_run(&self, instance_id: &str) -> anyhow::Result<Vec<Data>> {
-        self.read_run_data("live", instance_id)
+        self.read_run(Environment::Live, instance_id)
     }
 
     /// Reads data from a backtest run instance.
@@ -182,13 +215,15 @@ impl ParquetDataCatalog {
     ///
     /// # Returns
     ///
-    /// Returns a vector of `Data` objects from the backtest run, sorted by timestamp,
-    /// or an error if the operation fails.
+    /// Returns a vector of `Data` objects from the backtest run, sorted by timestamp, or an empty
+    /// vector if the run does not exist. Returns an error if the operation fails.
     ///
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The instance ID doesn't exist.
+    /// - The instance ID is empty, is `.` or `..`, or contains `/`, `\`, `:`, or a NUL character.
+    /// - The `backtest` run root does not resolve strictly inside the catalog.
+    /// - The run directory does not resolve strictly inside the `backtest` run root.
     /// - Feather file reading fails.
     /// - Data deserialization fails.
     ///
@@ -213,151 +248,178 @@ impl ParquetDataCatalog {
     /// # Ok::<(), anyhow::Error>(())
     /// ```
     pub fn read_backtest(&self, instance_id: &str) -> anyhow::Result<Vec<Data>> {
-        self.read_run_data("backtest", instance_id)
+        self.read_run(Environment::Backtest, instance_id)
     }
 
-    /// Helper function to read data from a run instance (backtest or live).
+    /// Reads the sealed Feather files of a run instance (backtest or live).
     ///
-    /// This function reads all data associated with a specific run instance
-    /// from feather files stored in the catalog.
-    ///
-    /// # Parameters
-    ///
-    /// - `subdirectory`: The subdirectory name ("backtest" or "live").
-    /// - `instance_id`: The ID of the run instance to read.
-    ///
-    /// # Returns
-    ///
-    /// Returns a vector of `Data` objects from the run, sorted by timestamp,
-    /// or an error if the operation fails.
-    fn read_run_data(&self, subdirectory: &str, instance_id: &str) -> anyhow::Result<Vec<Data>> {
-        // List all data type directories in the instance directory
-        let data_types = self.list_directory_stems(&format!("{subdirectory}/{instance_id}"))?;
-
-        if data_types.is_empty() {
-            // No data types found - return empty vector
-            return Ok(Vec::new());
-        }
-
+    /// Abandoned `.feather.partial` files are recovered first, and files a writer still holds
+    /// open are not read. Families that do not decode to `Data`, such as order events, are
+    /// skipped.
+    fn read_run(&self, environment: Environment, instance_id: &str) -> anyhow::Result<Vec<Data>> {
+        self.recover_partial_run_files(environment, instance_id)?;
+        let feather_files = self.list_feather_files(environment, instance_id, None, None)?;
         let mut all_data: Vec<Data> = Vec::new();
 
-        // Process each persisted data type.
-        for data_cls in data_types {
-            // List all feather files for this data type
-            let feather_files = self.list_feather_files(
-                subdirectory,
-                instance_id,
-                &data_cls,
-                None, // No identifier filtering - read all
-            )?;
+        for file_path in feather_files {
+            let data_type =
+                catalog_data_type_from_session_feather_path(&file_path, environment, instance_id)?;
 
-            if feather_files.is_empty() {
-                continue; // Skip if no files found
+            // A file may hold several batches
+            let batches = self.read_feather_file(&file_path)?;
+
+            if batches.is_empty() {
+                continue;
             }
 
-            // Process each feather file
-            for file_path in feather_files {
-                // Read the feather file (may contain multiple batches)
-                let batches = self.read_feather_file(&file_path)?;
-
-                if batches.is_empty() {
-                    continue; // Skip empty or invalid files
-                }
-
-                let decode_data_cls = Self::canonical_stream_data_name(&data_cls);
-
-                // Convert RecordBatches to Data objects based on data_cls
-                let file_data: Vec<Data> = match decode_data_cls {
-                    "quotes" => {
-                        let quotes: Vec<QuoteTick> =
-                            self.convert_record_batches_to_data(batches, false)?;
-                        quotes.into_iter().map(Data::from).collect()
-                    }
-                    "trades" => {
-                        let trades: Vec<TradeTick> =
-                            self.convert_record_batches_to_data(batches, false)?;
-                        trades.into_iter().map(Data::from).collect()
-                    }
-                    "order_book_deltas" => {
-                        let deltas: Vec<OrderBookDelta> =
-                            self.convert_record_batches_to_data(batches, false)?;
-                        deltas.into_iter().map(Data::from).collect()
-                    }
-                    "order_book_depths" => {
-                        let depths: Vec<OrderBookDepth> =
-                            self.convert_record_batches_to_data(batches, false)?;
-                        depths.into_iter().map(Data::from).collect()
-                    }
-                    "bars" => {
-                        let bars: Vec<Bar> = self.convert_record_batches_to_data(batches, false)?;
-                        bars.into_iter().map(Data::from).collect()
-                    }
-                    "index_prices" => {
-                        let prices: Vec<IndexPriceUpdate> =
-                            self.convert_record_batches_to_data(batches, false)?;
-                        prices.into_iter().map(Data::from).collect()
-                    }
-                    "mark_prices" => {
-                        let prices: Vec<MarkPriceUpdate> =
-                            self.convert_record_batches_to_data(batches, false)?;
-                        prices.into_iter().map(Data::from).collect()
-                    }
-                    "option_greeks" => {
-                        let greeks: Vec<OptionGreeks> =
-                            self.convert_record_batches_to_data(batches, false)?;
-                        greeks.into_iter().map(Data::from).collect()
-                    }
-                    "funding_rates" => {
-                        let funding_rates: Vec<FundingRateUpdate> =
-                            self.convert_record_batches_to_data(batches, false)?;
-                        funding_rates.into_iter().map(Data::from).collect()
-                    }
-                    "instrument_status" => {
-                        let statuses: Vec<InstrumentStatus> =
-                            self.convert_record_batches_to_data(batches, false)?;
-                        statuses.into_iter().map(Data::from).collect()
-                    }
-                    "instrument_closes" => {
-                        let closes: Vec<InstrumentClose> =
-                            self.convert_record_batches_to_data(batches, false)?;
-                        closes.into_iter().map(Data::from).collect()
-                    }
-                    _ => {
-                        if decode_data_cls.starts_with("custom/") {
-                            decode_custom_batches_to_data(batches, false)?
-                        } else {
-                            // Unknown data type - skip it
-                            continue;
-                        }
-                    }
-                };
-
+            if let Some(file_data) = self.decode_run_batches(&data_type, batches)? {
                 all_data.extend(file_data);
             }
         }
 
-        // Sort all data by timestamp (ts_init)
         all_data.sort_by_key(HasTsInit::ts_init);
 
         Ok(all_data)
     }
 
-    /// Lists feather files for a specific data class in a subdirectory.
-    ///
-    /// This function finds all `.feather` files in the specified subdirectory
-    /// (backtest or live) for the given instance ID and data class.
+    // Returns `None` for stream families that do not decode to `Data`
+    fn decode_run_batches(
+        &self,
+        data_type: &CatalogDataType,
+        batches: Vec<RecordBatch>,
+    ) -> anyhow::Result<Option<Vec<Data>>> {
+        let data = match data_type {
+            CatalogDataType::Data(NautilusDataType::QuoteTick) => self
+                .convert_record_batches_to_data::<QuoteTick>(batches, false)?
+                .into_iter()
+                .map(Data::from)
+                .collect(),
+            CatalogDataType::Data(NautilusDataType::TradeTick) => self
+                .convert_record_batches_to_data::<TradeTick>(batches, false)?
+                .into_iter()
+                .map(Data::from)
+                .collect(),
+            CatalogDataType::Data(NautilusDataType::OrderBookDelta) => self
+                .convert_record_batches_to_data::<OrderBookDelta>(batches, false)?
+                .into_iter()
+                .map(Data::from)
+                .collect(),
+            CatalogDataType::Data(NautilusDataType::OrderBookDepth) => self
+                .convert_record_batches_to_data::<OrderBookDepth>(batches, false)?
+                .into_iter()
+                .map(Data::from)
+                .collect(),
+            CatalogDataType::Data(NautilusDataType::Bar) => self
+                .convert_record_batches_to_data::<Bar>(batches, false)?
+                .into_iter()
+                .map(Data::from)
+                .collect(),
+            CatalogDataType::Data(NautilusDataType::IndexPriceUpdate) => self
+                .convert_record_batches_to_data::<IndexPriceUpdate>(batches, false)?
+                .into_iter()
+                .map(Data::from)
+                .collect(),
+            CatalogDataType::Data(NautilusDataType::MarkPriceUpdate) => self
+                .convert_record_batches_to_data::<MarkPriceUpdate>(batches, false)?
+                .into_iter()
+                .map(Data::from)
+                .collect(),
+            CatalogDataType::Data(NautilusDataType::OptionGreeks) => self
+                .convert_record_batches_to_data::<OptionGreeks>(batches, false)?
+                .into_iter()
+                .map(Data::from)
+                .collect(),
+            CatalogDataType::Data(NautilusDataType::FundingRateUpdate) => self
+                .convert_record_batches_to_data::<FundingRateUpdate>(batches, false)?
+                .into_iter()
+                .map(Data::from)
+                .collect(),
+            CatalogDataType::Data(NautilusDataType::InstrumentStatus) => self
+                .convert_record_batches_to_data::<InstrumentStatus>(batches, false)?
+                .into_iter()
+                .map(Data::from)
+                .collect(),
+            CatalogDataType::Data(NautilusDataType::InstrumentClose) => self
+                .convert_record_batches_to_data::<InstrumentClose>(batches, false)?
+                .into_iter()
+                .map(Data::from)
+                .collect(),
+            CatalogDataType::Data(NautilusDataType::Custom { .. }) => {
+                decode_custom_batches_to_data(batches, false)?
+            }
+            _ => return Ok(None),
+        };
+
+        Ok(Some(data))
+    }
+
+    fn recover_partial_run_files(
+        &self,
+        environment: Environment,
+        instance_id: &str,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !instance_id.is_empty()
+                && !matches!(instance_id, "." | "..")
+                && !instance_id.contains(['/', '\\', ':', '\0']),
+            "Invalid run instance ID {instance_id:?}: expected a single path component",
+        );
+
+        // Writers stage only to local directories, so other catalogs hold no partial files
+        if !self.original_uri.starts_with("file://") {
+            return Ok(());
+        }
+
+        let catalog_root = match fs::canonicalize(self.native_base_path_string()) {
+            Ok(path) => path,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+
+        let run_root = match fs::canonicalize(catalog_root.join(environment_directory(environment)))
+        {
+            Ok(path) => path,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+
+        anyhow::ensure!(
+            run_root.starts_with(&catalog_root) && run_root != catalog_root,
+            "Run root resolves outside the catalog: {}",
+            run_root.display(),
+        );
+
+        let directory = match fs::canonicalize(run_root.join(instance_id)) {
+            Ok(path) => path,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+
+        anyhow::ensure!(
+            directory.starts_with(&run_root) && directory != run_root,
+            "Run directory resolves outside the run root: {}",
+            directory.display(),
+        );
+
+        recover_partial_feather_files(&directory);
+        Ok(())
+    }
+
+    /// Lists the feather files of a run, for one data type or every type when `data_type` is
+    /// `None`.
     fn list_feather_files(
         &self,
-        subdirectory: &str,
+        environment: Environment,
         instance_id: &str,
-        data_name: &str,
+        data_type: Option<&CatalogDataType>,
         identifiers: Option<&[String]>,
     ) -> anyhow::Result<Vec<String>> {
-        let base_dir = make_object_store_path(&self.base_path, [subdirectory, instance_id]);
+        let base_dir = make_object_store_path(
+            &self.base_path,
+            [environment_directory(environment), instance_id],
+        );
 
-        let mut files = Vec::new();
-
-        let list_result = self.execute_async(|| async {
+        let mut files = self.execute_async(|| async {
             let prefix = ObjectPath::from(format!("{base_dir}/"));
             let mut stream = self.object_store.list(Some(&prefix));
             let mut feather_files = Vec::new();
@@ -370,18 +432,20 @@ impl ParquetDataCatalog {
                     continue;
                 }
 
-                let Ok(path_data_name) =
-                    type_name_from_session_feather_path(&path_str, subdirectory, instance_id)
-                else {
+                let Ok(path_data_type) = catalog_data_type_from_session_feather_path(
+                    &path_str,
+                    environment,
+                    instance_id,
+                ) else {
                     continue;
                 };
 
-                if path_data_name != data_name {
+                if data_type.is_some_and(|data_type| path_data_type != *data_type) {
                     continue;
                 }
 
                 let path_identifier =
-                    identifier_from_session_feather_path(&path_str, subdirectory, instance_id);
+                    identifier_from_session_feather_path(&path_str, environment, instance_id);
 
                 if let (Some(identifiers), Some(path_identifier)) =
                     (identifiers, path_identifier.as_deref())
@@ -396,9 +460,37 @@ impl ParquetDataCatalog {
             Ok::<Vec<String>, anyhow::Error>(feather_files)
         })?;
 
-        files.extend(list_result);
         files.sort();
         Ok(files)
+    }
+
+    // Keeps the rows whose identifier matches; a type's file holds every identifier, so the file
+    // listing cannot select them by folder
+    fn filter_batches_by_identifiers(
+        batches: Vec<RecordBatch>,
+        file_path: &str,
+        environment: Environment,
+        instance_id: &str,
+        identifiers: Option<&[String]>,
+    ) -> anyhow::Result<Vec<RecordBatch>> {
+        let Some(identifiers) = identifiers else {
+            return Ok(batches);
+        };
+
+        let path_identifier =
+            identifier_from_session_feather_path(file_path, environment, instance_id);
+
+        batches
+            .iter()
+            .filter_map(|batch| {
+                filter_record_batch_by_identifier(batch, path_identifier.as_deref(), |identifier| {
+                    identifier.is_none_or(|identifier| {
+                        Self::stream_identifier_matches(identifier, identifiers)
+                    })
+                })
+                .transpose()
+            })
+            .collect()
     }
 
     fn stream_identifier_matches(candidate: &str, identifiers: &[String]) -> bool {
@@ -410,10 +502,12 @@ impl ParquetDataCatalog {
 
     /// Reads a feather file and returns all `RecordBatches`.
     fn read_feather_file(&self, file_path: &str) -> anyhow::Result<Vec<RecordBatch>> {
-        let path = ObjectPath::from(file_path);
+        let path = self.to_object_path_parsed(file_path)?;
+
         let batches = self.execute_async(|| async {
             read_feather_record_batches(self.object_store.clone(), &path).await
         })?;
+
         Self::restore_staged_batches(batches)
     }
 
@@ -422,6 +516,7 @@ impl ParquetDataCatalog {
         for batch in batches {
             restored.extend(restore_staged_record_batches(batch)?);
         }
+
         Ok(restored)
     }
 
@@ -434,10 +529,6 @@ impl ParquetDataCatalog {
     where
         T: DecodeDataFromRecordBatch + TryFrom<Data>,
     {
-        if batches.is_empty() {
-            return Ok(Vec::new());
-        }
-
         let mut all_data = Vec::new();
 
         for batch in batches {
@@ -448,6 +539,7 @@ impl ParquetDataCatalog {
                     convert_bar_type_to_external: false,
                 },
             )?;
+
             let metadata = batch.schema().metadata().clone();
 
             let data_vec = T::decode_data_batch(&metadata, batch)
@@ -467,10 +559,6 @@ impl ParquetDataCatalog {
     where
         T: DecodeTypedFromRecordBatch,
     {
-        if batches.is_empty() {
-            return Ok(Vec::new());
-        }
-
         let mut all_data = Vec::new();
 
         for batch in batches {
@@ -492,9 +580,9 @@ impl ParquetDataCatalog {
     /// # Parameters
     ///
     /// - `instance_id`: The ID of the backtest or live run instance.
-    /// - `data_cls`: The data class name (e.g., "quotes", "trades", "bars"), or
-    ///   `custom/{TypeName}` with the registered type name verbatim for custom data.
-    /// - `subdirectory`: The subdirectory containing the feather files. Either "backtest" or "live" (default: "backtest").
+    /// - `data_type`: The data or record type to convert, with the registered type name verbatim
+    ///   for custom data.
+    /// - `environment`: The environment of the run, which names the folder holding its feather files.
     /// - `identifiers`: Optional list of identifiers to filter by (instrument IDs or bar types).
     /// - `use_ts_event_for_ts_init`: If true, replaces the `ts_init` column with `ts_event` column values before deserializing.
     ///
@@ -507,6 +595,9 @@ impl ParquetDataCatalog {
     /// Returns an error if:
     /// - `data_type` is an instrument class selector, which has no staged stream name.
     /// - `data_type` is a family streams do not support.
+    /// - The instance ID is empty, is `.` or `..`, or contains `/`, `\`, `:`, or a NUL character.
+    /// - The environment's run root does not resolve strictly inside the catalog.
+    /// - The run directory does not resolve strictly inside the environment's run root.
     /// - Feather file listing fails.
     /// - Feather file reading fails.
     /// - Writing to parquet fails.
@@ -516,7 +607,8 @@ impl ParquetDataCatalog {
     /// This method converts directly between Arrow IPC stream batches and Parquet batches without
     /// materializing Nautilus data objects. An instance with no staged files for the family
     /// converts nothing and returns success. It requires:
-    /// - Listing feather files in the specified subdirectory
+    /// - Recovering abandoned `.feather.partial` files of a local run
+    /// - Listing feather files in the environment's run folder
     /// - Reading feather files (Arrow IPC stream reading)
     /// - Applying table-only stream conversion transforms
     /// - Writing Arrow batches to the catalog
@@ -524,6 +616,7 @@ impl ParquetDataCatalog {
     /// # Examples
     ///
     /// ```rust,no_run
+    /// use nautilus_common::enums::Environment;
     /// use nautilus_model::data::NautilusDataType;
     /// use nautilus_persistence::backend::parquet::catalog::ParquetDataCatalog;
     ///
@@ -539,7 +632,7 @@ impl ParquetDataCatalog {
     /// catalog.convert_stream_to_data(
     ///     "instance-123",
     ///     &NautilusDataType::QuoteTick.into(),
-    ///     Some("backtest"),
+    ///     Environment::Backtest,
     ///     None,
     ///     false,
     /// )?;
@@ -549,47 +642,34 @@ impl ParquetDataCatalog {
         &mut self,
         instance_id: &str,
         data_type: &CatalogDataType,
-        subdirectory: Option<&str>,
+        environment: Environment,
         identifiers: Option<&[String]>,
         use_ts_event_for_ts_init: bool,
     ) -> anyhow::Result<()> {
-        let subdirectory = subdirectory.unwrap_or("backtest");
-
-        // Streams stage instruments under the single aggregate name,
-        // with the class carried per batch, so a class selector names no staged directory.
-        let stream_data_name: Cow<'static, str> = match data_type {
-            CatalogDataType::Data(data_type) => parquet_data_path_prefix(data_type),
-            CatalogDataType::Record(record_type) => record_path_prefix(record_type),
-            CatalogDataType::Instrument(class) => {
-                anyhow::bail!(
-                    "Stream conversion stages instruments under the aggregate family, not {class}; \
-                     pass the Instrument data type"
-                );
-            }
-        };
-
-        if !Self::is_supported_stream_data_type(&stream_data_name) {
-            anyhow::bail!("Stream conversion does not support {data_type}");
-        }
-
-        // List all feather files for this data class
+        Self::ensure_stream_data_type(data_type)?;
+        self.recover_partial_run_files(environment, instance_id)?;
         let feather_files =
-            self.list_feather_files(subdirectory, instance_id, &stream_data_name, identifiers)?;
+            self.list_feather_files(environment, instance_id, Some(data_type), identifiers)?;
 
-        if feather_files.is_empty() {
-            return Ok(());
-        }
-
-        // Process each feather file independently so that each file's identifier
-        // (instrument_id or bar_type from schema metadata) is preserved when writing
-        // to parquet. Conversion then groups each file's restored batches by full schema
-        // before writing one catalog file per group.
+        // Each file is planned before it is written; a file holds every identifier of its type,
+        // and each restored batch carries its own identifier
         for file_path in feather_files {
-            let batches = self.read_feather_file(&file_path)?;
-            self.convert_feather_batches_to_parquet(
-                subdirectory,
+            let batches = Self::filter_batches_by_identifiers(
+                self.read_feather_file(&file_path)?,
+                &file_path,
+                environment,
                 instance_id,
-                &stream_data_name,
+                identifiers,
+            )?;
+
+            if batches.is_empty() {
+                continue;
+            }
+
+            self.convert_feather_batches_to_parquet(
+                environment,
+                instance_id,
+                data_type,
                 &file_path,
                 &batches,
                 use_ts_event_for_ts_init,
@@ -606,98 +686,325 @@ impl ParquetDataCatalog {
     )]
     fn convert_feather_batches_to_parquet(
         &self,
-        subdirectory: &str,
+        environment: Environment,
         instance_id: &str,
-        catalog_data_name: &str,
+        data_type: &CatalogDataType,
         feather_path: &str,
         batches: &[RecordBatch],
         use_ts_event_for_ts_init: bool,
         replay_identity: Option<&str>,
     ) -> anyhow::Result<()> {
-        let mut groups: IndexMap<Arc<Schema>, Vec<RecordBatch>> = IndexMap::new();
+        // A type's file holds every identifier, and custom data metadata does not name it, so
+        // rows are grouped by identifier as well as by schema
+        let mut groups: IndexMap<(Arc<Schema>, Option<String>), Vec<RecordBatch>> = IndexMap::new();
+        let mut row_offset = 0;
+
+        let mut rows = Vec::new();
 
         for batch in batches {
-            for restored in restore_staged_record_batches(batch.clone())? {
-                groups.entry(restored.schema()).or_default().push(restored);
+            anyhow::ensure!(
+                batch.column_by_name(PROMOTION_ROW_INDEX).is_none(),
+                "Feather source uses reserved column {PROMOTION_ROW_INDEX}"
+            );
+            let row_end = row_offset + batch.num_rows() as u64;
+            let mut fields = batch.schema().fields().to_vec();
+            fields.push(Arc::new(Field::new(
+                PROMOTION_ROW_INDEX,
+                DataType::UInt64,
+                false,
+            )));
+            let mut columns = batch.columns().to_vec();
+            columns.push(Arc::new(UInt64Array::from_iter_values(row_offset..row_end)));
+            let batch = RecordBatch::try_new(
+                Arc::new(Schema::new_with_metadata(
+                    fields,
+                    batch.schema().metadata().clone(),
+                )),
+                columns,
+            )?;
+            row_offset = row_end;
+            rows.extend(split_record_batch_by_identifier(&batch)?);
+        }
+
+        if *data_type == CatalogDataType::Data(NautilusDataType::OrderBookDelta) {
+            normalize_clear_precision(&mut rows)?;
+        }
+
+        for (identifier, batch) in rows {
+            groups
+                .entry((batch.schema(), identifier))
+                .or_default()
+                .push(batch);
+        }
+
+        let mut planned = Vec::new();
+
+        // Number each identifier's groups separately, so selecting identifiers for a conversion
+        // does not change the output identity of the groups it keeps.
+        let mut ordinals: AHashMap<Option<String>, usize> = AHashMap::new();
+
+        for ((_, identifier), group) in groups {
+            let ordinal = ordinals.entry(identifier.clone()).or_default();
+            let group_identity = format!(
+                "{}/{}/{ordinal}",
+                replay_identity.unwrap_or(feather_path),
+                identifier.as_deref().unwrap_or_default(),
+            );
+            *ordinal += 1;
+
+            if let Some(plan) = self.plan_catalog_write(
+                environment,
+                instance_id,
+                data_type,
+                feather_path,
+                &group,
+                use_ts_event_for_ts_init,
+                group_identity,
+            )? {
+                planned.push(plan);
             }
         }
 
-        for (index, group) in groups.into_values().enumerate() {
-            let Some(batch) =
-                Self::apply_stream_conversion_transforms(&group, use_ts_event_for_ts_init)
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "Failed to apply stream conversion transforms for {feather_path}: {e}"
-                        )
-                    })?
-            else {
-                continue;
-            };
+        let mut by_directory: IndexMap<String, Vec<PlannedCatalogWrite>> = IndexMap::new();
 
-            let (start_ts, end_ts) = Self::ts_init_range(&batch).map_err(|e| {
-                anyhow::anyhow!("Failed to determine ts_init range for {feather_path}: {e}")
-            })?;
+        for plan in planned {
+            by_directory
+                .entry(plan.directory.clone())
+                .or_default()
+                .push(plan);
+        }
 
-            let identifier = Self::identifier_from_batch_or_path(
-                &batch,
-                feather_path,
-                subdirectory,
-                instance_id,
-            );
+        let mut ready = Vec::new();
+        for (directory, plans) in by_directory {
+            ready.extend(self.ready_directory_plans(data_type, &directory, plans)?);
+        }
 
-            let instrument_prefix = if catalog_data_name == "instruments" {
-                let class = batch
-                    .schema()
-                    .metadata()
-                    .get("class")
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("Staged instrument has no class metadata"))?;
-                Some(crate::catalog::types::instrument_path_prefix(
-                    &class.parse()?,
-                ))
-            } else {
-                None
-            };
-
-            let catalog_data_name = instrument_prefix.unwrap_or(catalog_data_name);
-
-            let directory = if let Some(type_name) = catalog_data_name.strip_prefix("custom/") {
-                self.make_path_custom_data(type_name, identifier.as_deref())?
-            } else {
-                self.make_path(catalog_data_name, identifier.as_deref())?
-            };
-
-            let batch = Self::with_catalog_identifier_metadata(
-                batch,
-                catalog_data_name,
-                identifier.as_deref(),
-            )?;
-            let batches = vec![batch];
-            let group_identity = format!("{}/{index}", replay_identity.unwrap_or(feather_path));
+        for mut plan in ready {
+            let row_index = plan.batch.schema().index_of(PROMOTION_ROW_INDEX)?;
+            plan.batch.remove_column(row_index);
             self.write_parquet_file_checked(
-                &directory,
-                UnixNanos::from(start_ts),
-                UnixNanos::from(end_ts),
-                &batches,
+                &plan.directory,
+                UnixNanos::from(plan.start_ts),
+                UnixNanos::from(plan.end_ts),
+                std::slice::from_ref(&plan.batch),
                 false,
                 "File",
                 None,
-                Some(&group_identity),
+                Some(&plan.group_identity),
             )?;
         }
 
         Ok(())
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the arguments describe one restored schema group and its catalog destination"
+    )]
+    fn plan_catalog_write(
+        &self,
+        environment: Environment,
+        instance_id: &str,
+        data_type: &CatalogDataType,
+        feather_path: &str,
+        group: &[RecordBatch],
+        use_ts_event_for_ts_init: bool,
+        group_identity: String,
+    ) -> anyhow::Result<Option<PlannedCatalogWrite>> {
+        let Some(batch) = Self::apply_stream_conversion_transforms(group, use_ts_event_for_ts_init)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to apply stream conversion transforms for {feather_path}: {e}"
+                )
+            })?
+        else {
+            return Ok(None);
+        };
+
+        let (start_ts, end_ts) = Self::ts_init_range(&batch).map_err(|e| {
+            anyhow::anyhow!("Failed to determine ts_init range for {feather_path}: {e}")
+        })?;
+
+        let identifier =
+            Self::identifier_from_batch_or_path(&batch, feather_path, environment, instance_id);
+
+        let identifier = identifier.as_deref();
+
+        // Like direct catalog writes, promoted files carry the identifier in their directory and
+        // metadata
+        let batch = record_batch_without_identifier_column(batch)?;
+
+        let directory = match data_type {
+            CatalogDataType::Data(NautilusDataType::Instrument) => {
+                let class = batch
+                    .schema()
+                    .metadata()
+                    .get(KEY_TYPE_NAME)
+                    .ok_or_else(|| anyhow::anyhow!("Staged instrument has no type_name metadata"))?
+                    .parse()?;
+                self.make_path(instrument_path_prefix(&class), identifier)?
+            }
+            CatalogDataType::Data(NautilusDataType::Custom { type_name }) => {
+                self.make_path_custom_data(type_name, identifier)?
+            }
+            CatalogDataType::Data(data_type) => {
+                self.make_path(&parquet_data_path_prefix(data_type), identifier)?
+            }
+            CatalogDataType::Record(record_type) => {
+                self.make_path(&record_path_prefix(record_type), identifier)?
+            }
+            CatalogDataType::Instrument(class) => {
+                self.make_path(instrument_path_prefix(class), identifier)?
+            }
+        };
+
+        let batch = Self::with_catalog_identifier_metadata(batch, data_type, identifier)?;
+
+        Ok(Some(PlannedCatalogWrite {
+            directory,
+            start_ts,
+            end_ts,
+            batch,
+            group_identity,
+        }))
+    }
+
+    fn ready_directory_plans(
+        &self,
+        data_type: &CatalogDataType,
+        directory: &str,
+        plans: Vec<PlannedCatalogWrite>,
+    ) -> anyhow::Result<Vec<PlannedCatalogWrite>> {
+        let plans = coalesce_overlapping_plans(plans)?;
+        let mut remaining = Vec::new();
+
+        for plan in plans {
+            let filename = catalog_filename(
+                UnixNanos::from(plan.start_ts),
+                UnixNanos::from(plan.end_ts),
+                Some(&plan.group_identity),
+            );
+            let path = format!("{directory}/{filename}");
+            if !self.file_exists(&path)? {
+                remaining.push(plan);
+            }
+        }
+
+        if remaining.is_empty() {
+            return Ok(remaining);
+        }
+
+        let existing = self.get_directory_intervals(directory)?;
+
+        if *data_type == CatalogDataType::Data(NautilusDataType::Bar) {
+            let mut filtered = Vec::new();
+
+            for plan in remaining {
+                if !existing
+                    .iter()
+                    .any(|&(start, end)| plan.start_ts <= end && start <= plan.end_ts)
+                {
+                    filtered.push(plan);
+                } else if let Some(plan) = self.remove_replayed_bar_rows(directory, plan)? {
+                    filtered.push(plan);
+                }
+            }
+
+            remaining = filtered;
+        }
+
+        let mut intervals = existing.clone();
+        intervals.extend(remaining.iter().map(|plan| (plan.start_ts, plan.end_ts)));
+
+        if !are_intervals_disjoint(&intervals) {
+            anyhow::bail!(
+                "Writing promoted groups for {directory} would create non-disjoint intervals. \
+                 Existing intervals: {existing:?}"
+            );
+        }
+
+        Ok(remaining)
+    }
+
+    fn remove_replayed_bar_rows(
+        &self,
+        directory: &str,
+        mut plan: PlannedCatalogWrite,
+    ) -> anyhow::Result<Option<PlannedCatalogWrite>> {
+        let row_index = plan.batch.schema().index_of(PROMOTION_ROW_INDEX)?;
+        let columns = (0..plan.batch.num_columns())
+            .filter(|&index| index != row_index)
+            .collect::<Vec<_>>();
+        let incoming = plan.batch.project(&columns)?;
+        let mut persisted = Vec::new();
+        let mut rows_by_timestamp: AHashMap<u64, Vec<(usize, usize)>> = AHashMap::new();
+
+        for file in self.list_parquet_files(directory)? {
+            if !query_intersects_filename(&file, Some(plan.start_ts), Some(plan.end_ts)) {
+                continue;
+            }
+
+            let path = self.to_object_path_parsed(&file)?;
+            let (batches, schema) = self.execute_async(|| {
+                read_parquet_from_object_store(self.object_store.clone(), &path)
+            })?;
+
+            for batch in batches {
+                let batch = RecordBatch::try_new(schema.clone(), batch.columns().to_vec())?;
+                let timestamps = Self::ts_init_array(&batch)?;
+                for row in 0..batch.num_rows() {
+                    let timestamp = timestamps
+                        .value(row)
+                        .ok_or_else(|| anyhow::anyhow!("ts_init value cannot be negative"))?;
+                    rows_by_timestamp
+                        .entry(timestamp)
+                        .or_default()
+                        .push((persisted.len(), row));
+                }
+
+                persisted.push(batch);
+            }
+        }
+
+        let timestamps = Self::ts_init_array(&incoming)?;
+        let mut keep = Vec::new();
+
+        for row in 0..incoming.num_rows() {
+            let timestamp = timestamps
+                .value(row)
+                .ok_or_else(|| anyhow::anyhow!("ts_init value cannot be negative"))?;
+
+            let replayed = rows_by_timestamp.get(&timestamp).is_some_and(|matches| {
+                let incoming_row = incoming.slice(row, 1);
+                matches
+                    .iter()
+                    .all(|&(batch, index)| persisted[batch].slice(index, 1) == incoming_row)
+            });
+
+            if !replayed {
+                keep.push(row as u64);
+            }
+        }
+
+        if keep.is_empty() {
+            return Ok(None);
+        }
+
+        plan.batch = take_record_batch(&plan.batch, &UInt64Array::from(keep))?;
+        (plan.start_ts, plan.end_ts) = Self::ts_init_range(&plan.batch)?;
+        Ok(Some(plan))
+    }
+
     fn with_catalog_identifier_metadata(
         batch: RecordBatch,
-        catalog_data_name: &str,
+        data_type: &CatalogDataType,
         identifier: Option<&str>,
     ) -> anyhow::Result<RecordBatch> {
         let Some(identifier) = identifier else {
             return Ok(batch);
         };
-        let metadata_key = if catalog_data_name == "bars" {
+
+        let metadata_key = if *data_type == CatalogDataType::Data(NautilusDataType::Bar) {
             "bar_type"
         } else {
             "instrument_id"
@@ -709,6 +1016,7 @@ impl ParquetDataCatalog {
 
         let mut metadata = batch.schema().metadata().clone();
         metadata.insert(metadata_key.to_string(), identifier.to_string());
+
         let schema = Arc::new(Schema::new_with_metadata(
             batch.schema().fields().clone(),
             metadata,
@@ -760,7 +1068,7 @@ impl ParquetDataCatalog {
     fn identifier_from_batch_or_path(
         batch: &RecordBatch,
         feather_path: &str,
-        subdirectory: &str,
+        environment: Environment,
         instance_id: &str,
     ) -> Option<String> {
         let metadata = batch.schema().metadata().clone();
@@ -778,91 +1086,1408 @@ impl ParquetDataCatalog {
             return identifiers.into_iter().next();
         }
 
-        identifier_from_session_feather_path(feather_path, subdirectory, instance_id)
+        identifier_from_session_feather_path(feather_path, environment, instance_id)
     }
 
-    fn canonical_stream_data_name(data_name: &str) -> &str {
-        match data_name {
-            "quote_tick" => "quotes",
-            "trade_tick" => "trades",
-            "bar" => "bars",
-            "mark_price_update" => "mark_prices",
-            "index_price_update" => "index_prices",
-            "funding_rate_update" => "funding_rates",
-            "instrument_close" => "instrument_closes",
-            "order_book_delta" => "order_book_deltas",
-            other => other,
+    fn ensure_stream_data_type(data_type: &CatalogDataType) -> anyhow::Result<()> {
+        match data_type {
+            // Streams stage instruments under the aggregate family, with the class carried per
+            // batch, so a class selector names no staged file
+            CatalogDataType::Instrument(class) => anyhow::bail!(
+                "Streams stage instruments under the aggregate family, not {class}; \
+                 pass the Instrument data type"
+            ),
+            #[cfg(feature = "defi")]
+            CatalogDataType::Data(NautilusDataType::Defi)
+            | CatalogDataType::Record(NautilusRecordType::Defi) => {
+                anyhow::bail!("Streams do not support {data_type}")
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+struct PlannedCatalogWrite {
+    directory: String,
+    start_ts: u64,
+    end_ts: u64,
+    batch: RecordBatch,
+    group_identity: String,
+}
+
+// Splits `batch` into one batch per identifier, with rows that have no identifier as their own
+// group; a batch without an identifier column is returned whole
+fn split_record_batch_by_identifier(
+    batch: &RecordBatch,
+) -> anyhow::Result<Vec<(Option<String>, RecordBatch)>> {
+    let Ok(identifiers) = identifiers_from_record_batches(std::slice::from_ref(batch)) else {
+        return Ok(vec![(None, batch.clone())]);
+    };
+
+    let mut split = Vec::with_capacity(identifiers.len() + 1);
+    for identifier in identifiers.into_iter().map(Some).chain([None]) {
+        if let Some(rows) =
+            filter_record_batch_by_identifier(batch, None, |value| value == identifier.as_deref())?
+        {
+            split.push((identifier, rows));
         }
     }
 
-    fn is_supported_stream_data_type(data_name: &str) -> bool {
-        data_name.starts_with("custom/")
-            || matches!(
-                data_name,
-                "instruments"
-                    | "quotes"
-                    | "trades"
-                    | "order_book_deltas"
-                    | "order_book_depths"
-                    | "bars"
-                    | "index_prices"
-                    | "mark_prices"
-                    | "option_greeks"
-                    | "instrument_status"
-                    | "instrument_closes"
-                    | "funding_rates"
-                    | "account_state"
-                    | "order_initialized"
-                    | "order_denied"
-                    | "order_emulated"
-                    | "order_submitted"
-                    | "order_accepted"
-                    | "order_rejected"
-                    | "order_pending_cancel"
-                    | "order_canceled"
-                    | "order_cancel_rejected"
-                    | "order_expired"
-                    | "order_triggered"
-                    | "order_pending_update"
-                    | "order_released"
-                    | "order_modify_rejected"
-                    | "order_updated"
-                    | "order_filled"
-                    | "order_fill_voided"
-                    | "position_opened"
-                    | "position_changed"
-                    | "position_closed"
-                    | "position_adjusted"
-                    | "order_snapshot"
-                    | "position_snapshot"
-                    | "order_status_report"
-                    | "fill_report"
-                    | "position_status_report"
-                    | "execution_mass_status"
+    Ok(split)
+}
+
+fn normalize_clear_precision(batches: &mut [(Option<String>, RecordBatch)]) -> anyhow::Result<()> {
+    let clear_only = batches
+        .iter()
+        .map(|(_, batch)| is_canonical_clear_batch(batch))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    if !clear_only.iter().any(|clear| *clear) {
+        return Ok(());
+    }
+
+    let mut targets = AHashMap::new();
+
+    // The last populated schema provides the fallback for trailing CLEAR rows
+    for ((identifier, batch), clear) in batches.iter().zip(&clear_only) {
+        if !clear && batch.num_rows() != 0 {
+            targets.insert(identifier.clone(), batch.schema());
+        }
+    }
+
+    // Prefer the following snapshot's schema before grouping, so CLEAR retains source order
+    for ((identifier, batch), clear) in batches.iter_mut().zip(clear_only).rev() {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+
+        if !clear {
+            targets.insert(identifier.clone(), batch.schema());
+            continue;
+        }
+
+        let Some(target) = targets.get(identifier) else {
+            continue;
+        };
+
+        let schema = batch.schema();
+        if schema.fields() != target.fields()
+            || metadata_without_precision(&schema) != metadata_without_precision(target)
+        {
+            continue;
+        }
+
+        *batch = RecordBatch::try_new(target.clone(), batch.columns().to_vec())?;
+    }
+
+    Ok(())
+}
+
+fn is_canonical_clear_batch(batch: &RecordBatch) -> anyhow::Result<bool> {
+    if precision_values(batch.schema().as_ref()) != (Some("0"), Some("0")) {
+        return Ok(false);
+    }
+
+    let action_index = batch.schema().index_of("action")?;
+    let side_index = batch.schema().index_of("side")?;
+    let action = extract_column_string(batch.columns(), "action", action_index)?;
+    let order_side = extract_column_string(batch.columns(), "side", side_index)?;
+    let price = extract_decimal_column(batch, "price")?;
+    let size = extract_decimal_column(batch, "size")?;
+    let order_id = extract_column_by_name::<UInt64Array>(batch, "order_id", DataType::UInt64)?;
+
+    Ok((0..batch.num_rows()).all(|row| {
+        action.value_opt(row) == Some(BookAction::Clear.as_ref())
+            && order_side.value_opt(row) == Some("NO_ORDER_SIDE")
+            && (price.is_null(row) || price.value(row) == 0)
+            && size.is_valid(row)
+            && size.value(row) == 0
+            && order_id.is_valid(row)
+            && order_id.value(row) == 0
+    }))
+}
+
+fn coalesce_overlapping_plans(
+    mut plans: Vec<PlannedCatalogWrite>,
+) -> anyhow::Result<Vec<PlannedCatalogWrite>> {
+    loop {
+        let mut changed = false;
+        let mut next = Vec::new();
+
+        while let Some(plan) = plans.pop() {
+            if let Some(index) = next
+                .iter()
+                .position(|other| plan_intervals_overlap(other, &plan))
+            {
+                let other = next.swap_remove(index);
+                next.push(unify_plans(other, plan)?);
+                changed = true;
+            } else {
+                next.push(plan);
+            }
+        }
+
+        plans = next;
+
+        if !changed {
+            break;
+        }
+    }
+
+    Ok(plans)
+}
+
+fn plan_intervals_overlap(left: &PlannedCatalogWrite, right: &PlannedCatalogWrite) -> bool {
+    left.start_ts <= right.end_ts && right.start_ts <= left.end_ts
+}
+
+fn unify_plans(
+    left: PlannedCatalogWrite,
+    right: PlannedCatalogWrite,
+) -> anyhow::Result<PlannedCatalogWrite> {
+    let batch = unify_record_batches(left.batch, right.batch)?;
+    let (start_ts, end_ts) = ParquetDataCatalog::ts_init_range(&batch)?;
+
+    Ok(PlannedCatalogWrite {
+        directory: left.directory,
+        start_ts,
+        end_ts,
+        batch,
+        group_identity: left.group_identity,
+    })
+}
+
+fn unify_record_batches(left: RecordBatch, right: RecordBatch) -> anyhow::Result<RecordBatch> {
+    if left.schema() == right.schema() {
+        return concat_sorted(&left, &right);
+    }
+
+    anyhow::ensure!(
+        left.schema().fields() == right.schema().fields()
+            && metadata_without_precision(left.schema().as_ref())
+                == metadata_without_precision(right.schema().as_ref()),
+        "overlapping promotion groups have incompatible schemas"
+    );
+
+    let target = precision_target_schema(left.schema().as_ref(), right.schema().as_ref())?;
+    let left = relabel_precision(left, &target)?;
+    let right = relabel_precision(right, &target)?;
+    concat_sorted(&left, &right)
+}
+
+fn precision_target_schema(left: &Schema, right: &Schema) -> anyhow::Result<Schema> {
+    if precision_values(left) == precision_values(right) {
+        return Ok(left.clone());
+    }
+
+    if is_precision_sentinel(left) && !is_precision_sentinel(right) {
+        return Ok(right.clone());
+    }
+
+    if is_precision_sentinel(right) && !is_precision_sentinel(left) {
+        return Ok(left.clone());
+    }
+
+    anyhow::bail!("overlapping promotion groups have incompatible precision metadata")
+}
+
+fn relabel_precision(batch: RecordBatch, target: &Schema) -> anyhow::Result<RecordBatch> {
+    if batch.schema().as_ref() == target {
+        return Ok(batch);
+    }
+
+    let precision_changes = precision_values(batch.schema().as_ref()) != precision_values(target);
+    if precision_changes && batch_has_present_decimal(&batch) {
+        anyhow::bail!(
+            "cannot relabel precision metadata for a promotion group that contains decimal values"
+        );
+    }
+
+    Ok(RecordBatch::try_new(
+        Arc::new(target.clone()),
+        batch.columns().to_vec(),
+    )?)
+}
+
+fn concat_sorted(left: &RecordBatch, right: &RecordBatch) -> anyhow::Result<RecordBatch> {
+    let schema = left.schema();
+    let batch = concat_batches(&schema, [left, right])
+        .map_err(|e| anyhow::anyhow!("Failed to concatenate promotion groups: {e}"))?;
+    sort_by_ts_init(&batch)
+}
+
+fn sort_by_ts_init(batch: &RecordBatch) -> anyhow::Result<RecordBatch> {
+    let ts_init = batch
+        .schema()
+        .index_of("ts_init")
+        .map_err(|_| anyhow::anyhow!("ts_init column not found"))?;
+    let original_row_index = batch
+        .column_by_name(PROMOTION_ROW_INDEX)
+        .cloned()
+        .unwrap_or_else(|| Arc::new(UInt64Array::from_iter_values(0..batch.num_rows() as u64)));
+
+    let options = Some(SortOptions {
+        descending: false,
+        nulls_first: false,
+    });
+
+    let indices = lexsort_to_indices(
+        &[
+            SortColumn {
+                values: batch.column(ts_init).clone(),
+                options,
+            },
+            SortColumn {
+                values: original_row_index,
+                options,
+            },
+        ],
+        None,
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to sort promotion group: {e}"))?;
+
+    take_record_batch(batch, &indices)
+        .map_err(|e| anyhow::anyhow!("Failed to reorder promotion group: {e}"))
+}
+
+fn metadata_without_precision(schema: &Schema) -> HashMap<String, String> {
+    schema
+        .metadata()
+        .iter()
+        .filter(|(key, _)| *key != "price_precision" && *key != "size_precision")
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+fn precision_values(schema: &Schema) -> (Option<&str>, Option<&str>) {
+    (
+        schema.metadata().get("price_precision").map(String::as_str),
+        schema.metadata().get("size_precision").map(String::as_str),
+    )
+}
+
+fn is_precision_sentinel(schema: &Schema) -> bool {
+    let (price, size) = precision_values(schema);
+    (price.is_some() || size.is_some())
+        && price.is_none_or(|value| value == "0")
+        && size.is_none_or(|value| value == "0")
+}
+
+fn batch_has_present_decimal(batch: &RecordBatch) -> bool {
+    batch
+        .columns()
+        .iter()
+        .any(|column| array_has_present_decimal(column.as_ref()))
+}
+
+fn array_has_present_decimal(array: &dyn Array) -> bool {
+    match array.data_type() {
+        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => {
+            !array.is_empty() && array.null_count() < array.len()
+        }
+        // A sliced list keeps its whole child array, so check only the values its rows reference
+        DataType::List(_) => array
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .is_none_or(|list| array_has_present_decimal(list_values(list).as_ref())),
+        DataType::LargeList(_) => array
+            .as_any()
+            .downcast_ref::<LargeListArray>()
+            .is_none_or(|list| array_has_present_decimal(list_values(list).as_ref())),
+        DataType::FixedSizeList(_, _) => array
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .is_none_or(|list| array_has_present_decimal(list.values().as_ref())),
+        DataType::Struct(_) => array
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .is_none_or(|values| {
+                values
+                    .columns()
+                    .iter()
+                    .any(|column| array_has_present_decimal(column.as_ref()))
+            }),
+        _ => false,
+    }
+}
+
+fn list_values<O: OffsetSizeTrait>(list: &GenericListArray<O>) -> ArrayRef {
+    let offsets = list.value_offsets();
+    let start = offsets[0].as_usize();
+    let end = offsets[offsets.len() - 1].as_usize();
+    list.values().slice(start, end - start)
+}
+
+#[cfg(test)]
+mod promotion_benchmarks;
+
+#[cfg(test)]
+mod promotion_group_tests {
+    use std::{collections::HashMap, sync::Arc};
+
+    use datafusion::arrow::{
+        array::{Array, Decimal128Array, ListArray, StringArray, UInt64Array},
+        buffer::OffsetBuffer,
+        datatypes::{DataType, Field, Schema},
+        record_batch::RecordBatch,
+    };
+    use nautilus_common::enums::Environment;
+    use nautilus_model::{
+        data::{BookOrder, NautilusDataType, OrderBookDelta},
+        enums::{BookAction, OrderSide},
+        identifiers::InstrumentId,
+        types::{Price, Quantity},
+    };
+    use nautilus_serialization::arrow::{EncodeToRecordBatch, KEY_IDENTIFIER};
+    use rstest::rstest;
+    use tempfile::TempDir;
+
+    use super::{
+        array_has_present_decimal, normalize_clear_precision, split_record_batch_by_identifier,
+    };
+    use crate::{
+        backend::parquet::{catalog::ParquetDataCatalog, io::read_parquet_from_object_store},
+        common::storage::create_storage_backend_from_path,
+        writer::{
+            feather::{NAUTILUS_ARROW_METADATA_ID_COLUMN, NAUTILUS_ARROW_METADATA_JSON_COLUMN},
+            run::FeatherSessionSource,
+        },
+    };
+
+    fn precision_batch(precision: &str, timestamps: Vec<u64>, price: Option<i128>) -> RecordBatch {
+        let mut metadata = HashMap::new();
+        metadata.insert("instrument_id".to_string(), "ETH/USDT.BINANCE".to_string());
+        metadata.insert("price_precision".to_string(), precision.to_string());
+        metadata.insert("size_precision".to_string(), "0".to_string());
+        let price = Decimal128Array::from(vec![price; timestamps.len()])
+            .with_precision_and_scale(38, 16)
+            .unwrap();
+        RecordBatch::try_new(
+            Arc::new(Schema::new_with_metadata(
+                vec![
+                    Field::new("ts_init", DataType::UInt64, false),
+                    Field::new("price", price.data_type().clone(), true),
+                ],
+                metadata,
+            )),
+            vec![Arc::new(UInt64Array::from(timestamps)), Arc::new(price)],
+        )
+        .unwrap()
+    }
+
+    #[rstest]
+    #[case::empty_row(0, false)]
+    #[case::populated_row(1, true)]
+    fn sliced_list_checks_only_its_rows_for_decimals(#[case] row: usize, #[case] expected: bool) {
+        let price = Decimal128Array::from(vec![Some(123_i128)])
+            .with_precision_and_scale(38, 16)
+            .unwrap();
+        let field = Arc::new(Field::new("item", price.data_type().clone(), false));
+
+        let list = ListArray::new(
+            field,
+            OffsetBuffer::new(vec![0_i32, 0, 1].into()),
+            Arc::new(price),
+            None,
+        );
+
+        assert_eq!(array_has_present_decimal(&list.slice(row, 1)), expected);
+    }
+
+    #[rstest]
+    #[case::one_identifier(
+        vec![Some("A"), None],
+        vec![(Some("A"), vec![1]), (None, vec![2])],
+    )]
+    #[case::two_identifiers(
+        vec![Some("A"), None, Some("B"), None],
+        vec![(Some("A"), vec![1]), (Some("B"), vec![3]), (None, vec![2, 4])],
+    )]
+    fn split_by_identifier_keeps_rows_without_identifier_as_their_own_group(
+        #[case] identifiers: Vec<Option<&str>>,
+        #[case] expected: Vec<(Option<&str>, Vec<u64>)>,
+    ) {
+        let values = (1..=identifiers.len() as u64).collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("value", DataType::UInt64, false),
+                Field::new(KEY_IDENTIFIER, DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(UInt64Array::from(values)),
+                Arc::new(StringArray::from(identifiers)),
+            ],
+        )
+        .unwrap();
+
+        let split = split_record_batch_by_identifier(&batch)
+            .unwrap()
+            .into_iter()
+            .map(|(identifier, rows)| {
+                let values = rows
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec();
+                (identifier, values)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            split,
+            expected
+                .into_iter()
+                .map(|(identifier, values)| (identifier.map(String::from), values))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[rstest]
+    fn clear_precision_keeps_instruments_separate() {
+        let id_a = InstrumentId::from("AUD/USD.SIM");
+        let id_b = InstrumentId::from("BTC/USD.SIM");
+
+        let add_a = OrderBookDelta::new(
+            id_a,
+            BookAction::Add,
+            BookOrder::new(
+                OrderSide::Buy,
+                Price::from("1.23"),
+                Quantity::from("4.500"),
+                71,
+            ),
+            128,
+            41,
+            99.into(),
+            100.into(),
+        );
+
+        let add_b = OrderBookDelta::new(
+            id_b,
+            BookAction::Add,
+            BookOrder::new(
+                OrderSide::Sell,
+                Price::from("12.3456"),
+                Quantity::from("7.89000"),
+                72,
+            ),
+            128,
+            42,
+            199.into(),
+            200.into(),
+        );
+        let deltas = [
+            OrderBookDelta::clear(id_a, 41, 99.into(), 100.into()),
+            OrderBookDelta::clear(id_b, 42, 199.into(), 200.into()),
+            add_a,
+            add_b,
+        ];
+
+        let mut batches = deltas
+            .iter()
+            .map(|delta| {
+                (
+                    Some(delta.instrument_id.to_string()),
+                    OrderBookDelta::encode_batch(&delta.metadata(), &[*delta]).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let original = batches.clone();
+
+        normalize_clear_precision(&mut batches).unwrap();
+
+        for ((identifier, batch), (original_identifier, original_batch)) in
+            batches.iter().zip(&original)
+        {
+            let expected_schema = if *identifier == Some(id_a.to_string()) {
+                original[2].1.schema()
+            } else {
+                original[3].1.schema()
+            };
+
+            assert_eq!(identifier, original_identifier);
+            assert_eq!(batch.schema(), expected_schema);
+            assert_eq!(batch.columns(), original_batch.columns());
+        }
+    }
+
+    #[rstest]
+    #[case::clear_only(false)]
+    #[case::empty_following_batch(true)]
+    fn clear_precision_without_following_orders(#[case] populated: bool) {
+        let id = InstrumentId::from("AUD/USD.SIM");
+        let clear = OrderBookDelta::clear(id, 41, 99.into(), 100.into());
+        let clear_batch = OrderBookDelta::encode_batch(&clear.metadata(), &[clear]).unwrap();
+
+        let add = OrderBookDelta::new(
+            id,
+            BookAction::Add,
+            BookOrder::new(
+                OrderSide::Buy,
+                Price::from("1.23"),
+                Quantity::from("4.500"),
+                71,
+            ),
+            128,
+            40,
+            49.into(),
+            50.into(),
+        );
+        let add_batch = OrderBookDelta::encode_batch(&add.metadata(), &[add]).unwrap();
+        let mut batches = Vec::new();
+        if populated {
+            batches.push((Some(id.to_string()), add_batch.clone()));
+        }
+
+        batches.push((Some(id.to_string()), clear_batch.clone()));
+        let clear_index = batches.len() - 1;
+
+        if populated {
+            let mut metadata = add.metadata();
+            metadata.insert("price_precision".to_string(), "4".to_string());
+            let empty = RecordBatch::new_empty(Arc::new(
+                add_batch.schema().as_ref().clone().with_metadata(metadata),
+            ));
+            batches.push((Some(id.to_string()), empty));
+        }
+
+        normalize_clear_precision(&mut batches).unwrap();
+
+        let expected_schema = if populated {
+            add_batch.schema()
+        } else {
+            clear_batch.schema()
+        };
+
+        assert_eq!(batches[clear_index].1.schema(), expected_schema);
+        assert_eq!(batches[clear_index].1.columns(), clear_batch.columns());
+        assert_eq!(batches.len(), if populated { 3 } else { 1 });
+    }
+
+    #[rstest]
+    fn overlapping_empty_precision_group_is_promoted() {
+        let temp = TempDir::new().unwrap();
+        let catalog = ParquetDataCatalog::new(temp.path(), None, None, None, None);
+        let batches = vec![
+            precision_batch("0", vec![1, 3], None),
+            precision_batch("2", vec![2], Some(20_000_000_000_000_000)),
+        ];
+
+        catalog
+            .convert_feather_batches_to_parquet(
+                Environment::Backtest,
+                "run-1",
+                &NautilusDataType::QuoteTick.into(),
+                "backtest/run-1/quotes_1.feather",
+                &batches,
+                false,
+                Some("replay"),
             )
+            .unwrap();
+        catalog
+            .convert_feather_batches_to_parquet(
+                Environment::Backtest,
+                "run-1",
+                &NautilusDataType::QuoteTick.into(),
+                "backtest/run-1/quotes_1.feather",
+                &batches,
+                false,
+                Some("replay"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            catalog
+                .get_intervals(
+                    &NautilusDataType::QuoteTick.into(),
+                    Some("ETH/USDT.BINANCE")
+                )
+                .unwrap(),
+            vec![(1, 3)],
+        );
+    }
+
+    #[rstest]
+    fn promotion_rejects_reserved_row_index() {
+        let temp = TempDir::new().unwrap();
+        let catalog = ParquetDataCatalog::new(temp.path(), None, None, None, None);
+        let batch = precision_batch("2", vec![1], Some(1));
+        let mut fields = batch.schema().fields().to_vec();
+        fields.push(Arc::new(Field::new(
+            super::PROMOTION_ROW_INDEX,
+            DataType::UInt64,
+            false,
+        )));
+        let mut columns = batch.columns().to_vec();
+        columns.push(Arc::new(UInt64Array::from(vec![19])));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new_with_metadata(
+                fields,
+                batch.schema().metadata().clone(),
+            )),
+            columns,
+        )
+        .unwrap();
+
+        let error = catalog
+            .convert_feather_batches_to_parquet(
+                Environment::Backtest,
+                "run-1",
+                &NautilusDataType::QuoteTick.into(),
+                "backtest/run-1/quotes_1.feather",
+                &[batch],
+                false,
+                Some("replay"),
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Feather source uses reserved column nautilus_promotion_row_index"
+        );
+        assert_eq!(
+            catalog
+                .query_files(&NautilusDataType::QuoteTick.into(), None, None, None)
+                .unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[rstest]
+    fn overlapping_incompatible_groups_write_nothing() {
+        let temp = TempDir::new().unwrap();
+        let catalog = ParquetDataCatalog::new(temp.path(), None, None, None, None);
+        let batches = vec![
+            precision_batch("2", vec![1, 3], Some(1)),
+            precision_batch("5", vec![2], Some(2)),
+        ];
+
+        let error = catalog
+            .convert_feather_batches_to_parquet(
+                Environment::Backtest,
+                "run-1",
+                &NautilusDataType::QuoteTick.into(),
+                "backtest/run-1/quotes_1.feather",
+                &batches,
+                false,
+                Some("replay"),
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "overlapping promotion groups have incompatible precision metadata"
+        );
+        assert!(
+            catalog
+                .query_files(&NautilusDataType::QuoteTick.into(), None, None, None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[rstest]
+    fn overlapping_groups_keep_source_order_for_equal_ts_init(
+        #[values(false, true)] repeated_schema: bool,
+    ) {
+        let temp = TempDir::new().unwrap();
+        let catalog = ParquetDataCatalog::new(temp.path(), None, None, None, None);
+        let mut batches = vec![
+            precision_batch("2", vec![1, 2], Some(10)),
+            precision_batch("0", vec![2, 3], None),
+        ];
+
+        if repeated_schema {
+            batches.push(precision_batch("2", vec![2, 4], Some(30)));
+        }
+
+        catalog
+            .convert_feather_batches_to_parquet(
+                Environment::Backtest,
+                "run-1",
+                &NautilusDataType::QuoteTick.into(),
+                "backtest/run-1/quotes_1.feather",
+                &batches,
+                false,
+                Some("replay"),
+            )
+            .unwrap();
+
+        let files = catalog
+            .query_files(&NautilusDataType::QuoteTick.into(), None, None, None)
+            .unwrap();
+
+        let (written, _) = catalog
+            .execute_async(|| async {
+                read_parquet_from_object_store(
+                    catalog.object_store.clone(),
+                    &object_store::path::Path::from(files[0].as_str()),
+                )
+                .await
+            })
+            .unwrap();
+
+        assert!(
+            written
+                .iter()
+                .all(|batch| batch.column_by_name(super::PROMOTION_ROW_INDEX).is_none())
+        );
+
+        let rows = written
+            .iter()
+            .flat_map(|batch| {
+                let ts_init = batch
+                    .column_by_name("ts_init")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec();
+                let price = batch
+                    .column_by_name("price")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>();
+                ts_init.into_iter().zip(price)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(files.len(), 1);
+
+        let expected = if repeated_schema {
+            vec![
+                (1, Some(10)),
+                (2, Some(10)),
+                (2, None),
+                (2, Some(30)),
+                (3, None),
+                (4, Some(30)),
+            ]
+        } else {
+            vec![(1, Some(10)), (2, Some(10)), (2, None), (3, None)]
+        };
+
+        assert_eq!(rows, expected);
+    }
+
+    #[rstest]
+    fn promote_feather_file_skips_staged_batches_without_rows() {
+        let temp = TempDir::new().unwrap();
+        let catalog = ParquetDataCatalog::new(temp.path(), None, None, None, None);
+        let storage =
+            create_storage_backend_from_path(temp.path().to_str().unwrap(), None).unwrap();
+        let source = FeatherSessionSource::new(storage, Environment::Backtest, "run-1");
+        let staged = RecordBatch::new_empty(Arc::new(Schema::new(vec![
+            Field::new("ts_init", DataType::UInt64, false),
+            Field::new(NAUTILUS_ARROW_METADATA_ID_COLUMN, DataType::Utf8, false),
+            Field::new(NAUTILUS_ARROW_METADATA_JSON_COLUMN, DataType::Utf8, false),
+        ])));
+
+        let summary = catalog
+            .promote_feather_file(
+                &source,
+                "backtest/run-1/quotes_1.feather",
+                vec![staged],
+                false,
+                "replay",
+            )
+            .unwrap();
+
+        assert!(summary.is_none());
+        assert!(
+            catalog
+                .query_files(&NautilusDataType::QuoteTick.into(), None, None, None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[rstest]
+    fn overlapping_groups_with_different_fields_write_nothing() {
+        let temp = TempDir::new().unwrap();
+        let catalog = ParquetDataCatalog::new(temp.path(), None, None, None, None);
+        let nullable = precision_batch("2", vec![2], Some(2));
+        let schema = nullable.schema();
+        let non_nullable = RecordBatch::try_new(
+            Arc::new(Schema::new_with_metadata(
+                vec![
+                    schema.field(0).clone(),
+                    schema.field(1).clone().with_nullable(false),
+                ],
+                schema.metadata().clone(),
+            )),
+            nullable.columns().to_vec(),
+        )
+        .unwrap();
+        let batches = vec![precision_batch("2", vec![1, 3], Some(1)), non_nullable];
+
+        let error = catalog
+            .convert_feather_batches_to_parquet(
+                Environment::Backtest,
+                "run-1",
+                &NautilusDataType::QuoteTick.into(),
+                "backtest/run-1/quotes_1.feather",
+                &batches,
+                false,
+                Some("replay"),
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "overlapping promotion groups have incompatible schemas"
+        );
+        assert!(
+            catalog
+                .query_files(&NautilusDataType::QuoteTick.into(), None, None, None)
+                .unwrap()
+                .is_empty()
+        );
     }
 }
 
 #[cfg(test)]
-mod canonical_name_tests {
+mod stream_folder_tests {
+    use nautilus_common::enums::Environment;
+    use nautilus_model::data::NautilusDataType;
     use rstest::rstest;
 
-    use super::ParquetDataCatalog;
+    use crate::{
+        catalog::types::CatalogDataType, common::paths::catalog_data_type_from_session_feather_path,
+    };
 
     #[rstest]
-    #[case("quotes", "quotes")]
-    #[case("trades", "trades")]
-    #[case("bars", "bars")]
-    #[case("order_book_delta", "order_book_deltas")]
-    #[case("mark_prices", "mark_prices")]
-    #[case("index_prices", "index_prices")]
-    #[case("funding_rates", "funding_rates")]
-    #[case("instrument_closes", "instrument_closes")]
-    #[case("quotes", "quotes")]
-    fn canonical_stream_data_aliases(#[case] input: &str, #[case] expected: &str) {
+    #[case("quotes", NautilusDataType::QuoteTick)]
+    #[case("quote_tick", NautilusDataType::QuoteTick)]
+    #[case("trades", NautilusDataType::TradeTick)]
+    #[case("trade_tick", NautilusDataType::TradeTick)]
+    #[case("bars", NautilusDataType::Bar)]
+    #[case("bar", NautilusDataType::Bar)]
+    #[case("order_book_deltas", NautilusDataType::OrderBookDelta)]
+    #[case("order_book_delta", NautilusDataType::OrderBookDelta)]
+    #[case("mark_prices", NautilusDataType::MarkPriceUpdate)]
+    #[case("mark_price_update", NautilusDataType::MarkPriceUpdate)]
+    #[case("index_prices", NautilusDataType::IndexPriceUpdate)]
+    #[case("index_price_update", NautilusDataType::IndexPriceUpdate)]
+    #[case("funding_rates", NautilusDataType::FundingRateUpdate)]
+    #[case("funding_rate_update", NautilusDataType::FundingRateUpdate)]
+    #[case("instrument_closes", NautilusDataType::InstrumentClose)]
+    #[case("instrument_close", NautilusDataType::InstrumentClose)]
+    fn stream_folders_parse_to_their_data_type(
+        #[case] folder: &str,
+        #[case] expected: NautilusDataType,
+    ) {
+        let path = format!("backtest/run-1/{folder}/{folder}_0.feather");
+
         assert_eq!(
-            ParquetDataCatalog::canonical_stream_data_name(input),
-            expected,
+            catalog_data_type_from_session_feather_path(&path, Environment::Backtest, "run-1")
+                .unwrap(),
+            CatalogDataType::from(expected),
+        );
+    }
+}
+
+#[cfg(test)]
+mod read_run_tests {
+    use std::{
+        fs::{self, OpenOptions},
+        sync::{Arc, atomic::AtomicU64},
+    };
+
+    use nautilus_common::enums::Environment;
+    use nautilus_core::UnixNanos;
+    use nautilus_model::data::{
+        Data, NautilusDataType, QuoteTick, TradeTick,
+        stubs::{quote_audusd, quote_ethusdt_binance, stub_trade_ethusdt_buy},
+    };
+    use rstest::rstest;
+    use tempfile::TempDir;
+
+    use crate::{
+        backend::parquet::catalog::ParquetDataCatalog,
+        catalog::types::CatalogDataType,
+        writer::feather::{FEATHER_PARTIAL_EXTENSION, FeatherWriter, RotationConfig, WriterClock},
+    };
+
+    fn quote_btc(ts: u64) -> QuoteTick {
+        QuoteTick {
+            instrument_id: "BTCUSDT-PERP.BINANCE".into(),
+            ts_event: UnixNanos::from(ts),
+            ts_init: UnixNanos::from(ts),
+            ..quote_ethusdt_binance()
+        }
+    }
+
+    fn quote_aud(ts: u64) -> QuoteTick {
+        QuoteTick {
+            ts_event: UnixNanos::from(ts),
+            ts_init: UnixNanos::from(ts),
+            ..quote_audusd()
+        }
+    }
+
+    fn quote_eth(ts: u64) -> QuoteTick {
+        QuoteTick {
+            ts_event: UnixNanos::from(ts),
+            ts_init: UnixNanos::from(ts),
+            ..quote_ethusdt_binance()
+        }
+    }
+
+    fn trade_eth(ts: u64) -> TradeTick {
+        TradeTick {
+            ts_event: UnixNanos::from(ts),
+            ts_init: UnixNanos::from(ts),
+            ..stub_trade_ethusdt_buy()
+        }
+    }
+
+    fn run_writer(temp_dir: &TempDir) -> FeatherWriter {
+        FeatherWriter::new(
+            temp_dir.path().join("backtest").join("run-001"),
+            WriterClock::Test(Arc::new(AtomicU64::new(0))),
+            RotationConfig::NoRotation,
+            None,
+            None,
+        )
+    }
+
+    fn read_backtest(temp_dir: &TempDir) -> Vec<Data> {
+        ParquetDataCatalog::new(temp_dir.path(), None, None, None, None)
+            .read_backtest("run-001")
+            .unwrap()
+    }
+
+    // Leaves one flushed batch per quote in a partial file whose last batch is cut short, as a
+    // writer that crashed mid-append would
+    fn write_crashed_run(temp_dir: &TempDir, quotes: &[QuoteTick]) {
+        let mut writer = run_writer(temp_dir);
+
+        for quote in quotes {
+            writer.write_data(Data::Quote(*quote)).unwrap();
+            writer.flush().unwrap();
+        }
+
+        writer.close().unwrap();
+
+        let sealed = temp_dir
+            .path()
+            .join("backtest/run-001/quotes/quotes_0.feather");
+        let partial = sealed.with_extension(FEATHER_PARTIAL_EXTENSION);
+        fs::rename(&sealed, &partial).unwrap();
+
+        // Drops the end-of-stream marker and the last byte of the final batch
+        let file = OpenOptions::new().write(true).open(&partial).unwrap();
+        file.set_len(file.metadata().unwrap().len() - 9).unwrap();
+    }
+
+    #[rstest]
+    #[case::backtest(ParquetDataCatalog::read_backtest)]
+    #[case::live(ParquetDataCatalog::read_live_run)]
+    fn read_run_rejects_path_bearing_ids(
+        #[case] reader: fn(&ParquetDataCatalog, &str) -> anyhow::Result<Vec<Data>>,
+        #[values(
+            "",
+            ".",
+            "..",
+            "../run",
+            "run/child",
+            "run\\child",
+            "/run",
+            "\\run",
+            "C:run",
+            "C:/run",
+            "C:\\run",
+            "\\\\server\\share",
+            "run:stream",
+            "run\0id"
+        )]
+        instance_id: &str,
+    ) {
+        let temp_dir = TempDir::new().unwrap();
+        let catalog = ParquetDataCatalog::new(temp_dir.path(), None, None, None, None);
+
+        let e = reader(&catalog, instance_id).unwrap_err();
+
+        assert_eq!(
+            e.to_string(),
+            format!("Invalid run instance ID {instance_id:?}: expected a single path component"),
+        );
+    }
+
+    #[rstest]
+    #[case::backtest(ParquetDataCatalog::read_backtest)]
+    #[case::live(ParquetDataCatalog::read_live_run)]
+    fn read_run_rejects_external_paths_before_recovery(
+        #[case] reader: fn(&ParquetDataCatalog, &str) -> anyhow::Result<Vec<Data>>,
+        #[values(false, true)] absolute: bool,
+    ) {
+        let temp_dir = TempDir::new().unwrap();
+        let outside = TempDir::new_in(temp_dir.path()).unwrap();
+        let catalog_path = temp_dir.path().join("catalog");
+        fs::create_dir_all(catalog_path.join("backtest")).unwrap();
+        fs::create_dir_all(catalog_path.join("live")).unwrap();
+        write_crashed_run(&outside, &[quote_aud(1_000), quote_eth(2_000)]);
+        let directory = outside.path().join("backtest/run-001");
+        let partial = directory.join("quotes/quotes_0.feather.partial");
+        let original = fs::read(&partial).unwrap();
+
+        let instance_id = if absolute {
+            directory.to_str().unwrap().to_string()
+        } else {
+            format!(
+                "../../{}/backtest/run-001",
+                outside.path().file_name().unwrap().to_str().unwrap(),
+            )
+        };
+
+        let catalog = ParquetDataCatalog::new(&catalog_path, None, None, None, None);
+
+        let result = reader(&catalog, &instance_id);
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(&partial).unwrap(), original);
+        assert!(!partial.with_extension("").exists());
+    }
+
+    #[rstest]
+    #[case::backtest(ParquetDataCatalog::read_backtest)]
+    #[case::live(ParquetDataCatalog::read_live_run)]
+    fn read_run_returns_no_data_for_missing_directories(
+        #[case] reader: fn(&ParquetDataCatalog, &str) -> anyhow::Result<Vec<Data>>,
+        #[values("", "backtest", "backtest/run-001")] directory: &str,
+    ) {
+        let temp_dir = TempDir::new().unwrap();
+        write_crashed_run(&temp_dir, &[quote_aud(1_000), quote_eth(2_000)]);
+        let mut catalog = ParquetDataCatalog::new(temp_dir.path(), None, None, None, None);
+        fs::remove_dir_all(temp_dir.path().join(directory)).unwrap();
+
+        let data = reader(&catalog, "run-001").unwrap();
+        let conversion = catalog.convert_stream_to_data(
+            "run-001",
+            &CatalogDataType::from(NautilusDataType::QuoteTick),
+            Environment::Backtest,
+            None,
+            false,
+        );
+
+        assert_eq!(data, Vec::<Data>::new());
+        conversion.unwrap();
+        assert!(!temp_dir.path().join(directory).exists());
+    }
+
+    #[rstest]
+    fn convert_stream_to_data_rejects_path_bearing_ids() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut catalog = ParquetDataCatalog::new(temp_dir.path(), None, None, None, None);
+
+        let e = catalog
+            .convert_stream_to_data(
+                "../run-001",
+                &CatalogDataType::from(NautilusDataType::QuoteTick),
+                Environment::Backtest,
+                None,
+                false,
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            e.to_string(),
+            "Invalid run instance ID \"../run-001\": expected a single path component",
+        );
+    }
+
+    #[rstest]
+    #[cfg(unix)]
+    #[case::backtest(ParquetDataCatalog::read_backtest, "backtest")]
+    #[case::live(ParquetDataCatalog::read_live_run, "live")]
+    fn read_run_rejects_escaping_directory_symlinks(
+        #[case] reader: fn(&ParquetDataCatalog, &str) -> anyhow::Result<Vec<Data>>,
+        #[case] environment: &str,
+        #[values(false, true)] environment_symlink: bool,
+    ) {
+        let temp_dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        write_crashed_run(&outside, &[quote_aud(1_000), quote_eth(2_000)]);
+        let run = outside.path().join("backtest/run-001");
+        let partial = run.join("quotes/quotes_0.feather.partial");
+        let original = fs::read(&partial).unwrap();
+        let root = temp_dir.path().join(environment);
+        if environment_symlink {
+            std::os::unix::fs::symlink(outside.path().join("backtest"), &root).unwrap();
+        } else {
+            fs::create_dir(&root).unwrap();
+            std::os::unix::fs::symlink(&run, root.join("run-001")).unwrap();
+        }
+
+        let catalog = ParquetDataCatalog::new(temp_dir.path(), None, None, None, None);
+        let result = reader(&catalog, "run-001");
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(&partial).unwrap(), original);
+        assert!(!partial.with_extension("").exists());
+    }
+
+    #[rstest]
+    #[cfg(unix)]
+    fn read_run_rejects_directory_symlinks_to_parent_roots(
+        #[values(false, true)] environment_symlink: bool,
+    ) {
+        let temp_dir = TempDir::new().unwrap();
+        write_crashed_run(&temp_dir, &[quote_aud(1_000), quote_eth(2_000)]);
+        let partial = temp_dir
+            .path()
+            .join("backtest/run-001/quotes/quotes_0.feather.partial");
+        let original = fs::read(&partial).unwrap();
+        let catalog = ParquetDataCatalog::new(temp_dir.path(), None, None, None, None);
+        let result = if environment_symlink {
+            std::os::unix::fs::symlink(temp_dir.path(), temp_dir.path().join("live")).unwrap();
+            catalog.read_live_run("backtest")
+        } else {
+            let root = temp_dir.path().join("backtest");
+            std::os::unix::fs::symlink(&root, root.join("run-alias")).unwrap();
+            catalog.read_backtest("run-alias")
+        };
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(&partial).unwrap(), original);
+        assert!(!partial.with_extension("").exists());
+    }
+
+    #[rstest]
+    #[cfg(unix)]
+    #[case::backtest(ParquetDataCatalog::read_backtest, "backtest")]
+    #[case::live(ParquetDataCatalog::read_live_run, "live")]
+    fn read_run_leaves_symlinked_recovery_targets_untouched(
+        #[case] reader: fn(&ParquetDataCatalog, &str) -> anyhow::Result<Vec<Data>>,
+        #[case] environment: &str,
+        #[values(false, true)] directory_symlink: bool,
+    ) {
+        let temp_dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        write_crashed_run(&outside, &[quote_aud(1_000), quote_eth(2_000)]);
+        let partial = outside
+            .path()
+            .join("backtest/run-001/quotes/quotes_0.feather.partial");
+        let original = fs::read(&partial).unwrap();
+        let run = temp_dir.path().join(environment).join("run-001");
+        fs::create_dir_all(&run).unwrap();
+        let link = if directory_symlink {
+            let link = run.join("quotes");
+            std::os::unix::fs::symlink(partial.parent().unwrap(), &link).unwrap();
+            link
+        } else {
+            fs::create_dir(run.join("quotes")).unwrap();
+            let link = run.join("quotes/quotes_0.feather.partial");
+            std::os::unix::fs::symlink(&partial, &link).unwrap();
+            link
+        };
+
+        let target = fs::read_link(&link).unwrap();
+        let catalog = ParquetDataCatalog::new(temp_dir.path(), None, None, None, None);
+
+        let data = reader(&catalog, "run-001").unwrap();
+
+        assert_eq!(data, Vec::<Data>::new());
+        assert_eq!(fs::read(&partial).unwrap(), original);
+        assert_eq!(fs::read_link(&link).unwrap(), target);
+        assert!(!partial.with_extension("").exists());
+        assert!(!run.join("quotes/quotes_0.feather").exists());
+    }
+
+    #[rstest]
+    #[cfg(unix)]
+    fn read_run_recovers_in_root_directory_symlinks(
+        #[values(false, true)] environment_symlink: bool,
+    ) {
+        let temp_dir = TempDir::new().unwrap();
+        write_crashed_run(&temp_dir, &[quote_aud(1_000), quote_eth(2_000)]);
+        let run = temp_dir.path().join("backtest/run-001");
+
+        if environment_symlink {
+            std::os::unix::fs::symlink(
+                temp_dir.path().join("backtest"),
+                temp_dir.path().join("live"),
+            )
+            .unwrap();
+        } else {
+            std::os::unix::fs::symlink(&run, temp_dir.path().join("backtest/run-alias")).unwrap();
+        }
+
+        let catalog = ParquetDataCatalog::new(temp_dir.path(), None, None, None, None);
+        let data = if environment_symlink {
+            catalog.read_live_run("run-001").unwrap()
+        } else {
+            catalog.read_backtest("run-alias").unwrap()
+        };
+
+        assert_eq!(data, vec![Data::Quote(quote_aud(1_000))]);
+        assert!(!run.join("quotes/quotes_0.feather.partial").exists());
+        assert!(run.join("quotes/quotes_0.feather").exists());
+    }
+
+    #[rstest]
+    fn read_backtest_returns_every_record_sorted_by_ts_init() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut writer = run_writer(&temp_dir);
+
+        for data in [
+            Data::Quote(quote_eth(3_000)),
+            Data::Quote(quote_aud(1_000)),
+            Data::Trade(trade_eth(2_000)),
+            Data::Quote(quote_aud(4_000)),
+            Data::Quote(quote_btc(5_000)),
+        ] {
+            writer.write_data(data).unwrap();
+        }
+
+        writer.close().unwrap();
+
+        assert_eq!(
+            read_backtest(&temp_dir),
+            vec![
+                Data::Quote(quote_aud(1_000)),
+                Data::Trade(trade_eth(2_000)),
+                Data::Quote(quote_eth(3_000)),
+                Data::Quote(quote_aud(4_000)),
+                Data::Quote(quote_btc(5_000)),
+            ],
+        );
+    }
+
+    #[rstest]
+    #[case::selected_identifier_first(true)]
+    #[case::every_identifier_first(false)]
+    fn convert_stream_to_data_repeats_across_identifier_selections(#[case] selected_first: bool) {
+        let temp_dir = TempDir::new().unwrap();
+        let mut writer = run_writer(&temp_dir);
+        writer.write_data(Data::Quote(quote_aud(1_000))).unwrap();
+        writer.write_data(Data::Quote(quote_eth(2_000))).unwrap();
+        writer.close().unwrap();
+
+        // The second identifier in the shared file keeps its output identity when selected alone
+        let selected = [quote_eth(2_000).instrument_id.to_string()];
+
+        let conversions = if selected_first {
+            [Some(&selected[..]), None]
+        } else {
+            [None, Some(&selected[..])]
+        };
+
+        let mut catalog = ParquetDataCatalog::new(temp_dir.path(), None, None, None, None);
+
+        for identifiers in conversions {
+            catalog
+                .convert_stream_to_data(
+                    "run-001",
+                    &CatalogDataType::from(NautilusDataType::QuoteTick),
+                    Environment::Backtest,
+                    identifiers,
+                    false,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            catalog
+                .query::<QuoteTick>(None, None, None, None, None, true)
+                .unwrap(),
+            vec![quote_aud(1_000), quote_eth(2_000)],
+        );
+    }
+
+    #[rstest]
+    fn read_backtest_skips_open_partial_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut writer = run_writer(&temp_dir);
+        writer.write_data(Data::Quote(quote_aud(1_000))).unwrap();
+        writer.flush().unwrap();
+
+        let data = read_backtest(&temp_dir);
+        writer.close().unwrap();
+
+        assert_eq!(data, Vec::<Data>::new());
+        assert_eq!(
+            read_backtest(&temp_dir),
+            vec![Data::Quote(quote_aud(1_000))]
+        );
+    }
+
+    #[rstest]
+    fn read_backtest_recovers_crashed_partial_files() {
+        let temp_dir = TempDir::new().unwrap();
+        write_crashed_run(&temp_dir, &[quote_aud(1_000), quote_eth(2_000)]);
+
+        assert_eq!(
+            read_backtest(&temp_dir),
+            vec![Data::Quote(quote_aud(1_000))]
+        );
+    }
+
+    #[rstest]
+    fn convert_stream_to_data_recovers_crashed_partial_files() {
+        let temp_dir = TempDir::new().unwrap();
+        write_crashed_run(&temp_dir, &[quote_aud(1_000), quote_eth(2_000)]);
+        let mut catalog = ParquetDataCatalog::new(temp_dir.path(), None, None, None, None);
+
+        catalog
+            .convert_stream_to_data(
+                "run-001",
+                &CatalogDataType::from(NautilusDataType::QuoteTick),
+                Environment::Backtest,
+                None,
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(
+            catalog
+                .query::<QuoteTick>(None, None, None, None, None, true)
+                .unwrap(),
+            vec![quote_aud(1_000)],
+        );
+    }
+
+    #[rstest]
+    #[cfg(feature = "python")]
+    fn read_backtest_reads_custom_data() {
+        use nautilus_model::{
+            data::{CustomData, DataType},
+            identifiers::InstrumentId,
+        };
+        use nautilus_serialization::ensure_custom_data_registered;
+
+        use crate::test_data::RustTestCustomData;
+
+        ensure_custom_data_registered::<RustTestCustomData>();
+        let instrument_id = InstrumentId::from("RUST.TEST");
+
+        let custom = Data::Custom(CustomData::new(
+            Arc::new(RustTestCustomData {
+                instrument_id,
+                value: 1.23,
+                flag: true,
+                ts_event: UnixNanos::from(5_000),
+                ts_init: UnixNanos::from(5_000),
+            }),
+            DataType::new("RustTestCustomData", None, Some(instrument_id.to_string())),
+        ));
+
+        let temp_dir = TempDir::new().unwrap();
+        let mut writer = run_writer(&temp_dir);
+        writer.write_data(Data::Quote(quote_aud(1_000))).unwrap();
+        writer.write_data(custom.clone()).unwrap();
+        writer.close().unwrap();
+
+        assert_eq!(
+            read_backtest(&temp_dir),
+            vec![Data::Quote(quote_aud(1_000)), custom]
         );
     }
 }

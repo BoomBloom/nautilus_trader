@@ -43,10 +43,7 @@
 //!   [turmoil](https://crates.io/crates/turmoil).
 
 #![warn(rustc::all)]
-#![allow(
-    clippy::pedantic,
-    reason = "shield the CLI --all-features pedantic gate until the blockchain slice migrates"
-)]
+#![warn(clippy::clone_on_ref_ptr)]
 #![deny(unsafe_code)]
 #![deny(nonstandard_style)]
 #![deny(missing_debug_implementations)]
@@ -71,13 +68,13 @@ pub mod rpc;
 pub mod cache;
 
 #[cfg(feature = "hypersync")]
-pub mod execution;
-
-#[cfg(feature = "hypersync")]
 pub mod data;
 
 #[cfg(feature = "hypersync")]
 pub mod exchanges;
+
+#[cfg(feature = "hypersync")]
+pub mod execution;
 
 #[cfg(feature = "hypersync")]
 pub mod factories;
@@ -85,8 +82,8 @@ pub mod factories;
 #[cfg(feature = "hypersync")]
 pub mod hypersync;
 
-#[cfg(feature = "hypersync")]
-pub mod services;
-
 #[cfg(feature = "python")]
 pub mod python;
+
+#[cfg(feature = "hypersync")]
+pub mod services;

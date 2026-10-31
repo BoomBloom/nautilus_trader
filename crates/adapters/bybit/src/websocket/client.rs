@@ -34,6 +34,7 @@ use nautilus_common::live::get_runtime;
 use nautilus_core::{AtomicMap, AtomicSet, UUID4, string::secret::SecretString};
 use nautilus_live::{
     SocketControl,
+    book::snapshot::SnapshotGate,
     task::{SharedTaskSlot, TaskJoinOutcome},
 };
 use nautilus_model::{
@@ -44,6 +45,7 @@ use nautilus_model::{
     types::{Price, Quantity},
 };
 use nautilus_network::{
+    ConnectionUrl,
     http::create_standard_nautilus_headers,
     mode::ConnectionMode,
     ratelimiter::{RateLimiter, clock::MonotonicClock},
@@ -96,7 +98,7 @@ const AUTH_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const BATCH_PROCESSING_LIMIT: usize = 20;
 /// Public/market data WebSocket client for Bybit.
 pub struct BybitWebSocketClient {
-    url: String,
+    url: ConnectionUrl,
     environment: BybitEnvironment,
     product_type: Option<BybitProductType>,
     credential: Option<Credential>,
@@ -120,7 +122,6 @@ pub struct BybitWebSocketClient {
     instruments_cache: Arc<AtomicMap<Ustr, InstrumentAny>>,
     trade_subs: Arc<AtomicSet<InstrumentId>>,
     option_greeks_subs: Arc<AtomicSet<InstrumentId>>,
-    bars_timestamp_on_close: Arc<AtomicBool>,
     transport_backend: TransportBackend,
     cancellation_token: Arc<ArcSwap<CancellationToken>>,
     proxy_url: Option<SecretString>,
@@ -199,7 +200,6 @@ impl Clone for BybitWebSocketClient {
             instruments_cache: Arc::clone(&self.instruments_cache),
             trade_subs: Arc::clone(&self.trade_subs),
             option_greeks_subs: Arc::clone(&self.option_greeks_subs),
-            bars_timestamp_on_close: Arc::clone(&self.bars_timestamp_on_close),
             transport_backend: self.transport_backend,
             cancellation_token: Arc::clone(&self.cancellation_token),
             proxy_url: self.proxy_url.clone(),
@@ -262,7 +262,7 @@ impl BybitWebSocketClient {
             BybitRateLimiter::for_websocket(&resolved_url, None, proxy_url.as_deref());
 
         Self {
-            url: resolved_url,
+            url: resolved_url.into(),
             environment,
             product_type: Some(product_type),
             credential: None,
@@ -284,7 +284,6 @@ impl BybitWebSocketClient {
             instruments_cache: Arc::new(AtomicMap::new()),
             trade_subs: Arc::new(AtomicSet::new()),
             option_greeks_subs: Arc::new(AtomicSet::new()),
-            bars_timestamp_on_close: Arc::new(AtomicBool::new(true)),
             account_id: None,
             mm_level: Arc::new(AtomicU8::new(0)),
             transport_backend,
@@ -332,7 +331,7 @@ impl BybitWebSocketClient {
         );
 
         Self {
-            url: resolved_url,
+            url: resolved_url.into(),
             environment,
             product_type: None,
             credential,
@@ -354,7 +353,6 @@ impl BybitWebSocketClient {
             instruments_cache: Arc::new(AtomicMap::new()),
             trade_subs: Arc::new(AtomicSet::new()),
             option_greeks_subs: Arc::new(AtomicSet::new()),
-            bars_timestamp_on_close: Arc::new(AtomicBool::new(true)),
             account_id: None,
             mm_level: Arc::new(AtomicU8::new(0)),
             transport_backend,
@@ -395,7 +393,7 @@ impl BybitWebSocketClient {
         );
 
         Self {
-            url: resolved_url,
+            url: resolved_url.into(),
             environment,
             product_type: None,
             credential,
@@ -417,7 +415,6 @@ impl BybitWebSocketClient {
             instruments_cache: Arc::new(AtomicMap::new()),
             trade_subs: Arc::new(AtomicSet::new()),
             option_greeks_subs: Arc::new(AtomicSet::new()),
-            bars_timestamp_on_close: Arc::new(AtomicBool::new(true)),
             account_id: None,
             mm_level: Arc::new(AtomicU8::new(0)),
             transport_backend,
@@ -433,6 +430,8 @@ impl BybitWebSocketClient {
     }
 
     /// Establishes the WebSocket connection.
+    ///
+    /// Clears subscription state from earlier sessions, so callers resubscribe after connecting.
     ///
     /// # Errors
     ///
@@ -465,7 +464,7 @@ impl BybitWebSocketClient {
         })?;
 
         let config = WebSocketConfig {
-            url: self.url.clone(),
+            url: self.url.expose().to_owned(),
             headers: Self::default_headers(),
             heartbeat_interval_secs: self.heartbeat,
             heartbeat_payload: Some(ping_msg),
@@ -477,11 +476,14 @@ impl BybitWebSocketClient {
             reconnect_max_attempts: None,
             heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
+            writer_capacity: None,
             backend: self.transport_backend,
             proxy_url: self
                 .proxy_url
                 .as_ref()
                 .map(|value| value.expose_secret().to_owned()),
+            max_message_size_bytes: None,
+            max_frame_size_bytes: None,
         };
 
         let message_rate_limiter = Arc::new(RateLimiter::<Ustr, MonotonicClock>::new_with_quota(
@@ -489,7 +491,7 @@ impl BybitWebSocketClient {
             vec![],
         ));
         let connection_rate_limiter = websocket_connection_limiter(
-            &self.url,
+            self.url.expose(),
             self.proxy_url.as_ref().map(SecretString::expose_secret),
         );
         let connection_rate_keys: Arc<[Ustr]> = Arc::from([websocket_connection_key()]);
@@ -506,13 +508,13 @@ impl BybitWebSocketClient {
             .await
             .map_err(|e| {
                 BybitWsError::Transport(format!(
-                    "Failed to connect to {}: {e}. \
-                    If this is a DNS error, check your network configuration and DNS settings.",
-                    self.url,
+                    "WebSocket connection failed: {}: {}",
+                    self.url.origin(),
+                    e.redacted_message()
                 ))
             })?;
 
-        self.connection_mode.store(client.connection_mode_atomic());
+        let connection_mode = client.connection_mode_atomic();
         let reconnect_handle = client.reconnect_handle();
         client.set_auth_tracker(self.auth_tracker.clone(), self.requires_auth);
 
@@ -520,11 +522,21 @@ impl BybitWebSocketClient {
         self.out_rx = Some(Arc::new(out_rx));
 
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
-        *self.cmd_tx.write().await = cmd_tx.clone();
 
-        let cmd = HandlerCommand::SetClient(client);
+        // Queue the client first so no subscribe reaches the handler before it
+        cmd_tx
+            .send(HandlerCommand::SetClient(client))
+            .map_err(|e| BybitWsError::Send(e.to_string()))?;
 
-        self.send_cmd(cmd).await?;
+        {
+            // Commands sent before this swap went to a closed channel and close skips
+            // unsubscribes, so the new session starts from clean subscription state.
+            let _guard = self.subscription_guard.lock().await;
+            let mut command_sender = self.cmd_tx.write().await;
+            self.subscriptions.clear();
+            *command_sender = cmd_tx.clone();
+            self.connection_mode.store(connection_mode);
+        }
 
         let signal = Arc::clone(&self.signal);
         let subscriptions = self.subscriptions.clone();
@@ -820,6 +832,27 @@ impl BybitWebSocketClient {
         }
         let _guard = self.subscription_guard.lock().await;
 
+        log::debug!("Subscribing to topics: {topics:?}");
+
+        let payloads = self.register_subscribe(topics)?;
+
+        if payloads.is_empty() {
+            return Ok(());
+        }
+
+        let cmd = HandlerCommand::Subscribe { topics: payloads };
+        self.cmd_tx
+            .read()
+            .await
+            .send(cmd)
+            .map_err(|e| BybitWsError::Send(format!("Failed to send subscribe command: {e}")))?;
+
+        Ok(())
+    }
+
+    // Adds a reference to each topic, returning subscribe payloads for topics no other
+    // subscription holds; the caller holds the subscription guard
+    fn register_subscribe(&self, topics: Vec<String>) -> BybitWsResult<Vec<String>> {
         if self.product_type == Some(BybitProductType::Option) {
             let occupied_topics = self
                 .subscriptions
@@ -840,8 +873,6 @@ impl BybitWebSocketClient {
             }
         }
 
-        log::debug!("Subscribing to topics: {topics:?}");
-
         // Use reference counting to deduplicate subscriptions
         let mut topics_to_send = Vec::new();
 
@@ -853,10 +884,6 @@ impl BybitWebSocketClient {
             } else {
                 log::debug!("Already subscribed to {topic}, skipping duplicate subscription");
             }
-        }
-
-        if topics_to_send.is_empty() {
-            return Ok(());
         }
 
         // Serialize subscription messages
@@ -873,14 +900,7 @@ impl BybitWebSocketClient {
             payloads.push(payload);
         }
 
-        let cmd = HandlerCommand::Subscribe { topics: payloads };
-        self.cmd_tx
-            .read()
-            .await
-            .send(cmd)
-            .map_err(|e| BybitWsError::Send(format!("Failed to send subscribe command: {e}")))?;
-
-        Ok(())
+        Ok(payloads)
     }
 
     /// Unsubscribe from the provided topics.
@@ -1006,17 +1026,6 @@ impl BybitWebSocketClient {
         (**self.instruments_cache.load()).clone()
     }
 
-    /// Sets whether bar timestamps use the close time.
-    pub fn set_bars_timestamp_on_close(&self, value: bool) {
-        self.bars_timestamp_on_close.store(value, Ordering::Relaxed);
-    }
-
-    /// Returns whether bar timestamps use the close time.
-    #[must_use]
-    pub fn bars_timestamp_on_close(&self) -> bool {
-        self.bars_timestamp_on_close.load(Ordering::Relaxed)
-    }
-
     /// Adds an instrument ID to the option greeks subscription set.
     pub fn add_option_greeks_sub(&self, instrument_id: InstrumentId) {
         self.option_greeks_subs.insert(instrument_id);
@@ -1059,12 +1068,86 @@ impl BybitWebSocketClient {
         instrument_id: InstrumentId,
         depth: u32,
     ) -> BybitWsResult<()> {
-        let raw_symbol = extract_raw_symbol(instrument_id.symbol.as_str());
-        let topic = format!(
-            "{}.{depth}.{raw_symbol}",
-            BybitWsPublicChannel::OrderBook.as_ref()
-        );
+        let topic = orderbook_topic(instrument_id, depth);
         self.subscribe(vec![topic]).await
+    }
+
+    /// Subscribes to an order book topic, opening `gate` once the connection confirms the
+    /// subscribe write.
+    ///
+    /// A topic another subscription already holds, such as the depth-1 topic quotes use, sends
+    /// nothing and opens `gate` at once. A failed write returns [`BybitWsError::Transport`]; any
+    /// other error means the request never reached the connection.
+    pub(crate) async fn subscribe_book(
+        &self,
+        instrument_id: InstrumentId,
+        depth: u32,
+        cancel: CancellationToken,
+        gate: SnapshotGate,
+    ) -> BybitWsResult<()> {
+        let (completion, receiver) = tokio::sync::oneshot::channel();
+
+        {
+            let _guard = self.subscription_guard.lock().await;
+            let topic = orderbook_topic(instrument_id, depth);
+
+            let Some(payload) = self.register_subscribe(vec![topic])?.pop() else {
+                gate.open();
+                return Ok(());
+            };
+
+            let cmd = HandlerCommand::SubscribeBook {
+                payload,
+                gate,
+                completion,
+            };
+
+            self.cmd_tx.read().await.send(cmd).map_err(|e| {
+                BybitWsError::Send(format!("Failed to send subscribe command: {e}"))
+            })?;
+        }
+
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => Ok(()),
+            result = receiver => result.map_err(|e| BybitWsError::Send(e.to_string()))?,
+        }
+    }
+
+    /// Requests a fresh snapshot by replacing an order book subscription on the current
+    /// connection.
+    pub(crate) async fn resubscribe_book(
+        &self,
+        instrument_id: InstrumentId,
+        depth: u32,
+        cancel: CancellationToken,
+        gate: SnapshotGate,
+    ) -> BybitWsResult<()> {
+        let topic = orderbook_topic(instrument_id, depth);
+        let (completion, receiver) = tokio::sync::oneshot::channel();
+        let sender = self.cmd_tx.read().await;
+
+        if cancel.is_cancelled() {
+            return Err(BybitWsError::ClientError(
+                "Book recovery canceled".to_string(),
+            ));
+        }
+
+        let cmd = HandlerCommand::ResubscribeBook {
+            topic,
+            cancel,
+            gate,
+            completion,
+        };
+
+        sender
+            .send(cmd)
+            .map_err(|e| BybitWsError::Send(format!("Failed to send resubscribe command: {e}")))?;
+        drop(sender);
+
+        receiver
+            .await
+            .map_err(|e| BybitWsError::Send(e.to_string()))?
     }
 
     /// Unsubscribes from orderbook updates for a specific instrument.
@@ -1073,11 +1156,7 @@ impl BybitWebSocketClient {
         instrument_id: InstrumentId,
         depth: u32,
     ) -> BybitWsResult<()> {
-        let raw_symbol = extract_raw_symbol(instrument_id.symbol.as_str());
-        let topic = format!(
-            "{}.{depth}.{raw_symbol}",
-            BybitWsPublicChannel::OrderBook.as_ref()
-        );
+        let topic = orderbook_topic(instrument_id, depth);
         self.unsubscribe(vec![topic]).await
     }
 
@@ -1116,6 +1195,36 @@ impl BybitWebSocketClient {
         let topic = format!(
             "{}.{topic_symbol}",
             BybitWsPublicChannel::PublicTrade.as_ref()
+        );
+        self.unsubscribe(vec![topic]).await
+    }
+
+    /// Subscribes to public liquidation updates for a specific instrument.
+    ///
+    /// Bybit publishes this stream for linear and inverse contracts only.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    ///
+    /// # References
+    ///
+    /// <https://bybit-exchange.github.io/docs/v5/websocket/public/all-liquidation>
+    pub async fn subscribe_liquidations(&self, instrument_id: InstrumentId) -> BybitWsResult<()> {
+        let raw_symbol = extract_raw_symbol(instrument_id.symbol.as_str());
+        let topic = format!(
+            "{}.{raw_symbol}",
+            BybitWsPublicChannel::AllLiquidation.as_ref()
+        );
+        self.subscribe(vec![topic]).await
+    }
+
+    /// Unsubscribes from public liquidation updates for a specific instrument.
+    pub async fn unsubscribe_liquidations(&self, instrument_id: InstrumentId) -> BybitWsResult<()> {
+        let raw_symbol = extract_raw_symbol(instrument_id.symbol.as_str());
+        let topic = format!(
+            "{}.{raw_symbol}",
+            BybitWsPublicChannel::AllLiquidation.as_ref()
         );
         self.unsubscribe(vec![topic]).await
     }
@@ -2151,8 +2260,18 @@ impl Drop for BybitWebSocketClient {
     }
 }
 
+fn orderbook_topic(instrument_id: InstrumentId, depth: u32) -> String {
+    let raw_symbol = extract_raw_symbol(instrument_id.symbol.as_str());
+    format!(
+        "{}.{depth}.{raw_symbol}",
+        BybitWsPublicChannel::OrderBook.as_ref()
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    use futures_util::StreamExt;
+    use nautilus_testkit::connection::race_command_with_publication;
     use rstest::rstest;
 
     use super::*;
@@ -2160,6 +2279,69 @@ mod tests {
         common::{enums::BybitMarketUnit, testing::load_test_json},
         websocket::{messages::BybitWsFrame, parse_bybit_ws_frame},
     };
+
+    #[tokio::test]
+    async fn command_during_sender_publication_reaches_initialized_handler() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (received_tx, mut received_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                    let payload: serde_json::Value = serde_json::from_str(text.as_str()).unwrap();
+                    let _ = received_tx.send(payload);
+                }
+            }
+        });
+
+        let url = format!("ws://{addr}");
+        let mut ws_client = BybitWebSocketClient::new_public(Some(url), 30);
+        let observer = ws_client.clone();
+        let expected = serde_json::json!({
+            "op": "subscribe",
+            "args": [
+                "publicTrade.BTCUSDT"
+            ]
+        });
+
+        let command = HandlerCommand::Subscribe {
+            topics: vec![expected.to_string()],
+        };
+
+        race_command_with_publication(
+            Arc::clone(&ws_client.cmd_tx),
+            ws_client.connect(),
+            move || command,
+            || observer.is_active(),
+        )
+        .await
+        .expect("connect failed");
+        let received = tokio::time::timeout(Duration::from_secs(2), received_rx.recv()).await;
+        ws_client.close().await.expect("disconnect failed");
+        server.abort();
+
+        let payload = received
+            .expect("startup command must reach server")
+            .unwrap();
+        assert_eq!(payload, expected);
+    }
+
+    #[rstest]
+    #[case("wss://stream.example.com/feed", "wss://stream.example.com")]
+    #[case(
+        "wss://SYN-user:SYN-password@stream.example.com:9443/SYN-path?token=SYN-query#SYN-fragment",
+        "wss://stream.example.com:9443"
+    )]
+    fn test_debug_preserves_url_origin(#[case] url: &str, #[case] origin: &str) {
+        let client = BybitWebSocketClient::new_public(Some(url.to_string()), 30);
+        let debug = format!("{client:?}");
+        assert!(debug.contains(&format!("url: {origin:?}")));
+        assert!(!debug.contains("SYN-"));
+        assert_eq!(client.url.expose(), url);
+    }
 
     #[tokio::test]
     async fn test_drop_clone_does_not_cancel_handler() {
@@ -2177,6 +2359,50 @@ mod tests {
 
         assert!(!cancellation_token.is_cancelled());
         assert!(!client.task_handle.is_empty());
+    }
+
+    // An unconnected client rejects every command, so success proves nothing was sent
+    #[tokio::test]
+    async fn test_subscribe_book_opens_gate_for_held_topic_without_sending() {
+        let client = BybitWebSocketClient::new_public(None, 20);
+        let instrument_id = InstrumentId::from("BTCUSDT-LINEAR.BYBIT");
+        let topic = "orderbook.1.BTCUSDT";
+        assert!(client.subscriptions.add_reference(topic));
+        let gate = SnapshotGate::default();
+        gate.lock().close();
+
+        let result = client
+            .subscribe_book(instrument_id, 1, CancellationToken::new(), gate.clone())
+            .await;
+
+        assert!(result.is_ok());
+        assert!(!gate.lock().is_closed());
+        assert_eq!(client.subscriptions.get_reference_count(topic), 2);
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_book_keeps_gate_closed_when_send_fails() {
+        let client = BybitWebSocketClient::new_public(None, 20);
+        let instrument_id = InstrumentId::from("BTCUSDT-LINEAR.BYBIT");
+        let gate = SnapshotGate::default();
+        gate.lock().close();
+
+        let error = client
+            .subscribe_book(instrument_id, 50, CancellationToken::new(), gate.clone())
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "WebSocket send error: Failed to send subscribe command: channel closed"
+        );
+        assert!(gate.lock().is_closed());
+        assert_eq!(
+            client
+                .subscriptions
+                .get_reference_count("orderbook.50.BTCUSDT"),
+            1
+        );
     }
 
     #[rstest]

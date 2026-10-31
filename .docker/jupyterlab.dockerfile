@@ -29,7 +29,7 @@ RUN curl -fsSL --retry 3 \
     mv /tmp/eurusd_instrument.parquet /catalog/data/currency_pair/EURUSD.SIM/part-0.parquet
 
 # Install UV
-COPY --from=ghcr.io/astral-sh/uv:0.12.15@sha256:62f8c047d0a0e9ece6b53fc63df902585a67a47a7f318ddec4a37db586edc8e3 \
+COPY --from=ghcr.io/astral-sh/uv:0.13.5@sha256:32a7bb39b496babbd997b0a39a4d66c126bdaf5661b302bf6f06abda8deca6ff \
   /uv /uvx /root/.local/bin/
 
 RUN uv pip install --system jupyterlab datafusion

@@ -39,13 +39,16 @@ use nautilus_backtest::{
     node::BacktestNode,
     result::{BacktestResult, CanonicalBacktestResult},
 };
+use nautilus_execution::models::fee::{FeeModelAny, MakerTakerFeeModel};
 use nautilus_model::{
     data::NautilusDataType,
     enums::{AccountType, BookType, OmsType},
     identifiers::InstrumentId,
     types::Quantity,
 };
+use nautilus_persistence::config::DataCatalogConfig;
 use nautilus_trading::examples::strategies::EmaCross;
+use rust_decimal_macros::dec;
 use serde_json::Value;
 use ustr::Ustr;
 
@@ -86,10 +89,15 @@ fn run_workload(catalog_path: &Path, result_path: &Path) -> anyhow::Result<()> {
         .account_type(AccountType::Margin)
         .book_type(BookType::L1_MBP)
         .starting_balances(vec![STARTING_BALANCE.to_string()])
+        // Matches the catalog instrument's defined rates; the recorded digests pin this behavior.
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::new(
+            dec!(0.00002),
+            dec!(0.00002),
+        )))
         .build()?;
     let data_config = BacktestDataConfig::builder()
         .data_type(NautilusDataType::QuoteTick)
-        .catalog_path(catalog_path)
+        .catalog(DataCatalogConfig::new(catalog_path, None, None))
         .instrument_id(instrument_id)
         .build()?;
     let run_config = BacktestRunConfig::builder()
@@ -257,7 +265,7 @@ mod tests {
         instruments::{Instrument, InstrumentAny, stubs::audusd_sim},
         types::Price,
     };
-    use nautilus_persistence::backend::catalog::ParquetDataCatalog;
+    use nautilus_persistence::backend::parquet::catalog::ParquetDataCatalog;
     use rstest::rstest;
     use tempfile::TempDir;
 

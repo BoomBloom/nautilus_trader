@@ -36,6 +36,8 @@ use nautilus_model::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Venue, VenueOrderId,
     },
     instruments::InstrumentAny,
+    orders::OrderAny,
+    reports::FillReport,
     types::{AccountBalance, MarginBalance},
 };
 
@@ -64,6 +66,8 @@ pub struct StubExecutionClient {
     queried_account_ids: Rc<RefCell<Vec<AccountId>>>,
     registered_external_order_ids: Rc<RefCell<Vec<ClientOrderId>>>,
     handles_all_order_venues: bool,
+    settles_contract_expirations: bool,
+    allows_reconciliation_overfill: bool,
     submit_order_error: Option<String>,
     submit_order_list_error: Option<String>,
 }
@@ -97,6 +101,8 @@ impl StubExecutionClient {
             queried_account_ids: Rc::new(RefCell::new(Vec::new())),
             registered_external_order_ids: Rc::new(RefCell::new(Vec::new())),
             handles_all_order_venues: false,
+            settles_contract_expirations: false,
+            allows_reconciliation_overfill: false,
             submit_order_error: None,
             submit_order_list_error: None,
         }
@@ -106,6 +112,20 @@ impl StubExecutionClient {
     #[must_use]
     pub fn with_handles_all_order_venues(mut self) -> Self {
         self.handles_all_order_venues = true;
+        self
+    }
+
+    /// Configures this stub as a venue that settles expiring contracts itself.
+    #[must_use]
+    pub fn with_settles_contract_expirations(mut self) -> Self {
+        self.settles_contract_expirations = true;
+        self
+    }
+
+    /// Configures this stub to allow a reconciliation quantity raise before an overfill.
+    #[must_use]
+    pub fn with_allows_reconciliation_overfill(mut self) -> Self {
+        self.allows_reconciliation_overfill = true;
         self
     }
 
@@ -205,6 +225,14 @@ impl ExecutionClient for StubExecutionClient {
 
     fn handles_order_venue(&self, venue: Venue) -> bool {
         self.handles_all_order_venues || self.venue == venue
+    }
+
+    fn settles_contract_expirations(&self) -> bool {
+        self.settles_contract_expirations
+    }
+
+    fn allows_reconciliation_overfill(&self, _order: &OrderAny, _report: &FillReport) -> bool {
+        self.allows_reconciliation_overfill
     }
 
     fn oms_type(&self) -> OmsType {

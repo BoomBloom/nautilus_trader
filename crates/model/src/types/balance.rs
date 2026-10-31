@@ -18,7 +18,7 @@
 use std::fmt::{Debug, Display};
 
 use nautilus_core::correctness::{
-    CorrectnessError, CorrectnessResult, CorrectnessResultExt, FAILED, check_predicate_true,
+    CorrectnessError, CorrectnessResult, CorrectnessResultExt, FAILED,
 };
 use rust_decimal::Decimal;
 use serde::{
@@ -65,24 +65,31 @@ impl AccountBalance {
     ///
     /// PyO3 requires a `Result` type that stacktrace can be printed for errors.
     pub fn new_checked(total: Money, locked: Money, free: Money) -> CorrectnessResult<Self> {
-        check_predicate_true(
-            total.currency == locked.currency,
-            &format!(
-                "`total` currency ({}) != `locked` currency ({})",
-                total.currency, locked.currency
-            ),
-        )?;
-        check_predicate_true(
-            total.currency == free.currency,
-            &format!(
-                "`total` currency ({}) != `free` currency ({})",
-                total.currency, free.currency
-            ),
-        )?;
-        check_predicate_true(
-            locked.checked_add(free) == Some(total),
-            &format!("`total` ({total}) - `locked` ({locked}) != `free` ({free})"),
-        )?;
+        // Inline checks keep message formatting off this per-update hot path
+        if total.currency != locked.currency {
+            return Err(CorrectnessError::PredicateViolation {
+                message: format!(
+                    "`total` currency ({}) != `locked` currency ({})",
+                    total.currency, locked.currency
+                ),
+            });
+        }
+
+        if total.currency != free.currency {
+            return Err(CorrectnessError::PredicateViolation {
+                message: format!(
+                    "`total` currency ({}) != `free` currency ({})",
+                    total.currency, free.currency
+                ),
+            });
+        }
+
+        if locked.checked_add(free) != Some(total) {
+            return Err(CorrectnessError::PredicateViolation {
+                message: format!("`total` ({total}) - `locked` ({locked}) != `free` ({free})"),
+            });
+        }
+
         Ok(Self {
             currency: total.currency,
             total,
@@ -123,21 +130,7 @@ impl AccountBalance {
         let total = Money::from_decimal(total, currency)?;
         let locked = Money::from_decimal(locked, currency)?;
 
-        let clamped_locked = if total.is_negative() {
-            locked
-        } else {
-            locked.clamp(Money::zero(currency), total)
-        };
-
-        let free = total.checked_sub(clamped_locked).ok_or_else(|| {
-            CorrectnessError::PredicateViolation {
-                message: format!(
-                    "Derived `free` exceeds Money bounds for `total` {total} and `locked` {clamped_locked}"
-                ),
-            }
-        })?;
-
-        Ok(Self::new(total, clamped_locked, free))
+        Self::from_money_total_and_locked(total, locked)
     }
 
     /// Creates a new [`AccountBalance`] from `total` and `free` decimal amounts,
@@ -176,6 +169,42 @@ impl AccountBalance {
         })?;
 
         Ok(Self::new(total, locked, clamped_free))
+    }
+
+    /// Creates a balance from native money amounts and derives `free` without rounding.
+    ///
+    /// Applies the same clamping rules as [`Self::from_total_and_locked`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if currencies differ or the derived `free` balance exceeds money bounds.
+    pub fn from_money_total_and_locked(total: Money, locked: Money) -> CorrectnessResult<Self> {
+        if total.currency != locked.currency {
+            return Err(CorrectnessError::PredicateViolation {
+                message: format!(
+                    "`total` currency ({}) != `locked` currency ({})",
+                    total.currency, locked.currency
+                ),
+            });
+        }
+
+        let currency = total.currency;
+
+        let clamped_locked = if total.is_negative() {
+            locked
+        } else {
+            locked.clamp(Money::zero(currency), total)
+        };
+
+        let free = total.checked_sub(clamped_locked).ok_or_else(|| {
+            CorrectnessError::PredicateViolation {
+                message: format!(
+                    "Derived `free` exceeds Money bounds for `total` {total} and `locked` {clamped_locked}"
+                ),
+            }
+        })?;
+
+        Self::new_checked(total, clamped_locked, free)
     }
 }
 
@@ -448,13 +477,15 @@ impl MarginBalance {
         maintenance: Money,
         instrument_id: Option<InstrumentId>,
     ) -> CorrectnessResult<Self> {
-        check_predicate_true(
-            initial.currency == maintenance.currency,
-            &format!(
-                "`initial` currency ({}) != `maintenance` currency ({})",
-                initial.currency, maintenance.currency
-            ),
-        )?;
+        if initial.currency != maintenance.currency {
+            return Err(CorrectnessError::PredicateViolation {
+                message: format!(
+                    "`initial` currency ({}) != `maintenance` currency ({})",
+                    initial.currency, maintenance.currency
+                ),
+            });
+        }
+
         Ok(Self {
             initial,
             maintenance,

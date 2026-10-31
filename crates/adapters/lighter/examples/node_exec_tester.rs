@@ -40,6 +40,7 @@ use nautilus_lighter::{
 };
 use nautilus_live::{config::LiveExecutionEngineConfig, node::LiveNode};
 use nautilus_model::{
+    enums::{ContingencyType, OrderType},
     identifiers::{AccountId, ClientId, InstrumentId, StrategyId, TraderId},
     types::Quantity,
 };
@@ -94,7 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let exec_engine_config = LiveExecutionEngineConfig {
-        reconciliation_lookback_mins: Some(60),
+        reconciliation_lookback_mins: Some(2 * 24 * 60),
         reconciliation_instrument_ids: Some(vec![instrument_id.to_string()]),
         open_check_interval_secs: Some(10.0),
         position_check_interval_secs: Some(30.0),
@@ -138,6 +139,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .enable_limit_sells(true)
         .enable_stop_buys(false)
         .enable_stop_sells(false)
+        .bracket_contingency_type(ContingencyType::Oco)
+        .bracket_tp_order_type(OrderType::MarketIfTouched)
         // .open_position_on_start_qty(order_qty.as_decimal())
         .tob_offset_ticks(100)
         .use_post_only(true)

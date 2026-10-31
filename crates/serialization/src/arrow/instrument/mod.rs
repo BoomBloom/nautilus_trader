@@ -44,7 +44,7 @@ use nautilus_model::{
 #[allow(unused)]
 use crate::arrow::{
     ArrowSchemaProvider, Data, DecodeDataFromRecordBatch, DecodeFromRecordBatch,
-    EncodeToRecordBatch, EncodingError, KEY_INSTRUMENT_ID,
+    EncodeToRecordBatch, EncodingError, KEY_INSTRUMENT_ID, KEY_TYPE_NAME, first_logical_null,
 };
 
 pub mod betting;
@@ -128,8 +128,6 @@ pub(crate) fn decode_currency(
     ))
 }
 
-pub(crate) const KEY_CLASS: &str = "class";
-
 const INSTRUMENT_VALIDATION_FIELD: &str = "instrument";
 
 pub(crate) fn instrument_validation_error<T>(
@@ -145,11 +143,37 @@ pub(crate) fn instrument_validation_error<T>(
     )
 }
 
+pub(crate) fn validate_required_instrument_columns<T: ArrowSchemaProvider>(
+    metadata: &HashMap<String, String>,
+    record_batch: &RecordBatch,
+) -> Result<(), EncodingError> {
+    let expected = T::get_schema(Some(metadata.clone()));
+    let actual = record_batch.schema();
+    for field in expected
+        .fields()
+        .iter()
+        .filter(|field| !field.is_nullable())
+    {
+        let Ok(index) = actual.index_of(field.name()) else {
+            continue;
+        };
+
+        if let Some(row) = first_logical_null(record_batch.column(index).as_ref()) {
+            return Err(EncodingError::ParseError(
+                INSTRUMENT_VALIDATION_FIELD,
+                format!("required field '{}' is null at row {row}", field.name()),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 impl ArrowSchemaProvider for InstrumentAny {
     fn get_schema(metadata: Option<HashMap<String, String>>) -> Schema {
         let instrument_type = metadata
             .as_ref()
-            .and_then(|m| m.get("class"))
+            .and_then(|m| m.get(KEY_TYPE_NAME))
             .map_or("CurrencyPair", |s| s.as_str());
 
         match instrument_type {
@@ -515,7 +539,8 @@ impl EncodeToRecordBatch for InstrumentAny {
             Self::PerpetualContract(_) => "PerpetualContract",
             Self::TokenizedAsset(_) => "TokenizedAsset",
         };
-        metadata.insert("class".to_string(), type_name.to_string());
+
+        metadata.insert(KEY_TYPE_NAME.to_string(), type_name.to_string());
         metadata
     }
 }
@@ -525,15 +550,15 @@ impl EncodeToRecordBatch for InstrumentAny {
 ///
 /// # Errors
 ///
-/// Returns an `EncodingError` if the RecordBatch cannot be decoded.
+/// Returns an error if the RecordBatch cannot be decoded.
 pub fn decode_instrument_any_batch(
     #[allow(unused)] metadata: &HashMap<String, String>,
     record_batch: &RecordBatch,
 ) -> Result<Vec<InstrumentAny>, EncodingError> {
     let type_name = metadata
-        .get("class")
+        .get(KEY_TYPE_NAME)
         .map(String::as_str)
-        .ok_or_else(|| EncodingError::MissingMetadata("class"))?;
+        .ok_or_else(|| EncodingError::MissingMetadata(KEY_TYPE_NAME))?;
 
     match type_name {
         "Cfd" => {
@@ -663,7 +688,7 @@ pub fn decode_instrument_any_batch(
                 .collect())
         }
         _ => Err(EncodingError::ParseError(
-            "class",
+            KEY_TYPE_NAME,
             format!("Unknown instrument type: {type_name}"),
         )),
     }
@@ -684,7 +709,12 @@ mod tests {
         instruments::{
             Instrument, InstrumentAny,
             currency_pair::CurrencyPair,
-            stubs::{betting, equity_aapl},
+            stubs::{
+                betting, cfd_gold, commodity_gold, crypto_future_btcusdt,
+                crypto_futures_spread_btc_deribit, crypto_option_btc_deribit,
+                crypto_option_spread_btc_deribit, crypto_perpetual_ethusdt, currency_pair_ethusdt,
+                equity_aapl, perpetual_contract_eurusd, tokenized_asset_aaplx,
+            },
         },
         types::{Currency, Money, Price, Quantity},
     };
@@ -697,7 +727,7 @@ mod tests {
     #[rstest]
     fn test_get_schema() {
         let mut metadata = HashMap::new();
-        metadata.insert("class".to_string(), "CurrencyPair".to_string());
+        metadata.insert(KEY_TYPE_NAME.to_string(), "CurrencyPair".to_string());
         let schema = InstrumentAny::get_schema(Some(metadata));
         assert!(schema.fields().len() >= 20);
         assert_eq!(schema.field(0).name(), "id");
@@ -812,6 +842,44 @@ mod tests {
     }
 
     #[rstest]
+    #[case::binary_option(nautilus_model::instruments::stubs::binary_option().into_any())]
+    #[case::betting(betting().into_any())]
+    #[case::cfd(cfd_gold().into_any())]
+    #[case::commodity(commodity_gold().into_any())]
+    #[case::crypto_future(crypto_future_btcusdt(2, 6, Price::from("0.01"), Quantity::from("0.000001")).into_any())]
+    #[case::crypto_futures_spread(crypto_futures_spread_btc_deribit().into_any())]
+    #[case::crypto_option(crypto_option_btc_deribit(3, 1, Price::from("0.001"), Quantity::from("0.1")).into_any())]
+    #[case::crypto_option_spread(crypto_option_spread_btc_deribit().into_any())]
+    #[case::crypto_perpetual(crypto_perpetual_ethusdt().into_any())]
+    #[case::currency_pair(currency_pair_ethusdt().into_any())]
+    #[case::perpetual_contract(perpetual_contract_eurusd().into_any())]
+    #[case::tokenized_asset(tokenized_asset_aaplx().into_any())]
+    fn test_instrument_exact_money_notional_round_trip(#[case] instrument: InstrumentAny) {
+        let currency = instrument.quote_currency();
+        let maximum = Money::from_decimal_exact(dec!(1.000000001), currency).unwrap();
+        let minimum = Money::from_decimal_exact(dec!(0.000000003), currency).unwrap();
+        let mut encoded = serde_json::to_value(instrument).unwrap();
+        let fields = encoded
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+            .next()
+            .unwrap();
+        fields["max_notional"] = serde_json::to_value(maximum).unwrap();
+        fields["min_notional"] = serde_json::to_value(minimum).unwrap();
+        let instrument: InstrumentAny = serde_json::from_value(encoded).unwrap();
+        let metadata = instrument.metadata();
+        let batch =
+            InstrumentAny::encode_batch(&metadata, std::slice::from_ref(&instrument)).unwrap();
+        let decoded = decode_instrument_any_batch(&metadata, &batch).unwrap();
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].id(), instrument.id());
+        assert_eq!(decoded[0].max_notional(), Some(maximum));
+        assert_eq!(decoded[0].min_notional(), Some(minimum));
+    }
+
+    #[rstest]
     fn test_decode_currency_pair_without_tick_scheme_column_defaults_none() {
         let instrument_id = InstrumentId::from("EUR/USD.SIM");
         let currency_pair = CurrencyPair::builder()
@@ -892,8 +960,7 @@ mod tests {
     fn test_encode_decode_round_trip_equity_all_fields() {
         use nautilus_core::Params;
 
-        let mut info = Params::new();
-        info.insert("sector".to_string(), serde_json::json!("technology"));
+        let info = Params::new([("sector".to_string(), serde_json::json!("technology"))].into());
 
         let equity = Equity::builder()
             .instrument_id(InstrumentId::from("AAPL.NASDAQ"))
@@ -909,8 +976,6 @@ mod tests {
             .min_price(Price::from("0.01"))
             .margin_init(dec!(0.01))
             .margin_maint(dec!(0.02))
-            .maker_fee(dec!(0.0002))
-            .taker_fee(dec!(0.0004))
             .tick_scheme(Ustr::from("TOPIX100"))
             .info(info)
             .ts_event(1.into())
@@ -944,9 +1009,14 @@ mod tests {
     fn test_instrument_info_uses_nullable_utf8_json() {
         let absent = equity_aapl();
         let mut populated = absent.clone();
-        let mut info = nautilus_core::Params::new();
-        info.insert("enabled".to_string(), serde_json::json!(true));
-        info.insert("source".to_string(), serde_json::json!("unit-test"));
+
+        let info = nautilus_core::Params::new(
+            [
+                ("enabled".to_string(), serde_json::json!(true)),
+                ("source".to_string(), serde_json::json!("unit-test")),
+            ]
+            .into(),
+        );
         populated.info = Some(info);
         let instruments = [
             InstrumentAny::Equity(populated.clone()),
@@ -1004,8 +1074,6 @@ mod tests {
             .min_price(Price::from("0.01"))
             .margin_init(dec!(0.01))
             .margin_maint(dec!(0.02))
-            .maker_fee(dec!(0.0002))
-            .taker_fee(dec!(0.0004))
             .ts_event(1.into())
             .ts_init(2.into())
             .build()
@@ -1045,8 +1113,6 @@ mod tests {
             .min_price(Price::from("0.01"))
             .margin_init(dec!(0.01))
             .margin_maint(dec!(0.02))
-            .maker_fee(dec!(0.0002))
-            .taker_fee(dec!(0.0004))
             .ts_event(1.into())
             .ts_init(2.into())
             .build()
@@ -1065,9 +1131,8 @@ mod tests {
 
     #[rstest]
     fn test_encode_decode_round_trip_binary_option_all_fields() {
-        let mut info = Params::new();
         let raw = "0.1234567890123456789012345678";
-        info.insert("gamma_market".to_string(), serde_json::json!(raw));
+        let info = Params::new([("gamma_market".to_string(), serde_json::json!(raw))].into());
         let option = BinaryOption::builder()
             .instrument_id(InstrumentId::from("ELECTION.POLYMARKET"))
             .raw_symbol(Symbol::from("ELECTION"))
@@ -1091,8 +1156,6 @@ mod tests {
             .min_price(Price::from("0.01"))
             .margin_init(dec!(0.01))
             .margin_maint(dec!(0.02))
-            .maker_fee(dec!(0.0002))
-            .taker_fee(dec!(0.0004))
             .ts_event(1.into())
             .ts_init(2.into())
             .build()
@@ -1239,6 +1302,96 @@ mod tests {
         RecordBatch::try_new(schema, columns).unwrap()
     }
 
+    fn batch_with_null_uint8_column(record_batch: &RecordBatch, column_name: &str) -> RecordBatch {
+        let schema = record_batch.schema();
+        let column_index = schema.index_of(column_name).unwrap();
+        let fields = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(index, field)| {
+                if index == column_index {
+                    field.as_ref().clone().with_nullable(true)
+                } else {
+                    field.as_ref().clone()
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut columns = record_batch.columns().to_vec();
+        columns[column_index] = Arc::new(UInt8Array::from(vec![None]));
+        let schema = Schema::new_with_metadata(fields, schema.metadata().clone());
+
+        RecordBatch::try_new(Arc::new(schema), columns).unwrap()
+    }
+
+    #[rstest]
+    fn test_public_instrument_decoders_reject_null_required_columns() {
+        let instruments = vec![
+            InstrumentAny::Betting(nautilus_model::instruments::stubs::betting()),
+            InstrumentAny::BinaryOption(nautilus_model::instruments::stubs::binary_option()),
+            InstrumentAny::Cfd(nautilus_model::instruments::stubs::cfd_gold()),
+            InstrumentAny::Commodity(nautilus_model::instruments::stubs::commodity_gold()),
+            InstrumentAny::CryptoFuture(nautilus_model::instruments::stubs::crypto_future_btcusdt(
+                2,
+                6,
+                Price::from("0.01"),
+                Quantity::from("0.000001"),
+            )),
+            InstrumentAny::CryptoFuturesSpread(
+                nautilus_model::instruments::stubs::crypto_futures_spread_btc_deribit(),
+            ),
+            InstrumentAny::CryptoOption(
+                nautilus_model::instruments::stubs::crypto_option_btc_deribit(
+                    3,
+                    1,
+                    Price::from("0.001"),
+                    Quantity::from("0.1"),
+                ),
+            ),
+            InstrumentAny::CryptoOptionSpread(
+                nautilus_model::instruments::stubs::crypto_option_spread_btc_deribit(),
+            ),
+            InstrumentAny::CryptoPerpetual(
+                nautilus_model::instruments::stubs::crypto_perpetual_ethusdt(),
+            ),
+            InstrumentAny::CurrencyPair(nautilus_model::instruments::stubs::currency_pair_btcusdt()),
+            InstrumentAny::Equity(nautilus_model::instruments::stubs::equity_aapl()),
+            InstrumentAny::FuturesContract(
+                nautilus_model::instruments::stubs::futures_contract_es(None, None),
+            ),
+            InstrumentAny::FuturesSpread(nautilus_model::instruments::stubs::futures_spread_es()),
+            InstrumentAny::IndexInstrument(
+                nautilus_model::instruments::stubs::index_instrument_spx(),
+            ),
+            InstrumentAny::OptionContract(
+                nautilus_model::instruments::stubs::option_contract_appl(),
+            ),
+            InstrumentAny::OptionSpread(nautilus_model::instruments::stubs::option_spread()),
+            InstrumentAny::PerpetualContract(
+                nautilus_model::instruments::stubs::perpetual_contract_eurusd(),
+            ),
+            InstrumentAny::TokenizedAsset(
+                nautilus_model::instruments::stubs::tokenized_asset_aaplx(),
+            ),
+        ];
+
+        for instrument in instruments {
+            let metadata = instrument.metadata();
+            let record_batch =
+                InstrumentAny::encode_batch(&metadata, std::slice::from_ref(&instrument)).unwrap();
+            let record_batch = batch_with_null_uint8_column(&record_batch, "price_precision");
+
+            let result = decode_instrument_any_batch(&metadata, &record_batch);
+
+            assert!(matches!(
+                result,
+                Err(EncodingError::ParseError(INSTRUMENT_VALIDATION_FIELD, ref message))
+                    if message == "required field 'price_precision' is null at row 0"
+            ));
+        }
+    }
+
     #[rstest]
     #[case::binary_option(InstrumentAny::BinaryOption(
         nautilus_model::instruments::stubs::binary_option()
@@ -1299,7 +1452,7 @@ mod tests {
     ))]
     fn test_decode_instrument_checked_constructor_error(#[case] instrument: InstrumentAny) {
         let metadata = instrument.metadata();
-        let class = metadata.get("class").unwrap();
+        let class = metadata.get(KEY_TYPE_NAME).unwrap();
         let first_row_price_precision = Instrument::price_precision(&instrument);
         let instruments = vec![instrument.clone(), instrument];
         let record_batch = InstrumentAny::encode_batch(&metadata, &instruments).unwrap();
@@ -1507,8 +1660,8 @@ mod tests {
 
     #[rstest]
     fn test_roundtrip_crypto_perpetual_inverse() {
-        use nautilus_model::instruments::stubs::xbtusd_bitmex;
-        roundtrip_case(&InstrumentAny::CryptoPerpetual(xbtusd_bitmex()));
+        use nautilus_model::instruments::stubs::btcusd_bybit;
+        roundtrip_case(&InstrumentAny::CryptoPerpetual(btcusd_bybit()));
     }
 
     #[rstest]

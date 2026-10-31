@@ -15,7 +15,10 @@
 
 //! Instrument provider for the Derive adapter.
 
-use std::{collections::HashMap, fmt::Debug};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Debug,
+};
 
 use async_trait::async_trait;
 use nautilus_common::providers::{InstrumentProvider, InstrumentStore};
@@ -36,9 +39,8 @@ const INSTRUMENT_NOT_FOUND_CODE: i64 = 12001;
 
 /// Provides Derive instruments via the REST API.
 ///
-/// The Derive `public/get_instruments` endpoint is scoped by underlying
-/// currency, so callers configure the currency set up front or pass a
-/// `currency`/`currencies` filter to `load_all()`.
+/// The provider filters `public/get_all_instruments` by underlying currency.
+/// Callers configure currencies up front or pass a `currency`/`currencies` filter to `load_all()`.
 pub struct DeriveInstrumentProvider {
     store: InstrumentStore,
     http_client: DeriveHttpClient,
@@ -167,7 +169,6 @@ impl InstrumentProvider for DeriveInstrumentProvider {
             .collect();
         currencies.sort();
         currencies.dedup();
-
         if !currencies.is_empty() {
             let instruments = self.fetch_instruments(&currencies, expired).await?;
             self.add_instruments(instruments);
@@ -238,26 +239,46 @@ pub(crate) async fn fetch_instrument_definitions(
     currency: &str,
     expired: bool,
 ) -> anyhow::Result<Vec<DeriveInstrument>> {
-    let (mut definitions, options, erc20s) = Box::pin(async {
-        tokio::try_join!(
-            fetch_instruments_if_listed(http_client, currency, DeriveInstrumentType::Perp, expired),
-            fetch_instruments_if_listed(
-                http_client,
-                currency,
-                DeriveInstrumentType::Option,
-                expired,
-            ),
-            fetch_instruments_if_listed(
-                http_client,
-                currency,
-                DeriveInstrumentType::Erc20,
-                expired,
-            ),
-        )
-    })
-    .await?;
+    let (mut definitions, options, erc20s) =
+        Box::pin(async {
+            tokio::try_join!(
+                fetch_instruments_if_listed(
+                    http_client,
+                    currency,
+                    DeriveInstrumentType::Perp,
+                    false,
+                ),
+                fetch_instruments_if_listed(
+                    http_client,
+                    currency,
+                    DeriveInstrumentType::Option,
+                    false,
+                ),
+                fetch_instruments_if_listed(
+                    http_client,
+                    currency,
+                    DeriveInstrumentType::Erc20,
+                    false,
+                ),
+            )
+        })
+        .await?;
+
     definitions.extend(options);
     definitions.extend(erc20s);
+
+    if expired {
+        // Fetch after live listings so options moving to expired remain discoverable.
+        let expired_options =
+            fetch_instruments_if_listed(http_client, currency, DeriveInstrumentType::Option, true)
+                .await?;
+        let mut names: HashSet<_> = definitions.iter().map(|row| row.instrument_name).collect();
+        definitions.extend(
+            expired_options
+                .into_iter()
+                .filter(|row| names.insert(row.instrument_name)),
+        );
+    }
 
     Ok(definitions)
 }
@@ -291,7 +312,7 @@ fn resolve_load_filters(
     let currencies = filters
         .and_then(|map| {
             map.get("currency")
-                .map(|currency| vec![currency.trim().to_string()])
+                .map(|currency| vec![currency.clone()])
                 .or_else(|| map.get("currencies").map(|value| split_currencies(value)))
         })
         .unwrap_or_else(|| default_currencies.to_vec());
@@ -327,12 +348,16 @@ fn split_currencies(value: &str) -> Vec<String> {
 fn normalize_currencies(currencies: Vec<String>) -> Vec<String> {
     let mut currencies: Vec<_> = currencies
         .into_iter()
-        .map(|currency| currency.trim().to_string())
-        .filter(|currency| !currency.is_empty())
+        .filter_map(|currency| normalize_currency(&currency).map(ToOwned::to_owned))
         .collect();
     currencies.sort();
     currencies.dedup();
     currencies
+}
+
+pub(crate) fn normalize_currency(currency: &str) -> Option<&str> {
+    let currency = currency.trim();
+    (!currency.is_empty()).then_some(currency)
 }
 
 fn currency_from_instrument_id(instrument_id: &InstrumentId) -> Option<&str> {

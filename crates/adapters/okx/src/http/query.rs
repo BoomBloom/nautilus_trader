@@ -32,8 +32,8 @@ use serde::{self, Deserialize, Serialize};
 
 use crate::{
     common::enums::{
-        OKXAlgoOrderStatus, OKXAlgoOrderType, OKXInstrumentType, OKXOrderStatus, OKXOrderType,
-        OKXPositionMode, OKXPositionSide, OKXTradeMode,
+        OKXAlgoOrderStatus, OKXAlgoOrderType, OKXContractType, OKXInstrumentType, OKXMarginMode,
+        OKXOrderStatus, OKXOrderType, OKXPositionMode, OKXPositionSide, OKXTradeMode,
     },
     http::error::BuildError,
 };
@@ -522,7 +522,7 @@ pub struct GetFundingRateHistoryParams {
     /// Pagination: records older than this timestamp (ms).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub after: Option<String>,
-    /// Number of results per request (default 100, max 100).
+    /// Number of results per request (default 400, max 400).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
 }
@@ -734,19 +734,78 @@ pub struct GetOrderParams {
     pub pos_side: Option<OKXPositionSide>,
 }
 
+/// Parameters for GET /api/v5/account/bills and GET /api/v5/account/bills-archive.
+///
+/// All filters are optional, allowing account-wide and currency-wide queries.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Builder)]
+#[builder(default)]
+#[builder(setter(into, strip_option))]
+#[serde(rename_all = "camelCase")]
+pub struct GetAccountBillsParams {
+    /// Instrument type: SPOT, MARGIN, SWAP, FUTURES, OPTION, EVENTS.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inst_type: Option<OKXInstrumentType>,
+    /// Instrument ID, e.g. "BTC-USDT".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inst_id: Option<String>,
+    /// Bill currency.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ccy: Option<String>,
+    /// Margin mode: cross or isolated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mgn_mode: Option<OKXMarginMode>,
+    /// Contract type: linear or inverse, applicable to FUTURES/SWAP.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ct_type: Option<OKXContractType>,
+    /// Bill type code, as defined by OKX.
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub bill_type: Option<String>,
+    /// Bill subtype code, as defined by OKX.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sub_type: Option<String>,
+    /// Returns records older than this bill ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+    /// Returns records newer than this bill ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+    /// Begin timestamp in Unix milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub begin: Option<String>,
+    /// End timestamp in Unix milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end: Option<String>,
+    /// Number of results per request (default 100, maximum 100).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
 /// Parameters for the GET /api/v5/account/trade-fee endpoint.
 #[derive(Clone, Debug, Deserialize, Serialize, Builder)]
 #[builder(setter(into, strip_option))]
 #[serde(rename_all = "camelCase")]
 pub struct GetTradeFeeParams {
-    /// Instrument type: SPOT, MARGIN, SWAP, FUTURES, OPTION.
+    /// Instrument type: SPOT, MARGIN, SWAP, FUTURES, OPTION, EVENTS.
     pub inst_type: OKXInstrumentType,
-    /// Underlying, required for SWAP/FUTURES/OPTION (optional).
+    /// Legacy underlying selector for SWAP/FUTURES/OPTION (optional).
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uly: Option<String>,
-    /// Instrument family, required for SWAP/FUTURES/OPTION (optional).
+    /// Instrument family for SWAP/FUTURES/OPTION (optional).
+    /// Required to obtain applicable incentive-program rates.
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inst_family: Option<String>,
+    /// Instrument ID for SPOT/MARGIN (optional).
+    /// Required to obtain applicable incentive-program rates.
+    #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inst_id: Option<String>,
+    /// Fee group ID from instrument metadata (optional).
+    /// Mutually exclusive with `inst_id` and `inst_family`.
+    #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
 }
 
 #[cfg(test)]

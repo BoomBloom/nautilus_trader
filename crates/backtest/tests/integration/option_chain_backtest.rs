@@ -39,6 +39,7 @@ use nautilus_backtest::{
 };
 use nautilus_common::actor::DataActor;
 use nautilus_core::UnixNanos;
+use nautilus_execution::models::fee::{FeeModelAny, MakerTakerFeeModel};
 use nautilus_model::{
     data::{
         NautilusDataType, QuoteTick,
@@ -50,7 +51,9 @@ use nautilus_model::{
     instruments::{CryptoOption, Instrument, InstrumentAny},
     types::{Currency, Money, Price, Quantity},
 };
-use nautilus_persistence::backend::catalog::ParquetDataCatalog;
+use nautilus_persistence::{
+    backend::parquet::catalog::ParquetDataCatalog, config::DataCatalogConfig,
+};
 use nautilus_trading::{StrategyConfig, StrategyCore, nautilus_strategy};
 use rstest::*;
 use tempfile::TempDir;
@@ -109,12 +112,13 @@ fn deribit_venue_config() -> BacktestVenueConfig {
         .account_type(AccountType::Margin)
         .book_type(BookType::L1_MBP)
         .starting_balances(vec!["10 BTC".to_string()])
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()))
         .build()
         .unwrap()
 }
 
 fn series_id() -> OptionSeriesId {
-    OptionSeriesId::new(
+    OptionSeriesId::new_derived(
         Venue::new("DERIBIT"),
         Ustr::from("BTC"),
         Ustr::from("BTC"),
@@ -306,13 +310,13 @@ fn run_chain_backtest(
     let instrument_ids = vec![call_id, put_id];
     let quote_data = BacktestDataConfig::builder()
         .data_type(NautilusDataType::QuoteTick)
-        .catalog_path(catalog_path.to_string())
+        .catalog(DataCatalogConfig::new(catalog_path.to_string(), None, None))
         .instrument_ids(instrument_ids.clone())
         .build()
         .unwrap();
     let greeks_data = BacktestDataConfig::builder()
         .data_type(NautilusDataType::OptionGreeks)
-        .catalog_path(catalog_path.to_string())
+        .catalog(DataCatalogConfig::new(catalog_path.to_string(), None, None))
         .instrument_ids(instrument_ids)
         .build()
         .unwrap();

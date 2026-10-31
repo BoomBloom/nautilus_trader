@@ -29,13 +29,13 @@ use nautilus_model::{
         FuturesSpread, IndexInstrument, InstrumentAny, OptionContract, OptionSpread,
         PerpetualContract, TokenizedAsset,
     },
-    types::{Currency, Money, Price, Quantity},
+    types::{Currency, Price, Quantity},
 };
 use rust_decimal::Decimal;
 use sqlx::{FromRow, Row, postgres::PgRow, types::Json};
 use ustr::Ustr;
 
-use crate::sql::models::{enums::AssetClassPg, read_u8, read_u64};
+use crate::sql::models::{decode_money, enums::AssetClassPg, read_u8, read_u64};
 
 #[derive(Debug)]
 pub struct InstrumentAnyRow(pub InstrumentAny);
@@ -244,11 +244,15 @@ impl<'r> FromRow<'r, PgRow> for BettingInstrumentRow {
         let max_notional = row
             .try_get::<Option<String>, _>("max_notional")
             .ok()
-            .and_then(|res| res.map(|value| Money::from(value.as_str())));
+            .flatten()
+            .map(|value| decode_money(&value, "max_notional"))
+            .transpose()?;
         let min_notional = row
             .try_get::<Option<String>, _>("min_notional")
             .ok()
-            .and_then(|res| res.map(|value| Money::from(value.as_str())));
+            .flatten()
+            .map(|value| decode_money(&value, "min_notional"))
+            .transpose()?;
         let max_price = row
             .try_get::<Option<String>, _>("max_price")
             .ok()
@@ -262,12 +266,6 @@ impl<'r> FromRow<'r, PgRow> for BettingInstrumentRow {
             .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
         let margin_maint = row
             .try_get::<String, _>("margin_maint")
-            .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
-        let maker_fee = row
-            .try_get::<String, _>("maker_fee")
-            .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
-        let taker_fee = row
-            .try_get::<String, _>("taker_fee")
             .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
         let ts_event = row.try_get::<String, _>("ts_event").map(UnixNanos::from)?;
         let ts_init = row.try_get::<String, _>("ts_init").map(UnixNanos::from)?;
@@ -306,8 +304,6 @@ impl<'r> FromRow<'r, PgRow> for BettingInstrumentRow {
             .maybe_min_price(min_price)
             .maybe_margin_init(margin_init)
             .maybe_margin_maint(margin_maint)
-            .maybe_maker_fee(maker_fee)
-            .maybe_taker_fee(taker_fee)
             .maybe_info(info.map(|info| info.0))
             .ts_event(ts_event)
             .ts_init(ts_init)
@@ -360,11 +356,15 @@ impl<'r> FromRow<'r, PgRow> for BinaryOptionRow {
         let max_notional = row
             .try_get::<Option<String>, _>("max_notional")
             .ok()
-            .and_then(|res| res.map(|value| Money::from(value.as_str())));
+            .flatten()
+            .map(|value| decode_money(&value, "max_notional"))
+            .transpose()?;
         let min_notional = row
             .try_get::<Option<String>, _>("min_notional")
             .ok()
-            .and_then(|res| res.map(|value| Money::from(value.as_str())));
+            .flatten()
+            .map(|value| decode_money(&value, "min_notional"))
+            .transpose()?;
         let max_price = row
             .try_get::<Option<String>, _>("max_price")
             .ok()
@@ -378,12 +378,6 @@ impl<'r> FromRow<'r, PgRow> for BinaryOptionRow {
             .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
         let margin_maint = row
             .try_get::<String, _>("margin_maint")
-            .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
-        let maker_fee = row
-            .try_get::<String, _>("maker_fee")
-            .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
-        let taker_fee = row
-            .try_get::<String, _>("taker_fee")
             .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
         let ts_event = row.try_get::<String, _>("ts_event").map(UnixNanos::from)?;
         let ts_init = row.try_get::<String, _>("ts_init").map(UnixNanos::from)?;
@@ -411,8 +405,6 @@ impl<'r> FromRow<'r, PgRow> for BinaryOptionRow {
             .maybe_min_price(min_price)
             .maybe_margin_init(margin_init)
             .maybe_margin_maint(margin_maint)
-            .maybe_maker_fee(maker_fee)
-            .maybe_taker_fee(taker_fee)
             .maybe_info(info.map(|info| info.0))
             .ts_event(ts_event)
             .ts_init(ts_init)
@@ -465,11 +457,15 @@ impl<'r> FromRow<'r, PgRow> for CryptoFutureRow {
         let max_notional = row
             .try_get::<Option<String>, _>("max_notional")
             .ok()
-            .and_then(|res| res.map(|value| Money::from(value.as_str())));
+            .flatten()
+            .map(|value| decode_money(&value, "max_notional"))
+            .transpose()?;
         let min_notional = row
             .try_get::<Option<String>, _>("min_notional")
             .ok()
-            .and_then(|res| res.map(|value| Money::from(value.as_str())));
+            .flatten()
+            .map(|value| decode_money(&value, "min_notional"))
+            .transpose()?;
         let max_price = row
             .try_get::<Option<String>, _>("max_price")
             .ok()
@@ -483,12 +479,6 @@ impl<'r> FromRow<'r, PgRow> for CryptoFutureRow {
             .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
         let margin_maint = row
             .try_get::<String, _>("margin_maint")
-            .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
-        let maker_fee = row
-            .try_get::<String, _>("maker_fee")
-            .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
-        let taker_fee = row
-            .try_get::<String, _>("taker_fee")
             .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
         let ts_event = row.try_get::<String, _>("ts_event").map(UnixNanos::from)?;
         let ts_init = row.try_get::<String, _>("ts_init").map(UnixNanos::from)?;
@@ -518,8 +508,6 @@ impl<'r> FromRow<'r, PgRow> for CryptoFutureRow {
             .maybe_min_price(min_price)
             .maybe_margin_init(margin_init)
             .maybe_margin_maint(margin_maint)
-            .maybe_maker_fee(maker_fee)
-            .maybe_taker_fee(taker_fee)
             .maybe_info(info.map(|info| info.0))
             .ts_event(ts_event)
             .ts_init(ts_init)
@@ -582,11 +570,15 @@ impl<'r> FromRow<'r, PgRow> for CryptoOptionRow {
         let max_notional = row
             .try_get::<Option<String>, _>("max_notional")
             .ok()
-            .and_then(|res| res.map(|value| Money::from(value.as_str())));
+            .flatten()
+            .map(|value| decode_money(&value, "max_notional"))
+            .transpose()?;
         let min_notional = row
             .try_get::<Option<String>, _>("min_notional")
             .ok()
-            .and_then(|res| res.map(|value| Money::from(value.as_str())));
+            .flatten()
+            .map(|value| decode_money(&value, "min_notional"))
+            .transpose()?;
         let max_price = row
             .try_get::<Option<String>, _>("max_price")
             .ok()
@@ -600,12 +592,6 @@ impl<'r> FromRow<'r, PgRow> for CryptoOptionRow {
             .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
         let margin_maint = row
             .try_get::<String, _>("margin_maint")
-            .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
-        let maker_fee = row
-            .try_get::<String, _>("maker_fee")
-            .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
-        let taker_fee = row
-            .try_get::<String, _>("taker_fee")
             .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
         let ts_event = row.try_get::<String, _>("ts_event").map(UnixNanos::from)?;
         let ts_init = row.try_get::<String, _>("ts_init").map(UnixNanos::from)?;
@@ -637,8 +623,6 @@ impl<'r> FromRow<'r, PgRow> for CryptoOptionRow {
             .maybe_min_price(min_price)
             .maybe_margin_init(margin_init)
             .maybe_margin_maint(margin_maint)
-            .maybe_maker_fee(maker_fee)
-            .maybe_taker_fee(taker_fee)
             .maybe_info(info.map(|info| info.0))
             .ts_event(ts_event)
             .ts_init(ts_init)
@@ -687,11 +671,15 @@ impl<'r> FromRow<'r, PgRow> for CryptoPerpetualRow {
         let max_notional = row
             .try_get::<Option<String>, _>("max_notional")
             .ok()
-            .and_then(|res| res.map(|res| Money::from(res.as_str())));
+            .flatten()
+            .map(|value| decode_money(&value, "max_notional"))
+            .transpose()?;
         let min_notional = row
             .try_get::<Option<String>, _>("min_notional")
             .ok()
-            .and_then(|res| res.map(|res| Money::from(res.as_str())));
+            .flatten()
+            .map(|value| decode_money(&value, "min_notional"))
+            .transpose()?;
         let max_price = row
             .try_get::<Option<String>, _>("max_price")
             .ok()
@@ -705,12 +693,6 @@ impl<'r> FromRow<'r, PgRow> for CryptoPerpetualRow {
             .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
         let margin_maint = row
             .try_get::<String, _>("margin_maint")
-            .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
-        let maker_fee = row
-            .try_get::<String, _>("maker_fee")
-            .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
-        let taker_fee = row
-            .try_get::<String, _>("taker_fee")
             .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
         let ts_event = row.try_get::<String, _>("ts_event").map(UnixNanos::from)?;
         let ts_event = row.try_get::<String, _>("ts_event").map(UnixNanos::from)?;
@@ -739,8 +721,6 @@ impl<'r> FromRow<'r, PgRow> for CryptoPerpetualRow {
             .maybe_min_price(min_price)
             .maybe_margin_init(margin_init)
             .maybe_margin_maint(margin_maint)
-            .maybe_maker_fee(maker_fee)
-            .maybe_taker_fee(taker_fee)
             .maybe_info(info.map(|info| info.0))
             .ts_event(ts_event)
             .ts_init(ts_init)
@@ -787,11 +767,15 @@ impl<'r> FromRow<'r, PgRow> for CurrencyPairRow {
         let max_notional = row
             .try_get::<Option<String>, _>("max_notional")
             .ok()
-            .and_then(|res| res.map(|res| Money::from(res.as_str())));
+            .flatten()
+            .map(|value| decode_money(&value, "max_notional"))
+            .transpose()?;
         let min_notional = row
             .try_get::<Option<String>, _>("min_notional")
             .ok()
-            .and_then(|res| res.map(|res| Money::from(res.as_str())));
+            .flatten()
+            .map(|value| decode_money(&value, "min_notional"))
+            .transpose()?;
         let max_price = row
             .try_get::<Option<String>, _>("max_price")
             .ok()
@@ -805,12 +789,6 @@ impl<'r> FromRow<'r, PgRow> for CurrencyPairRow {
             .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
         let margin_maint = row
             .try_get::<String, _>("margin_maint")
-            .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
-        let maker_fee = row
-            .try_get::<String, _>("maker_fee")
-            .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
-        let taker_fee = row
-            .try_get::<String, _>("taker_fee")
             .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
         let ts_event = row.try_get::<String, _>("ts_event").map(UnixNanos::from)?;
         let ts_init = row.try_get::<String, _>("ts_init").map(UnixNanos::from)?;
@@ -836,8 +814,6 @@ impl<'r> FromRow<'r, PgRow> for CurrencyPairRow {
             .maybe_min_price(min_price)
             .maybe_margin_init(margin_init)
             .maybe_margin_maint(margin_maint)
-            .maybe_maker_fee(maker_fee)
-            .maybe_taker_fee(taker_fee)
             .maybe_info(info.map(|info| info.0))
             .ts_event(ts_event)
             .ts_init(ts_init)
@@ -886,12 +862,6 @@ impl<'r> FromRow<'r, PgRow> for EquityRow {
         let margin_maint = row
             .try_get::<String, _>("margin_maint")
             .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
-        let maker_fee = row
-            .try_get::<String, _>("maker_fee")
-            .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
-        let taker_fee = row
-            .try_get::<String, _>("taker_fee")
-            .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
         let ts_event = row.try_get::<String, _>("ts_event").map(UnixNanos::from)?;
         let ts_init = row.try_get::<String, _>("ts_init").map(UnixNanos::from)?;
 
@@ -911,8 +881,6 @@ impl<'r> FromRow<'r, PgRow> for EquityRow {
             .maybe_min_price(min_price)
             .maybe_margin_init(margin_init)
             .maybe_margin_maint(margin_maint)
-            .maybe_maker_fee(maker_fee)
-            .maybe_taker_fee(taker_fee)
             .maybe_info(info.map(|info| info.0))
             .ts_event(ts_event)
             .ts_init(ts_init)
@@ -976,12 +944,6 @@ impl<'r> FromRow<'r, PgRow> for FuturesContractRow {
         let margin_maint = row
             .try_get::<String, _>("margin_maint")
             .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
-        let maker_fee = row
-            .try_get::<String, _>("maker_fee")
-            .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
-        let taker_fee = row
-            .try_get::<String, _>("taker_fee")
-            .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
         let ts_event = row.try_get::<String, _>("ts_event").map(UnixNanos::from)?;
         let ts_init = row.try_get::<String, _>("ts_init").map(UnixNanos::from)?;
 
@@ -1006,8 +968,6 @@ impl<'r> FromRow<'r, PgRow> for FuturesContractRow {
             .maybe_min_price(min_price)
             .maybe_margin_init(margin_init)
             .maybe_margin_maint(margin_maint)
-            .maybe_maker_fee(maker_fee)
-            .maybe_taker_fee(taker_fee)
             .maybe_info(info.map(|info| info.0))
             .ts_event(ts_event)
             .ts_init(ts_init)
@@ -1084,12 +1044,6 @@ impl<'r> FromRow<'r, PgRow> for OptionContractRow {
         let margin_maint = row
             .try_get::<String, _>("margin_maint")
             .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
-        let maker_fee = row
-            .try_get::<String, _>("maker_fee")
-            .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
-        let taker_fee = row
-            .try_get::<String, _>("taker_fee")
-            .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
         let ts_event = row.try_get::<String, _>("ts_event").map(UnixNanos::from)?;
         let ts_init = row.try_get::<String, _>("ts_init").map(UnixNanos::from)?;
 
@@ -1116,8 +1070,6 @@ impl<'r> FromRow<'r, PgRow> for OptionContractRow {
             .maybe_min_price(min_price)
             .maybe_margin_init(margin_init)
             .maybe_margin_maint(margin_maint)
-            .maybe_maker_fee(maker_fee)
-            .maybe_taker_fee(taker_fee)
             .maybe_info(info.map(|info| info.0))
             .ts_event(ts_event)
             .ts_init(ts_init)
@@ -1160,11 +1112,15 @@ impl<'r> FromRow<'r, PgRow> for CommodityRow {
         let max_notional = row
             .try_get::<Option<String>, _>("max_notional")
             .ok()
-            .and_then(|res| res.map(|value| Money::from(value.as_str())));
+            .flatten()
+            .map(|value| decode_money(&value, "max_notional"))
+            .transpose()?;
         let min_notional = row
             .try_get::<Option<String>, _>("min_notional")
             .ok()
-            .and_then(|res| res.map(|value| Money::from(value.as_str())));
+            .flatten()
+            .map(|value| decode_money(&value, "min_notional"))
+            .transpose()?;
         let max_price = row
             .try_get::<Option<String>, _>("max_price")
             .ok()
@@ -1178,12 +1134,6 @@ impl<'r> FromRow<'r, PgRow> for CommodityRow {
             .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
         let margin_maint = row
             .try_get::<String, _>("margin_maint")
-            .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
-        let maker_fee = row
-            .try_get::<String, _>("maker_fee")
-            .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
-        let taker_fee = row
-            .try_get::<String, _>("taker_fee")
             .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
         let ts_event = row.try_get::<String, _>("ts_event").map(UnixNanos::from)?;
         let ts_init = row.try_get::<String, _>("ts_init").map(UnixNanos::from)?;
@@ -1208,8 +1158,6 @@ impl<'r> FromRow<'r, PgRow> for CommodityRow {
             .maybe_min_price(min_price)
             .maybe_margin_init(margin_init)
             .maybe_margin_maint(margin_maint)
-            .maybe_maker_fee(maker_fee)
-            .maybe_taker_fee(taker_fee)
             .maybe_info(info.map(|info| info.0))
             .ts_event(ts_event)
             .ts_init(ts_init)
@@ -1293,11 +1241,15 @@ impl<'r> FromRow<'r, PgRow> for CfdRow {
         let max_notional = row
             .try_get::<Option<String>, _>("max_notional")
             .ok()
-            .and_then(|res| res.map(|value| Money::from(value.as_str())));
+            .flatten()
+            .map(|value| decode_money(&value, "max_notional"))
+            .transpose()?;
         let min_notional = row
             .try_get::<Option<String>, _>("min_notional")
             .ok()
-            .and_then(|res| res.map(|value| Money::from(value.as_str())));
+            .flatten()
+            .map(|value| decode_money(&value, "min_notional"))
+            .transpose()?;
         let max_price = row
             .try_get::<Option<String>, _>("max_price")
             .ok()
@@ -1311,12 +1263,6 @@ impl<'r> FromRow<'r, PgRow> for CfdRow {
             .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
         let margin_maint = row
             .try_get::<String, _>("margin_maint")
-            .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
-        let maker_fee = row
-            .try_get::<String, _>("maker_fee")
-            .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
-        let taker_fee = row
-            .try_get::<String, _>("taker_fee")
             .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
         let ts_event = row.try_get::<String, _>("ts_event").map(UnixNanos::from)?;
         let ts_init = row.try_get::<String, _>("ts_init").map(UnixNanos::from)?;
@@ -1342,8 +1288,6 @@ impl<'r> FromRow<'r, PgRow> for CfdRow {
             .maybe_min_price(min_price)
             .maybe_margin_init(margin_init)
             .maybe_margin_maint(margin_maint)
-            .maybe_maker_fee(maker_fee)
-            .maybe_taker_fee(taker_fee)
             .maybe_info(info.map(|info| info.0))
             .ts_event(ts_event)
             .ts_init(ts_init)
@@ -1354,10 +1298,6 @@ impl<'r> FromRow<'r, PgRow> for CfdRow {
 }
 
 impl<'r> FromRow<'r, PgRow> for PerpetualContractRow {
-    #[expect(
-        clippy::too_many_lines,
-        reason = "SQL row mapping mirrors the full perpetual contract constructor"
-    )]
     fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
         let id = row.try_get::<String, _>("id").map(InstrumentId::from)?;
         let raw_symbol = row.try_get::<String, _>("raw_symbol").map(Symbol::from)?;
@@ -1403,11 +1343,15 @@ impl<'r> FromRow<'r, PgRow> for PerpetualContractRow {
         let max_notional = row
             .try_get::<Option<String>, _>("max_notional")
             .ok()
-            .and_then(|res| res.map(|value| Money::from(value.as_str())));
+            .flatten()
+            .map(|value| decode_money(&value, "max_notional"))
+            .transpose()?;
         let min_notional = row
             .try_get::<Option<String>, _>("min_notional")
             .ok()
-            .and_then(|res| res.map(|value| Money::from(value.as_str())));
+            .flatten()
+            .map(|value| decode_money(&value, "min_notional"))
+            .transpose()?;
         let max_price = row
             .try_get::<Option<String>, _>("max_price")
             .ok()
@@ -1421,12 +1365,6 @@ impl<'r> FromRow<'r, PgRow> for PerpetualContractRow {
             .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
         let margin_maint = row
             .try_get::<String, _>("margin_maint")
-            .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
-        let maker_fee = row
-            .try_get::<String, _>("maker_fee")
-            .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
-        let taker_fee = row
-            .try_get::<String, _>("taker_fee")
             .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
         let ts_event = row.try_get::<String, _>("ts_event").map(UnixNanos::from)?;
         let ts_init = row.try_get::<String, _>("ts_init").map(UnixNanos::from)?;
@@ -1456,8 +1394,6 @@ impl<'r> FromRow<'r, PgRow> for PerpetualContractRow {
             .maybe_min_price(min_price)
             .maybe_margin_init(margin_init)
             .maybe_margin_maint(margin_maint)
-            .maybe_maker_fee(maker_fee)
-            .maybe_taker_fee(taker_fee)
             .maybe_info(info.map(|info| info.0))
             .ts_event(ts_event)
             .ts_init(ts_init)
@@ -1474,10 +1410,6 @@ impl<'r> FromRow<'r, PgRow> for OptionSpreadRow {
 }
 
 impl<'r> FromRow<'r, PgRow> for CryptoFuturesSpreadRow {
-    #[expect(
-        clippy::too_many_lines,
-        reason = "SQL row mapping mirrors the full crypto futures spread constructor"
-    )]
     fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
         let id = row.try_get::<String, _>("id").map(InstrumentId::from)?;
         let raw_symbol = row.try_get::<String, _>("raw_symbol").map(Symbol::from)?;
@@ -1523,11 +1455,15 @@ impl<'r> FromRow<'r, PgRow> for CryptoFuturesSpreadRow {
         let max_notional = row
             .try_get::<Option<String>, _>("max_notional")
             .ok()
-            .and_then(|res| res.map(|value| Money::from(value.as_str())));
+            .flatten()
+            .map(|value| decode_money(&value, "max_notional"))
+            .transpose()?;
         let min_notional = row
             .try_get::<Option<String>, _>("min_notional")
             .ok()
-            .and_then(|res| res.map(|value| Money::from(value.as_str())));
+            .flatten()
+            .map(|value| decode_money(&value, "min_notional"))
+            .transpose()?;
         let max_price = row
             .try_get::<Option<String>, _>("max_price")
             .ok()
@@ -1541,12 +1477,6 @@ impl<'r> FromRow<'r, PgRow> for CryptoFuturesSpreadRow {
             .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
         let margin_maint = row
             .try_get::<String, _>("margin_maint")
-            .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
-        let maker_fee = row
-            .try_get::<String, _>("maker_fee")
-            .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
-        let taker_fee = row
-            .try_get::<String, _>("taker_fee")
             .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
         let ts_event = row.try_get::<String, _>("ts_event").map(UnixNanos::from)?;
         let ts_init = row.try_get::<String, _>("ts_init").map(UnixNanos::from)?;
@@ -1577,8 +1507,6 @@ impl<'r> FromRow<'r, PgRow> for CryptoFuturesSpreadRow {
             .maybe_min_price(min_price)
             .maybe_margin_init(margin_init)
             .maybe_margin_maint(margin_maint)
-            .maybe_maker_fee(maker_fee)
-            .maybe_taker_fee(taker_fee)
             .maybe_info(info.map(|info| info.0))
             .ts_event(ts_event)
             .ts_init(ts_init)
@@ -1589,10 +1517,6 @@ impl<'r> FromRow<'r, PgRow> for CryptoFuturesSpreadRow {
 }
 
 impl<'r> FromRow<'r, PgRow> for CryptoOptionSpreadRow {
-    #[expect(
-        clippy::too_many_lines,
-        reason = "SQL row mapping mirrors the full crypto option spread constructor"
-    )]
     fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
         let id = row.try_get::<String, _>("id").map(InstrumentId::from)?;
         let raw_symbol = row.try_get::<String, _>("raw_symbol").map(Symbol::from)?;
@@ -1638,11 +1562,15 @@ impl<'r> FromRow<'r, PgRow> for CryptoOptionSpreadRow {
         let max_notional = row
             .try_get::<Option<String>, _>("max_notional")
             .ok()
-            .and_then(|res| res.map(|value| Money::from(value.as_str())));
+            .flatten()
+            .map(|value| decode_money(&value, "max_notional"))
+            .transpose()?;
         let min_notional = row
             .try_get::<Option<String>, _>("min_notional")
             .ok()
-            .and_then(|res| res.map(|value| Money::from(value.as_str())));
+            .flatten()
+            .map(|value| decode_money(&value, "min_notional"))
+            .transpose()?;
         let max_price = row
             .try_get::<Option<String>, _>("max_price")
             .ok()
@@ -1656,12 +1584,6 @@ impl<'r> FromRow<'r, PgRow> for CryptoOptionSpreadRow {
             .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
         let margin_maint = row
             .try_get::<String, _>("margin_maint")
-            .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
-        let maker_fee = row
-            .try_get::<String, _>("maker_fee")
-            .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
-        let taker_fee = row
-            .try_get::<String, _>("taker_fee")
             .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
         let ts_event = row.try_get::<String, _>("ts_event").map(UnixNanos::from)?;
         let ts_init = row.try_get::<String, _>("ts_init").map(UnixNanos::from)?;
@@ -1692,8 +1614,6 @@ impl<'r> FromRow<'r, PgRow> for CryptoOptionSpreadRow {
             .maybe_min_price(min_price)
             .maybe_margin_init(margin_init)
             .maybe_margin_maint(margin_maint)
-            .maybe_maker_fee(maker_fee)
-            .maybe_taker_fee(taker_fee)
             .maybe_info(info.map(|info| info.0))
             .ts_event(ts_event)
             .ts_init(ts_init)
@@ -1739,11 +1659,15 @@ impl<'r> FromRow<'r, PgRow> for TokenizedAssetRow {
         let max_notional = row
             .try_get::<Option<String>, _>("max_notional")
             .ok()
-            .and_then(|res| res.map(|res| Money::from(res.as_str())));
+            .flatten()
+            .map(|value| decode_money(&value, "max_notional"))
+            .transpose()?;
         let min_notional = row
             .try_get::<Option<String>, _>("min_notional")
             .ok()
-            .and_then(|res| res.map(|res| Money::from(res.as_str())));
+            .flatten()
+            .map(|value| decode_money(&value, "min_notional"))
+            .transpose()?;
         let max_price = row
             .try_get::<Option<String>, _>("max_price")
             .ok()
@@ -1757,12 +1681,6 @@ impl<'r> FromRow<'r, PgRow> for TokenizedAssetRow {
             .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
         let margin_maint = row
             .try_get::<String, _>("margin_maint")
-            .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
-        let maker_fee = row
-            .try_get::<String, _>("maker_fee")
-            .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
-        let taker_fee = row
-            .try_get::<String, _>("taker_fee")
             .map(|res| Some(Decimal::from_str(res.as_str()).unwrap()))?;
         let ts_event = row.try_get::<String, _>("ts_event").map(UnixNanos::from)?;
         let ts_init = row.try_get::<String, _>("ts_init").map(UnixNanos::from)?;
@@ -1790,8 +1708,6 @@ impl<'r> FromRow<'r, PgRow> for TokenizedAssetRow {
             .maybe_min_price(min_price)
             .maybe_margin_init(margin_init)
             .maybe_margin_maint(margin_maint)
-            .maybe_maker_fee(maker_fee)
-            .maybe_taker_fee(taker_fee)
             .maybe_info(info.map(|info| info.0))
             .ts_event(ts_event)
             .ts_init(ts_init)

@@ -26,8 +26,6 @@ currency futures.
 | `lot_size`        | `Quantity`         | `Quantity`         | Required         | Rounded lot or contract lot size.        |
 | `margin_init`     | `Option<Decimal>`  | `Decimal \| None`  | `0`              | Initial margin rate.                     |
 | `margin_maint`    | `Option<Decimal>`  | `Decimal \| None`  | `0`              | Maintenance margin rate.                 |
-| `maker_fee`       | `Option<Decimal>`  | `Decimal \| None`  | `0`              | Maker fee rate. Negative values rebate.  |
-| `taker_fee`       | `Option<Decimal>`  | `Decimal \| None`  | `0`              | Taker fee rate. Negative values rebate.  |
 | `max_quantity`    | `Option<Quantity>` | `Quantity \| None` | `None`           | Maximum order quantity.                  |
 | `min_quantity`    | `Option<Quantity>` | `Quantity \| None` | `1`              | Minimum order quantity.                  |
 | `max_price`       | `Option<Price>`    | `Price \| None`    | `None`           | Maximum valid quote or order price.      |
@@ -37,12 +35,13 @@ currency futures.
 | `ts_event`        | `UnixNanos`        | `int`              | Required         | Event timestamp in nanoseconds.          |
 | `ts_init`         | `UnixNanos`        | `int`              | Required         | Initialization timestamp in nanoseconds. |
 
-*Note: Python constructors use `instrument_id`; Rust stores the same value as `id`.*
+**Note**: Python constructors use `instrument_id`. Rust stores the same value as `id`.
 
 ## Behavior
 
 - `FuturesContract` has instrument class `Future`.
 - It is never inverse. Cost, settlement, and quote currency use `currency`.
+- Prices can be zero or negative.
 - It trades in whole contracts with size precision `0` and size increment `1`.
 - Use `CryptoFuture` for dated crypto futures where the underlying and settlement
   currencies can differ.
@@ -113,7 +112,7 @@ esz21 = FuturesContract(
 
 ## Adapters
 
-Representative adapters that create or consume `FuturesContract` instruments include:
+**Adapters that create or consume `FuturesContract` instruments include**:
 
 - [Databento](../../integrations/databento.md) for futures reference data and market data.
 - [Interactive Brokers](../../integrations/interactive_brokers.md) for listed futures contracts.

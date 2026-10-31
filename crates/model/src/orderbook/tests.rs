@@ -36,13 +36,13 @@ use crate::{
     },
     enums::{
         AggressorSide, BookAction, BookType, OrderSide, OrderStatus, OrderType, RecordFlag,
-        TimeInForce,
+        TimeInForce, TriggerType,
     },
     identifiers::{ClientOrderId, InstrumentId, TradeId, TraderId, VenueOrderId},
     orderbook::{
         BookIntegrityError, BookLevel, BookPrice, BookViewError, InvalidBookOperation, OrderBook,
         OwnBookError, OwnBookOrder,
-        analysis::book_check_integrity,
+        analysis::{book_check_integrity, get_levels_for_price},
         own::{OwnBookLadder, OwnBookLevel, OwnOrderBook, should_handle_own_book_order},
     },
     orders::builder::OrderTestBuilder,
@@ -186,6 +186,21 @@ fn test_book_display() {
     assert_eq!(
         book.to_string(),
         "OrderBook(instrument_id=ETHUSDT-PERP.BINANCE, book_type=L2_MBP, update_count=0)"
+    );
+}
+
+#[rstest]
+fn test_book_equality_uses_instrument_and_book_type() {
+    let instrument_id = InstrumentId::from("AAPL.XNAS");
+    let mut book = OrderBook::new(instrument_id, BookType::L2_MBP);
+    let bid = BookOrder::new(OrderSide::Buy, Price::from("100.00"), Quantity::from(10), 1);
+    book.add(bid, 0, 1, 1.into());
+
+    assert_eq!(book, OrderBook::new(instrument_id, BookType::L2_MBP));
+    assert_ne!(book, OrderBook::new(instrument_id, BookType::L3_MBO));
+    assert_ne!(
+        book,
+        OrderBook::new(InstrumentId::from("MSFT.XNAS"), BookType::L2_MBP)
     );
 }
 
@@ -773,49 +788,6 @@ fn test_book_get_price_for_exposure_no_market() {
     );
 }
 
-#[cfg(feature = "defi")]
-#[rstest]
-fn test_book_worst_price_preserves_mixed_scale_traversal() {
-    let mut book = OrderBook::new(InstrumentId::from("AAPL.XNAS"), BookType::L2_MBP);
-    let price = Price::from("1.00");
-    book.add(
-        BookOrder::new(OrderSide::Sell, price, Quantity::from_raw(1, 18), 1),
-        0,
-        0,
-        0.into(),
-    );
-    assert_eq!(
-        book.get_worst_px_for_quantity(Quantity::from(2), OrderSide::Buy),
-        Some(price)
-    );
-}
-
-#[cfg(feature = "defi")]
-#[rstest]
-fn test_book_exposure_accepts_native_scale_quantities() {
-    let mut book = OrderBook::new(InstrumentId::from("AAPL.XNAS"), BookType::L2_MBP);
-    let target = Quantity::from_raw(1_000_000_000_000_000_000, 18);
-    assert_eq!(
-        book.get_avg_px_qty_for_exposure(target, OrderSide::Buy),
-        (0.0, 0.0, 0.0)
-    );
-    book.add(
-        BookOrder::new(
-            OrderSide::Sell,
-            Price::from("1.00"),
-            Quantity::from_raw(2_000_000_000_000_000_000, 18),
-            1,
-        ),
-        0,
-        0,
-        0.into(),
-    );
-    assert_eq!(
-        book.get_avg_px_qty_for_exposure(target, OrderSide::Buy),
-        (1.0, 100.0, 1.0)
-    );
-}
-
 #[rstest]
 fn test_book_get_price_for_exposure(stub_depth10: OrderBookDepth) {
     let depth = stub_depth10;
@@ -837,6 +809,39 @@ fn test_book_get_price_for_exposure(stub_depth10: OrderBookDepth) {
     assert_eq!(
         book.get_avg_px_qty_for_exposure(qty, OrderSide::Sell),
         expected_sell
+    );
+}
+
+#[rstest]
+fn test_book_get_avg_px_qty_for_exposure_spans_levels() {
+    let instrument_id = InstrumentId::from("AAPL.XNAS");
+    let mut book = OrderBook::new(instrument_id, BookType::L2_MBP);
+    let ask1 = BookOrder::new(OrderSide::Sell, Price::from("100.00"), Quantity::from(1), 1);
+    let ask2 = BookOrder::new(OrderSide::Sell, Price::from("200.00"), Quantity::from(1), 2);
+    book.add(ask1, 0, 1, 1.into());
+    book.add(ask2, 0, 2, 2.into());
+
+    // 100 of exposure fills the first level, the remaining 100 buys 0.5 at 200
+    let result = book.get_avg_px_qty_for_exposure(Quantity::from(200), OrderSide::Buy);
+
+    assert_eq!(result, (200.0 / 1.5, 1.5, 200.0));
+}
+
+#[rstest]
+fn test_get_levels_for_price_returns_crossed_levels() {
+    let book = create_book_with_levels(
+        &[],
+        &[("100.00", 10, 1), ("101.00", 20, 2), ("102.00", 30, 3)],
+    );
+
+    let levels = get_levels_for_price(Price::from("101.00"), OrderSide::Buy, &book.asks.levels, 0);
+
+    assert_eq!(
+        levels,
+        vec![
+            (Price::from("100.00"), Quantity::from(10)),
+            (Price::from("101.00"), Quantity::from(20)),
+        ]
     );
 }
 
@@ -884,6 +889,37 @@ fn test_book_simulate_fills_routes_to_opposite_ladder(
         .into_iter()
         .map(|(price, size)| (Price::from(price), Quantity::from(size)))
         .collect::<Vec<_>>();
+
+    assert_eq!(fills, expected);
+}
+
+#[rstest]
+#[case::buy(OrderSide::Buy, OrderSide::Sell, "101.00", "102.00")]
+#[case::sell(OrderSide::Sell, OrderSide::Buy, "99.00", "98.00")]
+fn test_book_simulate_fills_caps_large_liquidity_to_remainder(
+    #[case] order_side: OrderSide,
+    #[case] resting_side: OrderSide,
+    #[case] first_price: &str,
+    #[case] second_price: &str,
+) {
+    let instrument_id = InstrumentId::from("AAPL.XNAS");
+    let mut book = OrderBook::new(instrument_id, BookType::L3_MBO);
+    let maximum = Quantity::from_raw_checked(QUANTITY_RAW_MAX, 0).unwrap();
+    let resting = [
+        BookOrder::new(resting_side, Price::from(first_price), Quantity::from(1), 1),
+        BookOrder::new(resting_side, Price::from(second_price), maximum, 2),
+    ];
+
+    for order in resting {
+        book.add(order, 0, order.order_id, order.order_id.into());
+    }
+
+    let order = BookOrder::new(order_side, Price::from(second_price), Quantity::from(2), 3);
+    let fills = book.simulate_fills(&order);
+    let expected = vec![
+        (Price::from(first_price), Quantity::from(1)),
+        (Price::from(second_price), Quantity::from(1)),
+    ];
 
     assert_eq!(fills, expected);
 }
@@ -942,6 +978,74 @@ fn test_l1_book_apply_depth_keeps_best_of_descending_levels() {
     assert_eq!(book.best_bid_price().unwrap(), Price::from("100.00"));
     assert_eq!(book.bids(None).count(), 1);
     assert_eq!(book.best_ask_price().unwrap(), Price::from("101.00"));
+}
+
+#[rstest]
+fn test_l1_book_apply_depth_skips_padding_levels() {
+    let instrument_id = InstrumentId::from("AAPL.XNAS");
+    let mut book = OrderBook::new(instrument_id, BookType::L1_MBP);
+
+    let mut depth = OrderBookDepth::new(
+        instrument_id,
+        [BookOrder::new(
+            OrderSide::Buy,
+            Price::from("100.00"),
+            Quantity::from("10"),
+            0,
+        )],
+        [BookOrder::new(
+            OrderSide::Sell,
+            Price::from("101.00"),
+            Quantity::from("10"),
+            0,
+        )],
+        [1],
+        [1],
+        RecordFlag::F_SNAPSHOT as u8,
+        1,
+        0.into(),
+        0.into(),
+    );
+
+    // `OrderBookDepth::new` drops padding, so append it afterwards to reach the book's own guard
+    depth.bids.push(BookOrder::new(
+        OrderSide::Buy,
+        Price::from("99.00"),
+        Quantity::zero(2),
+        0,
+    ));
+    depth.asks.push(BookOrder::new(
+        OrderSide::Sell,
+        Price::from("102.00"),
+        Quantity::zero(2),
+        0,
+    ));
+
+    book.apply_depth(&depth).unwrap();
+
+    assert_eq!(book.best_bid_price(), Some(Price::from("100.00")));
+    assert_eq!(book.best_bid_size(), Some(Quantity::from("10")));
+    assert_eq!(book.best_ask_price(), Some(Price::from("101.00")));
+    assert_eq!(book.best_ask_size(), Some(Quantity::from("10")));
+}
+
+#[rstest]
+#[case::l2_mbp(BookType::L2_MBP)]
+#[case::l3_mbo(BookType::L3_MBO)]
+fn test_book_add_zero_size_order_leaves_no_empty_level(#[case] book_type: BookType) {
+    let instrument_id = InstrumentId::from("AAPL.XNAS");
+    let mut book = OrderBook::new(instrument_id, book_type);
+    let bid = BookOrder::new(OrderSide::Buy, Price::from("100.00"), Quantity::from(10), 1);
+    let zero_bid = BookOrder::new(OrderSide::Buy, Price::from("101.00"), Quantity::zero(0), 2);
+
+    book.add(bid, 0, 1, 1.into());
+    book.add(zero_bid, 0, 2, 2.into());
+
+    assert_eq!(book.best_bid_price(), Some(Price::from("100.00")));
+    assert_eq!(book.best_bid_size(), Some(Quantity::from(10)));
+    assert_eq!(book.bids(None).count(), 1);
+    assert_eq!(book.bids.cache.len(), 1);
+    assert_eq!(book.update_count, 2);
 }
 
 #[rstest]
@@ -1915,7 +2019,7 @@ fn test_apply_delta_incremental_preserves_metadata_high_water(
 }
 
 struct BookWarnCapture {
-    messages: Mutex<Vec<String>>,
+    records: Mutex<Vec<(Level, String)>>,
 }
 
 impl BookWarnCapture {
@@ -1923,23 +2027,40 @@ impl BookWarnCapture {
     // one process, so drain only the messages naming this test's instrument
     fn take_for(&self, instrument_id: InstrumentId) -> Vec<String> {
         let marker = format!("instrument_id={instrument_id})");
-        let mut messages = self.messages.lock();
-        let (mine, rest) = messages
+        self.take_matching(|message| message.ends_with(&marker))
+    }
+
+    fn take_matching(&self, predicate: impl Fn(&str) -> bool) -> Vec<String> {
+        self.take_records_matching(predicate)
+            .into_iter()
+            .map(|(_, message)| message)
+            .collect()
+    }
+
+    fn take_records_matching(&self, predicate: impl Fn(&str) -> bool) -> Vec<(Level, String)> {
+        let mut records = self.records.lock();
+        let (mine, rest) = records
             .drain(..)
-            .partition(|message| message.ends_with(&marker));
-        *messages = rest;
+            .partition(|(_, message)| predicate(message));
+        *records = rest;
         mine
     }
 }
 
 impl Log for BookWarnCapture {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-        metadata.level() == Level::Warn && metadata.target() == "nautilus_model::orderbook::book"
+        metadata.level() <= Level::Warn
+            && matches!(
+                metadata.target(),
+                "nautilus_model::orderbook::book" | "nautilus_model::orderbook::own"
+            )
     }
 
     fn log(&self, record: &Record<'_>) {
         if self.enabled(record.metadata()) {
-            self.messages.lock().push(record.args().to_string());
+            self.records
+                .lock()
+                .push((record.level(), record.args().to_string()));
         }
     }
 
@@ -1947,7 +2068,7 @@ impl Log for BookWarnCapture {
 }
 
 static BOOK_WARN_CAPTURE: BookWarnCapture = BookWarnCapture {
-    messages: Mutex::new(Vec::new()),
+    records: Mutex::new(Vec::new()),
 };
 static BOOK_WARN_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1978,6 +2099,133 @@ fn seed_book_with_bid(instrument_id: InstrumentId) -> OrderBook {
     );
     book.apply_delta(&delta).unwrap();
     book
+}
+
+fn bid_add_delta(
+    instrument_id: InstrumentId,
+    price: &str,
+    sequence: u64,
+    ts: u64,
+) -> OrderBookDelta {
+    OrderBookDelta::new(
+        instrument_id,
+        BookAction::Add,
+        BookOrder::new(OrderSide::Buy, Price::from(price), Quantity::from("10"), 0),
+        0,
+        sequence,
+        UnixNanos::from(ts),
+        UnixNanos::from(ts),
+    )
+}
+
+#[rstest]
+#[case::stale_sequence(3, 2000, vec!["Out-of-order update: sequence 3 < 5 (instrument_id=INCRSEQ.TEST)"])]
+#[case::unsequenced(0, 2000, vec![])]
+#[case::equal_sequence(5, 2000, vec![])]
+#[case::advancing(6, 3000, vec![])]
+fn test_apply_delta_incremental_out_of_order_warning_boundaries(
+    #[case] sequence: u64,
+    #[case] ts_event: u64,
+    #[case] expected: Vec<&str>,
+) {
+    let _guard = start_book_warn_capture();
+
+    let instrument_id = InstrumentId::from("INCRSEQ.TEST");
+    let mut book = seed_book_with_bid(instrument_id);
+    book.apply_delta(&bid_add_delta(instrument_id, "98.00", 5, 2000))
+        .unwrap();
+    BOOK_WARN_CAPTURE.take_for(instrument_id);
+
+    book.apply_delta(&bid_add_delta(instrument_id, "97.00", sequence, ts_event))
+        .unwrap();
+
+    assert_eq!(BOOK_WARN_CAPTURE.take_for(instrument_id), expected);
+    assert_eq!(book.sequence, sequence.max(5));
+    assert_eq!(book.ts_last, UnixNanos::from(ts_event.max(2000)));
+}
+
+#[rstest]
+#[case::equal_metadata(5, 2000)]
+#[case::unsequenced(0, 2000)]
+#[case::advancing(6, 3000)]
+fn test_apply_deltas_in_order_snapshot_does_not_warn(#[case] sequence: u64, #[case] ts_event: u64) {
+    let _guard = start_book_warn_capture();
+
+    let instrument_id = InstrumentId::from("SNAPSEQ.TEST");
+    let mut book = seed_book_with_bid(instrument_id);
+    book.apply_delta(&bid_add_delta(instrument_id, "98.00", 5, 2000))
+        .unwrap();
+    BOOK_WARN_CAPTURE.take_for(instrument_id);
+
+    let snapshot = OrderBookDeltas::new(
+        instrument_id,
+        vec![
+            OrderBookDelta::clear(
+                instrument_id,
+                sequence,
+                UnixNanos::from(ts_event),
+                UnixNanos::from(ts_event),
+            ),
+            OrderBookDelta::new(
+                instrument_id,
+                BookAction::Add,
+                BookOrder::new(
+                    OrderSide::Buy,
+                    Price::from("96.00"),
+                    Quantity::from("50"),
+                    0,
+                ),
+                RecordFlag::F_SNAPSHOT as u8 | RecordFlag::F_LAST as u8,
+                sequence,
+                UnixNanos::from(ts_event),
+                UnixNanos::from(ts_event),
+            ),
+        ],
+    );
+    book.apply_deltas(&snapshot).unwrap();
+
+    assert_eq!(
+        BOOK_WARN_CAPTURE.take_for(instrument_id),
+        Vec::<String>::new()
+    );
+    assert_eq!(book.best_bid_price(), Some(Price::from("96.00")));
+    assert_eq!(book.bids(None).count(), 1);
+}
+
+// The crossed-quote warning fires only with debug assertions
+#[cfg(debug_assertions)]
+#[rstest]
+#[case::crossed("101.00", "100.00", vec!["Quote has crossed prices: bid=101.00, ask=100.00 for CROSSQ.TEST"])]
+#[case::locked("100.00", "100.00", vec![])]
+#[case::normal("99.00", "100.00", vec![])]
+fn test_update_quote_tick_warns_only_when_crossed(
+    #[case] bid: &str,
+    #[case] ask: &str,
+    #[case] expected: Vec<&str>,
+) {
+    let _guard = start_book_warn_capture();
+
+    let instrument_id = InstrumentId::from("CROSSQ.TEST");
+    let mut book = OrderBook::new(instrument_id, BookType::L1_MBP);
+
+    let quote = QuoteTick::new(
+        instrument_id,
+        Price::from(bid),
+        Price::from(ask),
+        Quantity::from(10),
+        Quantity::from(20),
+        UnixNanos::from(1),
+        UnixNanos::from(1),
+    );
+
+    book.update_quote_tick(&quote).unwrap();
+
+    assert_eq!(
+        BOOK_WARN_CAPTURE.take_matching(|message| message.contains("CROSSQ.TEST")),
+        expected
+    );
+    assert_eq!(book.best_bid_price(), Some(Price::from(bid)));
+    assert_eq!(book.best_ask_price(), Some(Price::from(ask)));
 }
 
 #[rstest]
@@ -3165,6 +3413,44 @@ fn test_order_book_filtered_view_optional_books() {
 }
 
 #[rstest]
+fn test_order_book_filtered_view_keeps_all_l3_levels() {
+    let instrument_id = InstrumentId::from("YES.XNAS");
+    let mut book = OrderBook::new(instrument_id, BookType::L3_MBO);
+    let orders = [
+        (OrderSide::Buy, "0.40", 100),
+        (OrderSide::Buy, "0.40", 50),
+        (OrderSide::Buy, "0.39", 30),
+        (OrderSide::Sell, "0.60", 200),
+        (OrderSide::Sell, "0.61", 20),
+        (OrderSide::Sell, "0.61", 10),
+        (OrderSide::Sell, "0.62", 40),
+        (OrderSide::Sell, "0.63", 15),
+    ];
+
+    for (order_id, (side, price, size)) in (1..).zip(orders) {
+        let order = BookOrder::new(side, Price::from(price), Quantity::from(size), order_id);
+        book.add(order, 0, order_id, order_id.into());
+    }
+
+    let filtered = book.filtered_view(None, None, None, None, None);
+
+    assert_eq!(filtered.book_type, BookType::L3_MBO);
+    assert_eq!(
+        filtered.bids_as_map(None).into_iter().collect::<Vec<_>>(),
+        vec![(dec!(0.40), dec!(150)), (dec!(0.39), dec!(30))],
+    );
+    assert_eq!(
+        filtered.asks_as_map(None).into_iter().collect::<Vec<_>>(),
+        vec![
+            (dec!(0.60), dec!(200)),
+            (dec!(0.61), dec!(30)),
+            (dec!(0.62), dec!(40)),
+            (dec!(0.63), dec!(15)),
+        ],
+    );
+}
+
+#[rstest]
 fn test_order_book_filtered_view_preserves_metadata_when_empty() {
     let instrument_id = InstrumentId::from("YES.XNAS");
     let mut book = OrderBook::new(instrument_id, BookType::L2_MBP);
@@ -3910,6 +4196,55 @@ fn test_book_group_asks_filtered_with_own_book() {
     assert_eq!(grouped_asks.len(), 2);
     assert_eq!(grouped_asks.get(&dec!(101.0)), Some(&dec!(60))); // 100 - 40 = 60
     assert_eq!(grouped_asks.get(&dec!(102.0)), Some(&dec!(150))); // 200 - 50 = 150
+}
+
+#[rstest]
+fn test_book_group_filtered_with_depth_subtracts_own_orders_within_depth() {
+    let instrument_id = InstrumentId::from("AAPL.XNAS");
+    let mut book = OrderBook::new(instrument_id, BookType::L2_MBP);
+    let mut own_book = OwnOrderBook::new(instrument_id);
+
+    for (order_id, side, price) in [
+        (1, OrderSide::Buy, "100.00"),
+        (2, OrderSide::Buy, "99.00"),
+        (3, OrderSide::Sell, "103.00"),
+        (4, OrderSide::Sell, "104.00"),
+    ] {
+        let order = BookOrder::new(side, Price::from(price), Quantity::from(10), order_id);
+        book.add(order, 0, order_id, order_id.into());
+    }
+
+    // Better-priced own orders not yet in the public book sit beside resting ones
+    for (client_order_id, side, price, size) in [
+        ("BID-NEW", OrderSide::Buy, "101.00", 1),
+        ("BID-REST", OrderSide::Buy, "100.00", 5),
+        ("ASK-NEW", OrderSide::Sell, "102.00", 1),
+        ("ASK-REST", OrderSide::Sell, "103.00", 4),
+    ] {
+        own_book.add(OwnBookOrder::new(
+            TraderId::test_default(),
+            ClientOrderId::from(client_order_id),
+            None,
+            side,
+            Price::from(price),
+            Quantity::from(size),
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            OrderStatus::Accepted,
+            UnixNanos::default(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+        ));
+    }
+
+    let grouped_bids =
+        book.group_bids_filtered(dec!(1.0), Some(1), Some(&own_book), None, None, None);
+    let grouped_asks =
+        book.group_asks_filtered(dec!(1.0), Some(1), Some(&own_book), None, None, None);
+
+    assert_eq!(grouped_bids, IndexMap::from([(dec!(100), dec!(5))]));
+    assert_eq!(grouped_asks, IndexMap::from([(dec!(103), dec!(6))]));
 }
 
 #[rstest]
@@ -4717,25 +5052,42 @@ fn test_book_clear_stale_levels_l1_mbp() {
 }
 
 #[rstest]
-#[case::priced_gtc_limit(OrderType::Limit, TimeInForce::Gtc, Some("100.00"), true)]
-#[case::market_without_price(OrderType::Market, TimeInForce::Gtc, None, false)]
-#[case::priced_ioc_limit(OrderType::Limit, TimeInForce::Ioc, Some("100.00"), false)]
-#[case::priced_fok_limit(OrderType::Limit, TimeInForce::Fok, Some("100.00"), false)]
+#[case::priced_gtc_limit(OrderType::Limit, TimeInForce::Gtc, Some("100.00"), None, false, true)]
+#[case::market_without_price(OrderType::Market, TimeInForce::Gtc, None, None, false, false)]
+#[case::priced_ioc_limit(OrderType::Limit, TimeInForce::Ioc, Some("100.00"), None, false, false)]
+#[case::priced_fok_limit(OrderType::Limit, TimeInForce::Fok, Some("100.00"), None, false, false)]
+#[case::emulated_limit(
+    OrderType::Limit,
+    TimeInForce::Gtc,
+    Some("100.00"),
+    Some(TriggerType::BidAsk),
+    false,
+    false
+)]
+#[case::quote_quantity_limit(OrderType::Limit, TimeInForce::Gtc, Some("100.00"), None, true, false)]
 fn test_should_handle_own_book_order(
     #[case] order_type: OrderType,
     #[case] time_in_force: TimeInForce,
     #[case] price: Option<&str>,
+    #[case] emulation_trigger: Option<TriggerType>,
+    #[case] quote_quantity: bool,
     #[case] expected: bool,
 ) {
     let mut builder = OrderTestBuilder::new(order_type);
     builder
         .instrument_id(InstrumentId::from("AAPL.XNAS"))
         .quantity(Quantity::from(10))
-        .time_in_force(time_in_force);
+        .time_in_force(time_in_force)
+        .quote_quantity(quote_quantity);
 
     if let Some(price) = price {
         builder.price(Price::from(price));
     }
+
+    if let Some(trigger) = emulation_trigger {
+        builder.emulation_trigger(trigger);
+    }
+
     let order = builder.build();
 
     assert_eq!(should_handle_own_book_order(&order), expected);
@@ -5099,6 +5451,16 @@ fn test_own_book_display() {
 }
 
 #[rstest]
+fn test_own_order_book_equality_uses_instrument(own_order: OwnBookOrder) {
+    let instrument_id = InstrumentId::from("AAPL.XNAS");
+    let mut book = OwnOrderBook::new(instrument_id);
+    book.add(own_order);
+
+    assert_eq!(book, OwnOrderBook::new(instrument_id));
+    assert_ne!(book, OwnOrderBook::new(InstrumentId::from("MSFT.XNAS")));
+}
+
+#[rstest]
 fn test_own_book_pprint() {
     let instrument_id = InstrumentId::from("ETHUSDT-PERP.BINANCE");
     let mut book = OwnOrderBook::new(instrument_id);
@@ -5308,6 +5670,36 @@ fn test_own_book_level_add_update_delete() {
 }
 
 #[rstest]
+#[case::bid(OrderSide::Buy, std::cmp::Ordering::Greater)]
+#[case::ask(OrderSide::Sell, std::cmp::Ordering::Less)]
+fn test_own_book_level_comparisons(#[case] side: OrderSide, #[case] expected: std::cmp::Ordering) {
+    let level0 = OwnBookLevel::new(BookPrice::new(Price::from("1.00"), side));
+    let same = OwnBookLevel::new(BookPrice::new(Price::from("1.00"), side));
+    let level1 = OwnBookLevel::new(BookPrice::new(Price::from("1.01"), side));
+
+    assert_eq!(level0, same);
+    assert_ne!(level0, level1);
+    assert_eq!(level0.partial_cmp(&level1), Some(expected));
+}
+
+#[rstest]
+fn test_own_book_level_add_bulk_preserves_fifo(own_order: OwnBookOrder) {
+    let mut level = OwnBookLevel::new(own_order.to_book_price());
+    let mut second = own_order;
+    second.client_order_id = ClientOrderId::from("O-2");
+
+    level.add_bulk(&[own_order, second]);
+
+    assert_eq!(
+        level
+            .iter()
+            .map(|order| order.client_order_id)
+            .collect::<Vec<_>>(),
+        vec![own_order.client_order_id, second.client_order_id]
+    );
+}
+
+#[rstest]
 fn test_own_book_level_update_inserts_missing_order() {
     let mut level = OwnBookLevel::new(BookPrice::new(Price::from("100.00"), OrderSide::Buy));
     let order = OwnBookOrder::new(
@@ -5363,6 +5755,44 @@ fn test_own_book_level_delete_missing_order_errors() {
         error.to_string(),
         format!("Own book order not found at level: client_order_id=O-MISSING, price={price:?}")
     );
+}
+
+#[rstest]
+fn test_own_book_ladder_display_and_debug(own_order: OwnBookOrder) {
+    let empty = OwnBookLadder::new(OrderSide::Buy);
+    let mut ladder = OwnBookLadder::new(OrderSide::Buy);
+    ladder.add(own_order);
+
+    assert_eq!(
+        ladder.to_string(),
+        "OwnBookLadder(side=BUY)\n  100.00 -> 1 orders\n"
+    );
+    assert_eq!(
+        format!("{empty:?}"),
+        "OwnBookLadder { side: Buy, levels: {}, cache: {} }"
+    );
+}
+
+#[rstest]
+fn test_own_book_audit_open_orders_logs_removed_order(own_order: OwnBookOrder) {
+    let _guard = start_book_warn_capture();
+
+    let mut book = OwnOrderBook::new(InstrumentId::from("AAPL.XNAS"));
+    let mut stale = own_order;
+    stale.client_order_id = ClientOrderId::from("O-AUDIT-STALE");
+    book.add(own_order);
+    book.add(stale);
+
+    book.audit_open_orders(&AHashSet::from([own_order.client_order_id]));
+
+    assert_eq!(
+        BOOK_WARN_CAPTURE.take_records_matching(|message| message.contains("O-AUDIT-STALE")),
+        vec![(
+            Level::Warn,
+            "Audit removing O-AUDIT-STALE from own book, absent from valid order IDs".to_string()
+        )]
+    );
+    assert_eq!(book.bid_client_order_ids(), vec![own_order.client_order_id]);
 }
 
 #[rstest]
@@ -5596,12 +6026,18 @@ fn test_own_order_book_reset_clears_orders_and_metadata(own_order: OwnBookOrder)
 }
 
 #[rstest]
-fn test_own_order_book_zero_size_update_removes_order(own_order: OwnBookOrder) {
+#[case::same_price("100.00")]
+#[case::new_price("101.00")]
+fn test_own_order_book_zero_size_update_removes_order(
+    own_order: OwnBookOrder,
+    #[case] price: &str,
+) {
     let instrument_id = InstrumentId::from("AAPL.XNAS");
     let mut book = OwnOrderBook::new(instrument_id);
     book.add(own_order);
 
     let mut update = own_order;
+    update.price = Price::from(price);
     update.size = Quantity::zero(own_order.size.precision);
     update.ts_last = 10.into();
     book.update(update).unwrap();
@@ -5611,6 +6047,50 @@ fn test_own_order_book_zero_size_update_removes_order(own_order: OwnBookOrder) {
     assert!(book.bid_client_order_ids().is_empty());
     assert!(book.bids.is_empty());
     assert!(book.asks.is_empty());
+}
+
+#[rstest]
+fn test_own_order_book_add_existing_order_at_new_price_moves_order(own_order: OwnBookOrder) {
+    let instrument_id = InstrumentId::from("AAPL.XNAS");
+    let mut book = OwnOrderBook::new(instrument_id);
+    let mut other = own_order;
+    other.client_order_id = ClientOrderId::from("O-OTHER");
+    let mut moved = own_order;
+    moved.price = Price::from("101.00");
+
+    book.add(own_order);
+    book.add(other);
+    book.add(moved);
+
+    let levels = book
+        .bids()
+        .map(|level| {
+            let orders = level
+                .iter()
+                .map(|order| (order.client_order_id, order.price))
+                .collect::<Vec<_>>();
+            (level.price.value, orders)
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        levels,
+        vec![
+            (
+                Price::from("101.00"),
+                vec![(own_order.client_order_id, Price::from("101.00"))],
+            ),
+            (
+                Price::from("100.00"),
+                vec![(other.client_order_id, Price::from("100.00"))],
+            ),
+        ],
+    );
+    assert_eq!(
+        book.bid_client_order_ids(),
+        vec![other.client_order_id, own_order.client_order_id],
+    );
+    assert_eq!(book.update_count, 3);
 }
 
 #[rstest]
@@ -5730,6 +6210,49 @@ fn test_own_order_book_positive_accepted_buffer_without_ts_now_panics() {
     let book = OwnOrderBook::new(instrument_id);
 
     let _ = book.bids_as_map(None, Some(1), None);
+}
+
+#[rstest]
+fn test_own_order_book_zero_accepted_buffer_without_ts_now_skips_acceptance_filter(
+    own_order: OwnBookOrder,
+) {
+    let mut book = OwnOrderBook::new(InstrumentId::from("AAPL.XNAS"));
+    book.add(own_order);
+
+    let quantities = book.bid_quantity(None, None, None, Some(0), None);
+
+    assert_eq!(
+        quantities.into_iter().collect::<Vec<_>>(),
+        vec![(dec!(100.00), dec!(10))],
+    );
+}
+
+#[rstest]
+#[case::bids(OrderSide::Buy)]
+#[case::asks(OrderSide::Sell)]
+fn test_own_order_book_quantity_omits_zero_size_levels(
+    own_order: OwnBookOrder,
+    #[case] side: OrderSide,
+) {
+    let mut book = OwnOrderBook::new(InstrumentId::from("AAPL.XNAS"));
+    let mut order = own_order;
+    order.side = side;
+    let mut zero_order = order;
+    zero_order.client_order_id = ClientOrderId::from("O-ZERO");
+    zero_order.price = Price::from("101.00");
+    zero_order.size = Quantity::zero(0);
+    book.add(order);
+    book.add(zero_order);
+
+    let quantities = match side {
+        OrderSide::Buy => book.bid_quantity(None, None, None, None, None),
+        OrderSide::Sell => book.ask_quantity(None, None, None, None, None),
+    };
+
+    assert_eq!(
+        quantities.into_iter().collect::<Vec<_>>(),
+        vec![(dec!(100.00), dec!(10))],
+    );
 }
 
 #[rstest]
@@ -7399,26 +7922,34 @@ fn own_order_side_strategy() -> impl Strategy<Value = OrderSide> {
     prop::sample::select(vec![OrderSide::Buy, OrderSide::Sell])
 }
 
+const OWN_ORDER_STATUSES: [OrderStatus; 6] = [
+    OrderStatus::Submitted,
+    OrderStatus::Accepted,
+    OrderStatus::Triggered,
+    OrderStatus::PendingUpdate,
+    OrderStatus::PendingCancel,
+    OrderStatus::PartiallyFilled,
+];
+
 fn own_order_status_strategy() -> impl Strategy<Value = OrderStatus> {
-    prop::sample::select(vec![
-        OrderStatus::Submitted,
-        OrderStatus::Accepted,
-        OrderStatus::Triggered,
-        OrderStatus::PendingUpdate,
-        OrderStatus::PendingCancel,
-        OrderStatus::PartiallyFilled,
-    ])
+    prop::sample::select(OWN_ORDER_STATUSES.to_vec())
 }
 
 fn own_book_order_spec_strategy(
     min_size_cents: u16,
     max_price_cents: u16,
 ) -> impl Strategy<Value = OwnBookOrderSpec> {
+    // Weight the minimum so zero-size removals are not left to a 1-in-5001 draw
+    let size_cents = prop_oneof![
+        1 => Just(min_size_cents),
+        9 => min_size_cents..=5_000u16,
+    ];
+
     (
         0u8..32,
         own_order_side_strategy(),
         1u16..=max_price_cents,
-        min_size_cents..=5_000u16,
+        size_cents,
         own_order_status_strategy(),
         0u16..=2_000u16,
     )
@@ -7482,18 +8013,37 @@ fn apply_own_book_operation(
 ) {
     match operation {
         OwnBookOperation::Add(spec) => {
-            add_unique_own_order(book, reference, spec.to_order(sequence));
+            let order = spec.to_order(sequence);
+            let client_order_id = order.client_order_id;
+
+            // An order never changes side, so a re-add is only valid on its resting side
+            if reference.contains(&client_order_id)
+                && !reference
+                    .side_mut(order.side)
+                    .contains_key(&client_order_id)
+            {
+                return;
+            }
+
+            book.add(order);
+
+            let side_orders = reference.side_mut(order.side);
+            if side_orders
+                .get(&client_order_id)
+                .is_some_and(|current| current.price != order.price)
+            {
+                side_orders.shift_remove(&client_order_id);
+            }
+
+            side_orders.insert(client_order_id, order);
+            reference.update_count += 1;
         }
         OwnBookOperation::Update(spec) => {
             let client_order_id = spec.client_order_id();
             let side_orders = reference.side_mut(spec.side);
-            let mut order = spec.to_order(sequence);
+            let order = spec.to_order(sequence);
 
             if let Some(current) = side_orders.get(&client_order_id).copied() {
-                if order.size.is_zero() {
-                    order.price = current.price;
-                }
-
                 book.update(order).unwrap();
 
                 if order.size.is_zero() {
@@ -7724,16 +8274,7 @@ fn reference_quantity(
             continue;
         }
 
-        let price = if let Some(group_size) = group_size {
-            if is_bid {
-                (order.price.as_decimal() / group_size).floor() * group_size
-            } else {
-                (order.price.as_decimal() / group_size).ceil() * group_size
-            }
-        } else {
-            order.price.as_decimal()
-        };
-
+        let price = reference_group_price(order.price.as_decimal(), group_size, is_bid);
         *quantities.entry(price).or_insert(Decimal::ZERO) += order.size.as_decimal();
     }
 
@@ -7741,6 +8282,54 @@ fn reference_quantity(
         .into_iter()
         .filter(|(_, quantity)| *quantity > Decimal::ZERO)
         .collect()
+}
+
+// Truncates public buckets to depth before subtracting own size, so views never refill depth
+fn reference_filtered_levels(
+    public_levels: &BTreeMap<u16, u16>,
+    own_quantities: &BTreeMap<Decimal, Decimal>,
+    group_size: Option<Decimal>,
+    depth: Option<usize>,
+    is_bid: bool,
+) -> Vec<(Decimal, Decimal)> {
+    let mut levels = public_levels
+        .iter()
+        .map(|(&price_cents, &size_cents)| {
+            (
+                price_from_cents(price_cents).as_decimal(),
+                quantity_from_cents(size_cents).as_decimal(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    if is_bid {
+        levels.reverse();
+    }
+
+    let mut buckets = IndexMap::<Decimal, Decimal>::new();
+
+    for (price, size) in levels {
+        *buckets
+            .entry(reference_group_price(price, group_size, is_bid))
+            .or_insert(Decimal::ZERO) += size;
+    }
+
+    buckets
+        .into_iter()
+        .take(depth.unwrap_or(usize::MAX))
+        .filter_map(|(price, size)| {
+            let net = size - own_quantities.get(&price).copied().unwrap_or(Decimal::ZERO);
+            (net > Decimal::ZERO).then_some((price, net))
+        })
+        .collect()
+}
+
+fn reference_group_price(price: Decimal, group_size: Option<Decimal>, is_bid: bool) -> Decimal {
+    match group_size {
+        Some(group_size) if is_bid => (price / group_size).floor() * group_size,
+        Some(group_size) => (price / group_size).ceil() * group_size,
+        None => price,
+    }
 }
 
 fn reference_price_order_ids(
@@ -7837,6 +8426,93 @@ fn prop_test_own_book_grouped_filtered_quantities_match_reference() {
         }
 
         assert_own_book_quantities_match_reference(&book, &reference);
+    });
+}
+
+#[rstest]
+fn prop_test_order_book_filtered_views_match_reference() {
+    proptest!(|(
+        public_bids in prop::collection::btree_map(1u16..=200, 1u16..=5_000, 0..=24),
+        public_asks in prop::collection::btree_map(1u16..=200, 1u16..=5_000, 0..=24),
+        specs in prop::collection::vec(own_book_order_spec_strategy(1, 200), 0..=48),
+        depth in prop::option::of(1usize..=12),
+        group_size in prop::sample::select(vec![
+            dec!(0.01),
+            dec!(0.05),
+            dec!(0.10),
+            dec!(0.25),
+            dec!(1.00),
+        ]),
+        status in prop::option::of(
+            prop::sample::subsequence(OWN_ORDER_STATUSES.to_vec(), 0..=OWN_ORDER_STATUSES.len())
+                .prop_map(|statuses| statuses.into_iter().collect::<AHashSet<_>>()),
+        ),
+        time_filter in prop_oneof![
+            Just((None, None)),
+            (prop::option::of(0u64..=1_000), 0u64..=3_000)
+                .prop_map(|(buffer_ns, now)| (buffer_ns, Some(now))),
+        ],
+    )| {
+        let instrument_id = InstrumentId::from("TEST.VENUE");
+        let mut book = OrderBook::new(instrument_id, BookType::L2_MBP);
+
+        for (side, levels) in [(OrderSide::Buy, &public_bids), (OrderSide::Sell, &public_asks)] {
+            for (&price_cents, &size_cents) in levels {
+                let order = BookOrder::new(
+                    side,
+                    price_from_cents(price_cents),
+                    quantity_from_cents(size_cents),
+                    0,
+                );
+                book.add(order, 0, 0, UnixNanos::default());
+            }
+        }
+
+        let mut own_book = OwnOrderBook::new(instrument_id);
+        let mut reference = OwnBookReference::default();
+
+        for (sequence, spec) in specs.into_iter().enumerate() {
+            add_unique_own_order(&mut own_book, &mut reference, spec.to_order(sequence as u64 + 1));
+        }
+
+        let (buffer_ns, now) = time_filter;
+        let status = status.as_ref();
+        let expected = |public, orders, group_size, is_bid| {
+            let own = reference_quantity(orders, status, group_size, buffer_ns, now, is_bid);
+            reference_filtered_levels(public, &own, group_size, depth, is_bid)
+        };
+        let expected_bids = expected(&public_bids, &reference.bids, None, true);
+        let expected_asks = expected(&public_asks, &reference.asks, None, false);
+        let expected_grouped_bids = expected(&public_bids, &reference.bids, Some(group_size), true);
+        let expected_grouped_asks =
+            expected(&public_asks, &reference.asks, Some(group_size), false);
+
+        let bids = book
+            .bids_filtered_as_map(depth, Some(&own_book), status, buffer_ns, now)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let asks = book
+            .asks_filtered_as_map(depth, Some(&own_book), status, buffer_ns, now)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let grouped_bids = book
+            .group_bids_filtered(group_size, depth, Some(&own_book), status, buffer_ns, now)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let grouped_asks = book
+            .group_asks_filtered(group_size, depth, Some(&own_book), status, buffer_ns, now)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let view = book.filtered_view(Some(&own_book), depth, status, buffer_ns, now);
+        let view_bids = view.bids_as_map(None).into_iter().collect::<Vec<_>>();
+        let view_asks = view.asks_as_map(None).into_iter().collect::<Vec<_>>();
+
+        prop_assert_eq!(&bids, &expected_bids);
+        prop_assert_eq!(&asks, &expected_asks);
+        prop_assert_eq!(&grouped_bids, &expected_grouped_bids);
+        prop_assert_eq!(&grouped_asks, &expected_grouped_asks);
+        prop_assert_eq!(&view_bids, &expected_bids);
+        prop_assert_eq!(&view_asks, &expected_asks);
     });
 }
 
@@ -9130,6 +9806,26 @@ fn test_apply_delta_no_order_side_with_zero_order_id_for_clear() {
 }
 
 #[rstest]
+#[case::add(BookAction::Add)]
+#[case::update(BookAction::Update)]
+#[case::delete(BookAction::Delete)]
+fn test_apply_delta_no_order_side_with_zero_order_id_errors(
+    #[case] action: BookAction,
+    #[values(BookType::L1_MBP, BookType::L2_MBP, BookType::L3_MBO)] book_type: BookType,
+) {
+    let instrument_id = InstrumentId::from("AAPL.XNAS");
+    let mut book = OrderBook::new(instrument_id, book_type);
+    let order = BookOrder::new(None, Price::from("100.00"), Quantity::from("10"), 0);
+    let delta = OrderBookDelta::new(instrument_id, action, order, 0, 1, 1.into(), 1.into());
+
+    let result = book.apply_delta(&delta);
+
+    assert_eq!(result, Err(BookIntegrityError::NoOrderSide));
+    assert_eq!(book.sequence, 0);
+    assert_eq!(book.update_count, 0);
+}
+
+#[rstest]
 fn test_l1_snapshot_tardis_style_selects_best_prices() {
     // Simulates Tardis snapshot format: Clear + bids + asks with F_LAST only on last ask
     // Verifies L1_MBP correctly accumulates all levels and selects best prices
@@ -9585,6 +10281,151 @@ fn test_deltas_to_quotes_emits_on_two_sided_book() {
     assert_eq!(quotes[0].bid_price, Price::from("99.00"));
     assert_eq!(quotes[0].ask_price, Price::from("101.00"));
     assert_eq!(quotes[0].ts_event, UnixNanos::from(2000u64));
+}
+
+#[rstest]
+#[case("1", "0.5", "1.0", "0.5")]
+#[case("0.25", "1", "0.25", "1.00")]
+#[case("1", "0.500", "1.000", "0.500")]
+fn test_deltas_to_quotes_preserves_mixed_size_precision(
+    #[case] bid_size: &str,
+    #[case] ask_size: &str,
+    #[case] expected_bid: &str,
+    #[case] expected_ask: &str,
+    #[values(BookType::L2_MBP, BookType::L3_MBO)] book_type: BookType,
+) {
+    let id = InstrumentId::from("TEST.VENUE");
+    let mut deltas = vec![
+        make_delta(
+            id,
+            BookAction::Add,
+            OrderSide::Buy,
+            "99.00",
+            bid_size,
+            1,
+            1000,
+        ),
+        make_delta(
+            id,
+            BookAction::Add,
+            OrderSide::Sell,
+            "101.00",
+            ask_size,
+            2,
+            2000,
+        ),
+    ];
+    deltas[1].ts_init = 2007.into();
+    let bid_size = Quantity::from(expected_bid);
+    let ask_size = Quantity::from(expected_ask);
+    let bid_price = Price::from("99.00");
+    let ask_price = Price::from("101.00");
+    let ts_event = UnixNanos::from(2000);
+    let ts_init = UnixNanos::from(2007);
+
+    let expected = QuoteTick::new(
+        id, bid_price, ask_price, bid_size, ask_size, ts_event, ts_init,
+    );
+
+    let quotes = OrderBook::deltas_to_quotes(book_type, &deltas);
+
+    assert_eq!(quotes, vec![expected]);
+    assert_eq!(quotes[0].bid_size.raw(), bid_size.raw());
+    assert_eq!(quotes[0].ask_size.raw(), ask_size.raw());
+    assert_eq!(quotes[0].bid_size.precision, bid_size.precision);
+    assert_eq!(quotes[0].ask_size.precision, ask_size.precision);
+}
+
+#[rstest]
+#[case(OrderSide::Buy, "1.25", "0.50")]
+#[case(OrderSide::Sell, "0.50", "1.25")]
+fn test_deltas_to_quotes_preserves_mixed_precision_within_level(
+    #[case] side: OrderSide,
+    #[case] expected_bid: &str,
+    #[case] expected_ask: &str,
+) {
+    let id = InstrumentId::from("TEST.VENUE");
+
+    let (price, other_side, other_price) = match side {
+        OrderSide::Buy => ("99.00", OrderSide::Sell, "101.00"),
+        OrderSide::Sell => ("101.00", OrderSide::Buy, "99.00"),
+    };
+
+    let mut deltas = vec![
+        make_delta(id, BookAction::Add, side, price, "1", 1, 1000),
+        make_delta(id, BookAction::Add, side, price, "0.25", 2, 2000),
+        make_delta(id, BookAction::Add, other_side, other_price, "0.5", 3, 3000),
+    ];
+    deltas[2].ts_init = 3007.into();
+    let bid_size = Quantity::from(expected_bid);
+    let ask_size = Quantity::from(expected_ask);
+    let bid_price = Price::from("99.00");
+    let ask_price = Price::from("101.00");
+    let ts_event = UnixNanos::from(3000);
+    let ts_init = UnixNanos::from(3007);
+
+    let expected = QuoteTick::new(
+        id, bid_price, ask_price, bid_size, ask_size, ts_event, ts_init,
+    );
+
+    let quotes = OrderBook::deltas_to_quotes(BookType::L3_MBO, &deltas);
+
+    assert_eq!(quotes, vec![expected]);
+    assert_eq!(quotes[0].bid_size.raw(), bid_size.raw());
+    assert_eq!(quotes[0].ask_size.raw(), ask_size.raw());
+    assert_eq!(quotes[0].bid_size.precision, bid_size.precision);
+    assert_eq!(quotes[0].ask_size.precision, ask_size.precision);
+}
+
+#[cfg(feature = "defi")]
+#[rstest]
+#[case("1", "1.000000000000000000")]
+#[case("0.25000000000000001", "0.250000000000000010")]
+fn test_deltas_to_quotes_rescales_native_sizes(
+    #[case] bid_size: &str,
+    #[case] expected_bid: &str,
+    #[values(BookType::L2_MBP, BookType::L3_MBO)] book_type: BookType,
+) {
+    let id = InstrumentId::from("TEST.VENUE");
+    let ask_size = "0.500000000000000001";
+    let deltas = vec![
+        make_delta(
+            id,
+            BookAction::Add,
+            OrderSide::Buy,
+            "99.00",
+            bid_size,
+            1,
+            1000,
+        ),
+        make_delta(
+            id,
+            BookAction::Add,
+            OrderSide::Sell,
+            "101.00",
+            ask_size,
+            2,
+            2000,
+        ),
+    ];
+    let bid_size = Quantity::from(expected_bid);
+    let ask_size = Quantity::from(ask_size);
+    let bid_price = Price::from("99.00");
+    let ask_price = Price::from("101.00");
+    let ts_event = UnixNanos::from(2000);
+    let ts_init = UnixNanos::from(2000);
+
+    let expected = QuoteTick::new(
+        id, bid_price, ask_price, bid_size, ask_size, ts_event, ts_init,
+    );
+
+    let quotes = OrderBook::deltas_to_quotes(book_type, &deltas);
+
+    assert_eq!(quotes, vec![expected]);
+    assert_eq!(quotes[0].bid_size.raw(), bid_size.raw());
+    assert_eq!(quotes[0].ask_size.raw(), ask_size.raw());
+    assert_eq!(quotes[0].bid_size.precision, bid_size.precision);
+    assert_eq!(quotes[0].ask_size.precision, ask_size.precision);
 }
 
 #[rstest]

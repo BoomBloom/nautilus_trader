@@ -17,10 +17,11 @@
 
 use std::{any::Any, fmt::Debug};
 
-use nautilus_common::factories::ClientConfig;
+use nautilus_common::{config::check_unique_values, factories::ClientConfig};
 #[cfg(test)]
 use nautilus_core::string::secret::REDACTED;
 use nautilus_core::string::secret::SecretString;
+use nautilus_live::book::DEFAULT_BOOK_SNAPSHOT_TIMEOUT_SECS;
 use nautilus_model::{
     identifiers::AccountId,
     types::{Currency, Money},
@@ -63,13 +64,17 @@ fn resolve_credential(
     username: Option<SecretString>,
     password: Option<SecretString>,
     app_key: Option<SecretString>,
+    certs_dir: Option<String>,
 ) -> anyhow::Result<BetfairCredential> {
     match BetfairCredential::resolve(
         username.map(SecretString::into_inner),
         password.map(SecretString::into_inner),
         app_key.map(SecretString::into_inner),
     ) {
-        Ok(Some(credential)) => Ok(credential),
+        Ok(Some(credential)) => Ok(match certs_dir {
+            Some(dir) => credential.with_certs_dir(dir),
+            None => credential,
+        }),
         Ok(None) => anyhow::bail!("Missing Betfair credentials in config and environment"),
         Err(e) => Err(match e {
             CredentialError::MissingPassword => anyhow::anyhow!(
@@ -180,6 +185,12 @@ pub struct BetfairDataClientConfig {
     /// Subscribe to the sports data stream for cricket match updates.
     #[builder(default)]
     pub subscribe_cricket_data: bool,
+    /// Maximum time to wait for an initial or recovery market image in seconds.
+    /// Set to 0 to disable.
+    #[builder(default = DEFAULT_BOOK_SNAPSHOT_TIMEOUT_SECS)]
+    pub book_snapshot_timeout_secs: u64,
+    /// Directory containing the client certificate and private key for certificate login.
+    pub certs_dir: Option<String>,
 }
 
 #[cfg(feature = "python")]
@@ -206,6 +217,8 @@ nautilus_core::impl_pyo3_config_getters!(BetfairDataClientConfig {
     subscription_delay_secs: u64,
     subscribe_race_data: bool,
     subscribe_cricket_data: bool,
+    book_snapshot_timeout_secs: u64,
+    certs_dir: Option<String>,
 });
 
 impl Default for BetfairDataClientConfig {
@@ -231,6 +244,7 @@ impl BetfairDataClientConfig {
             self.username.clone(),
             self.password.clone(),
             self.app_key.clone(),
+            self.certs_dir.clone(),
         )
     }
 
@@ -288,6 +302,30 @@ impl BetfairDataClientConfig {
     ///
     /// Returns an error if any configured value is invalid.
     pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(values) = &self.event_type_ids {
+            check_unique_values("event_type_ids", values)?;
+        }
+
+        if let Some(values) = &self.event_type_names {
+            check_unique_values("event_type_names", values)?;
+        }
+
+        if let Some(values) = &self.event_ids {
+            check_unique_values("event_ids", values)?;
+        }
+
+        if let Some(values) = &self.country_codes {
+            check_unique_values("country_codes", values)?;
+        }
+
+        if let Some(values) = &self.market_types {
+            check_unique_values("market_types", values)?;
+        }
+
+        if let Some(values) = &self.market_ids {
+            check_unique_values("market_ids", values)?;
+        }
+
         let _ = self.currency()?;
         validate_market_start_time("min_market_start_time", &self.min_market_start_time)?;
         validate_market_start_time("max_market_start_time", &self.max_market_start_time)?;
@@ -376,6 +414,8 @@ pub struct BetfairExecutionClientConfig {
     /// comfortably exceed the longest expected reconnect duration.
     #[builder(default = 10)]
     pub stream_gap_recovery_lookback_mins: u64,
+    /// Directory containing the client certificate and private key for certificate login.
+    pub certs_dir: Option<String>,
 }
 
 #[cfg(feature = "python")]
@@ -399,6 +439,7 @@ nautilus_core::impl_pyo3_config_getters!(BetfairExecutionClientConfig {
     reconcile_market_ids: Option<Vec<String>>,
     use_market_version: bool,
     stream_gap_recovery_lookback_mins: u64,
+    certs_dir: Option<String>,
 });
 
 impl Default for BetfairExecutionClientConfig {
@@ -424,6 +465,7 @@ impl BetfairExecutionClientConfig {
             self.username.clone(),
             self.password.clone(),
             self.app_key.clone(),
+            self.certs_dir.clone(),
         )
     }
 
@@ -456,6 +498,14 @@ impl BetfairExecutionClientConfig {
     ///
     /// Returns an error if any configured value is invalid.
     pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(values) = &self.stream_market_ids_filter {
+            check_unique_values("stream_market_ids_filter", values)?;
+        }
+
+        if let Some(values) = &self.reconcile_market_ids {
+            check_unique_values("reconcile_market_ids", values)?;
+        }
+
         let _ = self.currency()?;
 
         if self.request_rate_per_second == 0 {
@@ -474,9 +524,48 @@ impl BetfairExecutionClientConfig {
 
 #[cfg(test)]
 mod tests {
+    use nautilus_common::config::ConfigError;
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    #[case("stream_market_ids_filter")]
+    #[case("reconcile_market_ids")]
+    fn test_execution_config_rejects_duplicate_selections(#[case] field: &str) {
+        let mut input = serde_json::to_value(BetfairExecutionClientConfig::default()).unwrap();
+        input[field] = serde_json::json!(["first", "second", "first"]);
+        let config: BetfairExecutionClientConfig = serde_json::from_value(input).unwrap();
+        let original = serde_json::to_value(&config).unwrap();
+        let result = config.validate();
+
+        assert_eq!(
+            result.unwrap_err().downcast_ref::<ConfigError>(),
+            Some(&ConfigError::duplicate(field, None))
+        );
+        assert_eq!(serde_json::to_value(&config).unwrap(), original);
+    }
+
+    #[rstest]
+    #[case("event_type_ids")]
+    #[case("event_type_names")]
+    #[case("event_ids")]
+    #[case("country_codes")]
+    #[case("market_types")]
+    #[case("market_ids")]
+    fn test_data_config_rejects_duplicate_selections(#[case] field: &str) {
+        let mut input = serde_json::to_value(BetfairDataClientConfig::default()).unwrap();
+        input[field] = serde_json::json!(["first", "second", "first"]);
+        let config: BetfairDataClientConfig = serde_json::from_value(input).unwrap();
+        let original = serde_json::to_value(&config).unwrap();
+        let result = config.validate();
+
+        assert_eq!(
+            result.unwrap_err().downcast_ref::<ConfigError>(),
+            Some(&ConfigError::duplicate(field, None))
+        );
+        assert_eq!(serde_json::to_value(&config).unwrap(), original);
+    }
 
     #[rstest]
     fn test_config_debug_redacts_credentials() {
@@ -514,6 +603,35 @@ mod tests {
     }
 
     #[rstest]
+    #[case(None)]
+    #[case(Some("/betfair/certs".to_string()))]
+    fn test_config_credentials_attach_certs_dir(#[case] certs_dir: Option<String>) {
+        let data = BetfairDataClientConfig::builder()
+            .username("data-user".into())
+            .password("data-password".into())
+            .app_key("data-key".into())
+            .maybe_certs_dir(certs_dir.clone())
+            .build();
+        let execution = BetfairExecutionClientConfig::builder()
+            .username("execution-user".into())
+            .password("execution-password".into())
+            .app_key("execution-key".into())
+            .maybe_certs_dir(certs_dir.clone())
+            .build();
+        let data_credential = data.credential().unwrap();
+        let execution_credential = execution.credential().unwrap();
+
+        assert_eq!(data_credential.username(), "data-user");
+        assert_eq!(data_credential.password(), "data-password");
+        assert_eq!(data_credential.app_key(), "data-key");
+        assert_eq!(data_credential.certs_dir(), certs_dir.as_deref());
+        assert_eq!(execution_credential.username(), "execution-user");
+        assert_eq!(execution_credential.password(), "execution-password");
+        assert_eq!(execution_credential.app_key(), "execution-key");
+        assert_eq!(execution_credential.certs_dir(), certs_dir.as_deref());
+    }
+
+    #[rstest]
     fn test_data_config_default() {
         let config = BetfairDataClientConfig::default();
 
@@ -526,6 +644,7 @@ mod tests {
         assert_eq!(config.subscription_delay_secs, 3);
         assert!(!config.subscribe_race_data);
         assert!(!config.subscribe_cricket_data);
+        assert_eq!(config.book_snapshot_timeout_secs, 10);
     }
 
     #[rstest]

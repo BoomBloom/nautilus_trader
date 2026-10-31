@@ -25,15 +25,24 @@ use nautilus_betfair::{
 };
 use nautilus_common::{
     clients::DataClient,
+    config::ConfigError,
     live::runner::{replace_system_event_sender, set_data_event_sender},
-    messages::{DataEvent, data::SubscribeBookDeltas, system::SocketState},
+    messages::{
+        DataEvent,
+        data::{
+            SubscribeBookDeltas, SubscribeQuotes, SubscribeTrades, UnsubscribeQuotes,
+            UnsubscribeTrades,
+        },
+        system::SocketState,
+    },
     testing::wait_until_async,
 };
-use nautilus_core::UUID4;
+use nautilus_core::{UUID4, UnixNanos};
 use nautilus_live::{SocketReconnectRegistry, SocketReconnectRequestOutcome};
 use nautilus_model::{
     data::Data,
-    enums::{BookType, MarketStatusAction},
+    enums::{BookType, MarketStatusAction, RecordFlag},
+    identifiers::InstrumentId,
     types::Currency,
 };
 use rstest::rstest;
@@ -49,6 +58,17 @@ fn create_test_data_client(
     BetfairDataClient,
     tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
 ) {
+    create_test_data_client_with_config(addr, stream_port, BetfairDataClientConfig::default())
+}
+
+fn create_test_data_client_with_config(
+    addr: SocketAddr,
+    stream_port: u16,
+    config: BetfairDataClientConfig,
+) -> (
+    BetfairDataClient,
+    tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+) {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     set_data_event_sender(tx);
 
@@ -60,44 +80,220 @@ fn create_test_data_client(
         http_client,
         test_credential(),
         plain_stream_config(stream_port),
-        BetfairDataClientConfig::default(),
+        config,
         NavigationFilter::default(),
         currency,
         None,
-    );
+    )
+    .unwrap();
 
     (client, rx)
 }
 
-async fn connect_data_market_ready(client: &mut BetfairDataClient) {
+const MARKET_ID: &str = "1.180294978";
+const LIVE_MARKET_ID: &str = "1.176621195";
+const RESUB_DELTA_MARKET_IDS: [&str; 3] = ["1.176621195", "1.167249195", "1.175776462"];
+
+async fn connect_data_market_ready(client: &mut BetfairDataClient, market_ids: &[&str]) {
     client.connect().await.unwrap();
-    let instrument_id = nautilus_betfair::common::parse::make_instrument_id(
-        "1.180294978",
-        6_146_434,
-        rust_decimal::Decimal::ZERO,
-    );
-    client
-        .subscribe_book_deltas(SubscribeBookDeltas::new(
-            instrument_id,
-            BookType::L2_MBP,
-            None,
-            Some(*BETFAIR_VENUE),
-            UUID4::new(),
-            nautilus_core::UnixNanos::default(),
-            None,
-            false,
-            None,
-            None,
-        ))
-        .unwrap();
+
+    for market_id in market_ids {
+        let instrument_id = nautilus_betfair::common::parse::make_instrument_id(
+            market_id,
+            6_146_434,
+            rust_decimal::Decimal::ZERO,
+        );
+        client
+            .subscribe_book_deltas(SubscribeBookDeltas::new(
+                instrument_id,
+                BookType::L2_MBP,
+                None,
+                Some(*BETFAIR_VENUE),
+                UUID4::new(),
+                nautilus_core::UnixNanos::default(),
+                None,
+                false,
+                None,
+                None,
+            ))
+            .unwrap();
+    }
+
     wait_until_async(|| async { client.is_connected() }, Duration::from_secs(2)).await;
     assert!(client.is_connected());
 }
 
+// Reads one subscription per market and answers the last with an image of every market, as each
+// Betfair market subscription replaces the previous one
+async fn accept_and_image(
+    listener: &tokio::net::TcpListener,
+    market_ids: &[&str],
+) -> (
+    tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
+    tokio::net::tcp::OwnedWriteHalf,
+    u64,
+) {
+    let (mut reader, mut write_half) = accept_and_auth(listener).await;
+    let mut id = 0;
+
+    for _ in market_ids {
+        let subscription = read_subscription(&mut reader).await;
+        assert_eq!(subscription["op"], "marketSubscription");
+        id = subscription["id"].as_u64().unwrap();
+    }
+
+    write_image(&mut write_half, id, market_ids).await;
+    (reader, write_half, id)
+}
+
+async fn read_subscription(
+    reader: &mut tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
+) -> Value {
+    let mut line = String::new();
+    tokio::io::AsyncBufReadExt::read_line(reader, &mut line)
+        .await
+        .unwrap();
+    serde_json::from_str(line.trim()).unwrap()
+}
+
+async fn write_image(
+    write_half: &mut tokio::net::tcp::OwnedWriteHalf,
+    id: u64,
+    market_ids: &[&str],
+) {
+    let changes: Vec<Value> = market_ids
+        .iter()
+        .map(|market_id| serde_json::json!({"id": market_id, "img": true}))
+        .collect();
+    let image = serde_json::json!({
+        "op": "mcm",
+        "id": id,
+        "clk": "AAAA",
+        "initialClk": "BBBB",
+        "pt": 1000,
+        "ct": "SUB_IMAGE",
+        "mc": changes,
+    });
+    write_status(write_half, id).await;
+    write_line(write_half, &image.to_string()).await;
+}
+
+async fn write_status(write_half: &mut tokio::net::tcp::OwnedWriteHalf, id: u64) {
+    let status = serde_json::json!({
+        "op": "status",
+        "id": id,
+        "statusCode": "SUCCESS",
+        "connectionClosed": false,
+    });
+    write_line(write_half, &status.to_string()).await;
+}
+
+async fn write_line(write_half: &mut tokio::net::tcp::OwnedWriteHalf, line: &str) {
+    tokio::io::AsyncWriteExt::write_all(write_half, format!("{}\r\n", line.trim()).as_bytes())
+        .await
+        .unwrap();
+}
+
 fn current_market_message(message: &str) -> String {
+    market_message(message, 2)
+}
+
+fn market_message(message: &str, id: u64) -> String {
     let mut value: Value = serde_json::from_str(message).unwrap();
-    value["id"] = Value::from(2);
+    value["id"] = Value::from(id);
     value.to_string()
+}
+
+fn without_id(mut subscription: Value) -> Value {
+    subscription.as_object_mut().unwrap().remove("id");
+    subscription
+}
+
+// Returns each book batch received within `timeout` as its instrument and whether it is a snapshot
+async fn receive_books(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+    count: usize,
+    timeout: Duration,
+) -> Vec<(InstrumentId, bool)> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut books = Vec::new();
+
+    while books.len() < count {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(DataEvent::Data(Data::BookDeltas(deltas)))) => {
+                let snapshot = deltas
+                    .deltas
+                    .iter()
+                    .all(|delta| RecordFlag::F_SNAPSHOT.matches(delta.flags));
+                books.push((deltas.instrument_id, snapshot));
+            }
+            Ok(Some(_)) => {}
+            _ => break,
+        }
+    }
+
+    books
+}
+
+fn live_runner(selection_id: u64) -> InstrumentId {
+    nautilus_betfair::common::parse::make_instrument_id(
+        LIVE_MARKET_ID,
+        selection_id,
+        rust_decimal::Decimal::ZERO,
+    )
+}
+
+#[rstest]
+#[case::single(1)]
+#[case::batch(2)]
+#[tokio::test]
+async fn test_quote_and_trade_subscriptions_are_noops(
+    #[case] count: usize,
+    #[values(false, true)] trades: bool,
+) {
+    let (mut client, mut data_rx) = create_test_data_client("127.0.0.1:1".parse().unwrap(), 1);
+    let ids = [
+        InstrumentId::from("1-180294978-6146434-0.BETFAIR"),
+        InstrumentId::from("1-180294978-6146435-0.BETFAIR"),
+    ];
+
+    let subscribe = SubscribeQuotes::new(
+        &ids[..count],
+        Some(*BETFAIR_CLIENT_ID),
+        Some(*BETFAIR_VENUE),
+        UUID4::new(),
+        UnixNanos::from(11),
+        None,
+        None,
+    );
+
+    let unsubscribe = UnsubscribeQuotes::new(
+        &ids[..count],
+        Some(*BETFAIR_CLIENT_ID),
+        Some(*BETFAIR_VENUE),
+        UUID4::new(),
+        UnixNanos::from(17),
+        None,
+        None,
+    );
+
+    if trades {
+        let subscribe: SubscribeTrades =
+            serde_json::from_value(serde_json::to_value(subscribe).unwrap()).unwrap();
+        let unsubscribe: UnsubscribeTrades =
+            serde_json::from_value(serde_json::to_value(unsubscribe).unwrap()).unwrap();
+        client.subscribe_trades(subscribe).unwrap();
+        client.unsubscribe_trades(&unsubscribe).unwrap();
+    } else {
+        client.subscribe_quotes(subscribe).unwrap();
+        client.unsubscribe_quotes(&unsubscribe).unwrap();
+    }
+
+    assert!(!client.is_connected());
+    assert!(matches!(
+        data_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
 }
 
 #[rstest]
@@ -373,7 +569,7 @@ async fn test_data_client_emits_instruments_on_connect() {
     let mut instrument_count = 0;
 
     while let Ok(event) = rx.try_recv() {
-        if matches!(event, DataEvent::Instrument(_)) {
+        if matches!(event, DataEvent::Data(Data::Instrument(_))) {
             instrument_count += 1;
         }
     }
@@ -549,28 +745,23 @@ async fn test_mcm_handler_emits_book_deltas() {
     let (stream_port, listener) = start_mock_stream().await;
     let (mut client, mut rx) = create_test_data_client(addr, stream_port);
 
-    let mcm_fixture = current_market_message(&load_fixture("stream/mcm_UPDATE.json"));
+    let mcm_fixture = load_fixture("stream/mcm_UPDATE.json");
 
     let (server_done_tx, server_done_rx) = tokio::sync::oneshot::channel();
 
     let server = tokio::spawn(async move {
-        let (_reader, mut write_half) = accept_and_activate(&listener).await;
+        let (_reader, mut write_half, id) = accept_and_image(&listener, &["1.180727728"]).await;
 
         // Allow subscribe to complete before sending data
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        tokio::io::AsyncWriteExt::write_all(
-            &mut write_half,
-            format!("{}\r\n", mcm_fixture.trim()).as_bytes(),
-        )
-        .await
-        .unwrap();
+        write_line(&mut write_half, &market_message(&mcm_fixture, id)).await;
 
         let _ = server_done_rx.await;
         drop(write_half);
     });
 
-    connect_data_market_ready(&mut client).await;
+    connect_data_market_ready(&mut client, &["1.180727728"]).await;
 
     while rx.try_recv().is_ok() {}
 
@@ -616,7 +807,7 @@ async fn test_mcm_handler_emits_trades() {
         drop(write_half);
     });
 
-    connect_data_market_ready(&mut client).await;
+    connect_data_market_ready(&mut client, &[MARKET_ID]).await;
 
     while rx.try_recv().is_ok() {}
 
@@ -667,7 +858,7 @@ async fn test_data_client_handles_heartbeat_gracefully() {
         drop(write_half);
     });
 
-    connect_data_market_ready(&mut client).await;
+    connect_data_market_ready(&mut client, &[MARKET_ID]).await;
 
     while rx.try_recv().is_ok() {}
 
@@ -715,7 +906,7 @@ async fn test_data_client_emits_instrument_before_status_on_market_definition() 
         drop(write_half);
     });
 
-    connect_data_market_ready(&mut client).await;
+    connect_data_market_ready(&mut client, &[MARKET_ID]).await;
 
     while rx.try_recv().is_ok() {}
 
@@ -726,13 +917,13 @@ async fn test_data_client_emits_instrument_before_status_on_market_definition() 
 
     for _ in 0..30 {
         match tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
-            Ok(Some(DataEvent::Instrument(_))) => {
+            Ok(Some(DataEvent::Data(Data::Instrument(_)))) => {
                 if instrument_arrival.is_none() {
                     instrument_arrival = Some(seen);
                 }
                 seen += 1;
             }
-            Ok(Some(DataEvent::InstrumentStatus(event))) => {
+            Ok(Some(DataEvent::Data(Data::InstrumentStatus(event)))) => {
                 if status_arrival.is_none() {
                     status_arrival = Some(seen);
                     status_action = Some(event.action);
@@ -775,27 +966,22 @@ async fn test_data_client_handles_sub_image_snapshot() {
     let (stream_port, listener) = start_mock_stream().await;
     let (mut client, mut rx) = create_test_data_client(addr, stream_port);
 
-    let sub_image_fixture = current_market_message(&load_fixture("stream/mcm_SUB_IMAGE.json"));
+    let sub_image_fixture = load_fixture("stream/mcm_SUB_IMAGE.json");
 
     let (server_done_tx, server_done_rx) = tokio::sync::oneshot::channel();
 
     let server = tokio::spawn(async move {
-        let (_reader, mut write_half) = accept_and_activate(&listener).await;
+        let (_reader, mut write_half, id) = accept_and_image(&listener, &["1.180737206"]).await;
 
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        tokio::io::AsyncWriteExt::write_all(
-            &mut write_half,
-            format!("{}\r\n", sub_image_fixture.trim()).as_bytes(),
-        )
-        .await
-        .unwrap();
+        write_line(&mut write_half, &market_message(&sub_image_fixture, id)).await;
 
         let _ = server_done_rx.await;
         drop(write_half);
     });
 
-    connect_data_market_ready(&mut client).await;
+    connect_data_market_ready(&mut client, &["1.180737206"]).await;
 
     while rx.try_recv().is_ok() {}
 
@@ -811,7 +997,7 @@ async fn test_data_client_handles_sub_image_snapshot() {
                     break;
                 }
             }
-            Ok(Some(DataEvent::Instrument(_))) => {
+            Ok(Some(DataEvent::Data(Data::Instrument(_)))) => {
                 found_instrument = true;
 
                 if found_deltas {
@@ -847,27 +1033,23 @@ async fn test_data_client_handles_resub_delta_emits_deltas() {
     let (stream_port, listener) = start_mock_stream().await;
     let (mut client, mut rx) = create_test_data_client(addr, stream_port);
 
-    let resub_fixture = current_market_message(&load_fixture("stream/mcm_RESUB_DELTA.json"));
+    let resub_fixture = load_fixture("stream/mcm_RESUB_DELTA.json");
 
     let (server_done_tx, server_done_rx) = tokio::sync::oneshot::channel();
 
     let server = tokio::spawn(async move {
-        let (_reader, mut write_half) = accept_and_activate(&listener).await;
+        let (_reader, mut write_half, id) =
+            accept_and_image(&listener, &RESUB_DELTA_MARKET_IDS).await;
 
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        tokio::io::AsyncWriteExt::write_all(
-            &mut write_half,
-            format!("{}\r\n", resub_fixture.trim()).as_bytes(),
-        )
-        .await
-        .unwrap();
+        write_line(&mut write_half, &market_message(&resub_fixture, id)).await;
 
         let _ = server_done_rx.await;
         drop(write_half);
     });
 
-    connect_data_market_ready(&mut client).await;
+    connect_data_market_ready(&mut client, &RESUB_DELTA_MARKET_IDS).await;
 
     while rx.try_recv().is_ok() {}
 
@@ -875,9 +1057,7 @@ async fn test_data_client_handles_resub_delta_emits_deltas() {
     // Tracking distinct market ids (rather than a raw delta count) catches
     // regressions that drop entire markets while still emitting a few deltas.
     let expected_markets: std::collections::HashSet<&str> =
-        ["1.176621195", "1.167249195", "1.175776462"]
-            .into_iter()
-            .collect();
+        RESUB_DELTA_MARKET_IDS.into_iter().collect();
     let mut markets_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut delta_count = 0usize;
 
@@ -929,27 +1109,22 @@ async fn test_data_client_handles_live_race_message_emits_deltas(
     let (stream_port, listener) = start_mock_stream().await;
     let (mut client, mut rx) = create_test_data_client(addr, stream_port);
 
-    let fixture = current_market_message(&load_fixture(fixture_path));
+    let fixture = load_fixture(fixture_path);
 
     let (server_done_tx, server_done_rx) = tokio::sync::oneshot::channel();
 
     let server = tokio::spawn(async move {
-        let (_reader, mut write_half) = accept_and_activate(&listener).await;
+        let (_reader, mut write_half, id) = accept_and_image(&listener, &["1.176621195"]).await;
 
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        tokio::io::AsyncWriteExt::write_all(
-            &mut write_half,
-            format!("{}\r\n", fixture.trim()).as_bytes(),
-        )
-        .await
-        .unwrap();
+        write_line(&mut write_half, &market_message(&fixture, id)).await;
 
         let _ = server_done_rx.await;
         drop(write_half);
     });
 
-    connect_data_market_ready(&mut client).await;
+    connect_data_market_ready(&mut client, &["1.176621195"]).await;
 
     while rx.try_recv().is_ok() {}
 
@@ -1008,7 +1183,7 @@ async fn test_data_client_handles_bsp_settled_emits_close_status() {
         drop(write_half);
     });
 
-    connect_data_market_ready(&mut client).await;
+    connect_data_market_ready(&mut client, &[MARKET_ID]).await;
 
     while rx.try_recv().is_ok() {}
 
@@ -1016,7 +1191,7 @@ async fn test_data_client_handles_bsp_settled_emits_close_status() {
 
     for _ in 0..40 {
         match tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
-            Ok(Some(DataEvent::InstrumentStatus(event)))
+            Ok(Some(DataEvent::Data(Data::InstrumentStatus(event))))
                 if event.action == MarketStatusAction::Close =>
             {
                 close_status_seen = true;
@@ -1056,27 +1231,21 @@ async fn test_data_client_handles_bsp_sub_image_emits_instrument_and_deltas() {
         .and_then(|arr| arr.first())
         .expect("expected at least one BSP frame")
         .to_string();
-    let first_frame = current_market_message(&first_frame);
 
     let (server_done_tx, server_done_rx) = tokio::sync::oneshot::channel();
 
     let server = tokio::spawn(async move {
-        let (_reader, mut write_half) = accept_and_activate(&listener).await;
+        let (_reader, mut write_half, id) = accept_and_image(&listener, &["1.185781465"]).await;
 
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        tokio::io::AsyncWriteExt::write_all(
-            &mut write_half,
-            format!("{first_frame}\r\n").as_bytes(),
-        )
-        .await
-        .unwrap();
+        write_line(&mut write_half, &market_message(&first_frame, id)).await;
 
         let _ = server_done_rx.await;
         drop(write_half);
     });
 
-    connect_data_market_ready(&mut client).await;
+    connect_data_market_ready(&mut client, &["1.185781465"]).await;
 
     while rx.try_recv().is_ok() {}
 
@@ -1088,7 +1257,7 @@ async fn test_data_client_handles_bsp_sub_image_emits_instrument_and_deltas() {
 
     for _ in 0..40 {
         match tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
-            Ok(Some(DataEvent::Instrument(_))) => {
+            Ok(Some(DataEvent::Data(Data::Instrument(_)))) => {
                 if !instrument_seen {
                     instrument_seen = true;
                     instrument_idx = Some(idx);
@@ -1212,7 +1381,7 @@ async fn test_data_client_connect_is_idempotent() {
     let mut first_instruments = 0usize;
 
     while let Ok(event) = rx.try_recv() {
-        if matches!(event, DataEvent::Instrument(_)) {
+        if matches!(event, DataEvent::Data(Data::Instrument(_))) {
             first_instruments += 1;
         }
     }
@@ -1258,7 +1427,7 @@ async fn test_data_client_connect_is_idempotent() {
     let mut second_instruments = 0usize;
 
     while let Ok(event) = rx.try_recv() {
-        if matches!(event, DataEvent::Instrument(_)) {
+        if matches!(event, DataEvent::Data(Data::Instrument(_))) {
             second_instruments += 1;
         }
     }
@@ -1296,4 +1465,513 @@ async fn test_data_client_reset_clears_state() {
 
     let _ = server_done_tx.send(());
     server.await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_data_client_recovers_book_after_change_before_image() {
+    let (addr, _state) = start_mock_http().await;
+    let (stream_port, listener) = start_mock_stream().await;
+    let (mut client, mut rx) = create_test_data_client(addr, stream_port);
+    let image = load_fixture("stream/mcm_live_IMAGE.json");
+    let update = load_fixture("stream/mcm_live_UPDATE.json");
+    let (subscriptions_tx, subscriptions_rx) = tokio::sync::oneshot::channel();
+    let (server_done_tx, server_done_rx) = tokio::sync::oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        let (mut reader, mut write_half) = accept_and_auth(&listener).await;
+        let first = read_subscription(&mut reader).await;
+        let first_id = first["id"].as_u64().unwrap();
+        write_image(&mut write_half, first_id, &[]).await;
+        write_line(&mut write_half, &market_message(&update, first_id)).await;
+
+        let second = read_subscription(&mut reader).await;
+        let second_id = second["id"].as_u64().unwrap();
+        write_status(&mut write_half, second_id).await;
+        write_line(&mut write_half, &market_message(&image, second_id)).await;
+        write_line(&mut write_half, &market_message(&update, second_id)).await;
+        let _ = subscriptions_tx.send((first, second));
+
+        let _ = server_done_rx.await;
+        drop(write_half);
+    });
+
+    connect_data_market_ready(&mut client, &[LIVE_MARKET_ID]).await;
+    let books = receive_books(&mut rx, 3, Duration::from_secs(5)).await;
+    let (first, second) = subscriptions_rx.await.unwrap();
+
+    assert_eq!(
+        books,
+        vec![
+            (live_runner(42_153), true),
+            (live_runner(39_978), true),
+            (live_runner(42_153), false),
+        ],
+    );
+    assert_eq!(second["id"], first["id"].as_u64().unwrap() + 1);
+    assert_eq!(second.get("clk"), None);
+    assert_eq!(second.get("initialClk"), None);
+    assert_eq!(without_id(second), without_id(first));
+
+    client.disconnect().await.unwrap();
+    let _ = server_done_tx.send(());
+    server.await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_data_client_resubscribes_when_initial_image_missing() {
+    let (addr, _state) = start_mock_http().await;
+    let (stream_port, listener) = start_mock_stream().await;
+
+    let config = BetfairDataClientConfig {
+        book_snapshot_timeout_secs: 1,
+        ..Default::default()
+    };
+
+    let (mut client, mut rx) = create_test_data_client_with_config(addr, stream_port, config);
+    let image = load_fixture("stream/mcm_live_IMAGE.json");
+    let (subscriptions_tx, subscriptions_rx) = tokio::sync::oneshot::channel();
+    let (server_done_tx, server_done_rx) = tokio::sync::oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        let (mut reader, mut write_half) = accept_and_auth(&listener).await;
+        let first = read_subscription(&mut reader).await;
+        let first_id = first["id"].as_u64().unwrap();
+        write_image(&mut write_half, first_id, &[]).await;
+        let imaged = tokio::time::Instant::now();
+
+        let second = read_subscription(&mut reader).await;
+        let waited = imaged.elapsed();
+        let second_id = second["id"].as_u64().unwrap();
+        write_status(&mut write_half, second_id).await;
+        write_line(&mut write_half, &market_message(&image, second_id)).await;
+        let _ = subscriptions_tx.send((first, second, waited));
+
+        let _ = server_done_rx.await;
+        drop(write_half);
+    });
+
+    connect_data_market_ready(&mut client, &[LIVE_MARKET_ID]).await;
+    let books = receive_books(&mut rx, 2, Duration::from_secs(5)).await;
+    let (first, second, waited) = subscriptions_rx.await.unwrap();
+
+    assert_eq!(
+        books,
+        vec![(live_runner(42_153), true), (live_runner(39_978), true)],
+    );
+    assert!(
+        waited >= Duration::from_millis(500),
+        "recovery must wait for the image deadline, waited {waited:?}",
+    );
+    assert_eq!(second["id"], first["id"].as_u64().unwrap() + 1);
+    assert_eq!(without_id(second), without_id(first));
+
+    client.disconnect().await.unwrap();
+    let _ = server_done_tx.send(());
+    server.await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_data_client_recovery_joins_pending_image() {
+    let (addr, _state) = start_mock_http().await;
+    let (stream_port, listener) = start_mock_stream().await;
+    let (mut client, mut rx) = create_test_data_client(addr, stream_port);
+    let image = load_fixture("stream/mcm_live_IMAGE.json");
+    let update = load_fixture("stream/mcm_live_UPDATE.json");
+    let (extra_tx, extra_rx) = tokio::sync::oneshot::channel();
+    let (server_done_tx, server_done_rx) = tokio::sync::oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        let (mut reader, mut write_half) = accept_and_auth(&listener).await;
+        let subscription = read_subscription(&mut reader).await;
+        let id = subscription["id"].as_u64().unwrap();
+
+        // The change precedes the image this subscription requested
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        write_line(&mut write_half, &market_message(&update, id)).await;
+
+        let mut line = String::new();
+        let before_image = tokio::time::timeout(
+            Duration::from_millis(500),
+            tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line),
+        )
+        .await;
+
+        write_status(&mut write_half, id).await;
+        write_line(&mut write_half, &market_message(&image, id)).await;
+        write_line(&mut write_half, &market_message(&update, id)).await;
+
+        let after_image = tokio::time::timeout(
+            Duration::from_millis(500),
+            tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line),
+        )
+        .await;
+        let _ = extra_tx.send((before_image.is_ok(), after_image.is_ok(), line));
+
+        let _ = server_done_rx.await;
+        drop(write_half);
+    });
+
+    client.connect().await.unwrap();
+    client
+        .subscribe_book_deltas(SubscribeBookDeltas::new(
+            live_runner(42_153),
+            BookType::L2_MBP,
+            None,
+            Some(*BETFAIR_VENUE),
+            UUID4::new(),
+            nautilus_core::UnixNanos::default(),
+            None,
+            false,
+            None,
+            None,
+        ))
+        .unwrap();
+    let books = receive_books(&mut rx, 3, Duration::from_secs(5)).await;
+    let (extra_before_image, extra_after_image, line) = extra_rx.await.unwrap();
+
+    assert_eq!(
+        books,
+        vec![
+            (live_runner(42_153), true),
+            (live_runner(39_978), true),
+            (live_runner(42_153), false),
+        ],
+    );
+    assert!(!extra_before_image, "recovery wrote a subscription: {line}");
+    assert!(!extra_after_image, "recovery wrote a subscription: {line}");
+
+    client.disconnect().await.unwrap();
+    let _ = server_done_tx.send(());
+    server.await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_data_client_reconnect_resumes_synced_book_from_clock() {
+    let (addr, _state) = start_mock_http().await;
+    let (stream_port, listener) = start_mock_stream().await;
+    let (mut client, mut rx) = create_test_data_client(addr, stream_port);
+    let image = load_fixture("stream/mcm_live_IMAGE.json");
+    let update = load_fixture("stream/mcm_live_UPDATE.json");
+    let (imaged_tx, imaged_rx) = tokio::sync::oneshot::channel();
+    let (replayed_tx, replayed_rx) = tokio::sync::oneshot::channel();
+    let (server_done_tx, server_done_rx) = tokio::sync::oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        let (mut reader, mut write_half) = accept_and_auth(&listener).await;
+        let subscription = read_subscription(&mut reader).await;
+        let id = subscription["id"].as_u64().unwrap();
+        write_status(&mut write_half, id).await;
+        write_line(&mut write_half, &market_message(&image, id)).await;
+        imaged_rx.await.unwrap();
+        drop(reader);
+        drop(write_half);
+
+        let (mut reader, mut write_half) =
+            tokio::time::timeout(Duration::from_secs(5), accept_and_auth(&listener))
+                .await
+                .expect("data stream must reconnect");
+        let replayed = read_subscription(&mut reader).await;
+        let mut resumed: Value = serde_json::from_str(&market_message(&update, id)).unwrap();
+        resumed["ct"] = Value::from("RESUB_DELTA");
+        write_status(&mut write_half, id).await;
+        write_line(&mut write_half, &resumed.to_string()).await;
+
+        let mut line = String::new();
+        let extra = tokio::time::timeout(
+            Duration::from_millis(500),
+            tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line),
+        )
+        .await;
+        let _ = replayed_tx.send((subscription, replayed, extra.is_ok(), line));
+
+        let _ = server_done_rx.await;
+        drop(write_half);
+    });
+
+    connect_data_market_ready(&mut client, &[LIVE_MARKET_ID]).await;
+    let imaged = receive_books(&mut rx, 2, Duration::from_secs(5)).await;
+    imaged_tx.send(()).unwrap();
+    let resumed = receive_books(&mut rx, 1, Duration::from_secs(5)).await;
+    let (subscription, replayed, extra, line) = replayed_rx.await.unwrap();
+
+    assert_eq!(
+        imaged,
+        vec![(live_runner(42_153), true), (live_runner(39_978), true)],
+    );
+    assert_eq!(resumed, vec![(live_runner(42_153), false)]);
+    assert_eq!(replayed["id"], subscription["id"]);
+    assert_eq!(replayed["clk"], "AAAAAAAA");
+    assert_eq!(replayed["initialClk"], "kxzLoPfJC6IcrbfQ1AuWHLCOxcsL");
+    assert!(!extra, "reconnect must not request another image: {line}");
+
+    client.disconnect().await.unwrap();
+    let _ = server_done_tx.send(());
+    server.await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_data_client_recovers_book_after_unparsable_runner_change() {
+    let (addr, _state) = start_mock_http().await;
+    let (stream_port, listener) = start_mock_stream().await;
+    let (mut client, mut rx) = create_test_data_client(addr, stream_port);
+    let image = load_fixture("stream/mcm_live_IMAGE.json");
+    let update = load_fixture("stream/mcm_live_UPDATE.json");
+
+    // A valid change for one runner precedes a negative size the adapter cannot parse
+    let mut unparsable: Value = serde_json::from_str(&update).unwrap();
+    unparsable["mc"][0]["rc"][0]["atl"][0][1] = Value::from(-1);
+    let runners = unparsable["mc"][0]["rc"].as_array_mut().unwrap();
+    runners.insert(0, serde_json::json!({"id": 39_978, "atb": [[1.7, 10.0]]}));
+    let unparsable = unparsable.to_string();
+
+    let (subscriptions_tx, subscriptions_rx) = tokio::sync::oneshot::channel();
+    let (server_done_tx, server_done_rx) = tokio::sync::oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        let (mut reader, mut write_half) = accept_and_auth(&listener).await;
+        let first = read_subscription(&mut reader).await;
+        let first_id = first["id"].as_u64().unwrap();
+        write_status(&mut write_half, first_id).await;
+        write_line(&mut write_half, &market_message(&image, first_id)).await;
+        write_line(&mut write_half, &market_message(&unparsable, first_id)).await;
+
+        let second = tokio::time::timeout(Duration::from_secs(5), read_subscription(&mut reader))
+            .await
+            .expect("an unparsable runner change requests a fresh image");
+        let second_id = second["id"].as_u64().unwrap();
+        write_status(&mut write_half, second_id).await;
+        write_line(&mut write_half, &market_message(&image, second_id)).await;
+        write_line(&mut write_half, &market_message(&update, second_id)).await;
+        let _ = subscriptions_tx.send((first, second));
+
+        let _ = server_done_rx.await;
+        drop(write_half);
+    });
+
+    connect_data_market_ready(&mut client, &[LIVE_MARKET_ID]).await;
+    let books = receive_books(&mut rx, 5, Duration::from_secs(5)).await;
+    let (first, second) = subscriptions_rx.await.unwrap();
+
+    assert_eq!(
+        books,
+        vec![
+            (live_runner(42_153), true),
+            (live_runner(39_978), true),
+            (live_runner(42_153), true),
+            (live_runner(39_978), true),
+            (live_runner(42_153), false),
+        ],
+    );
+    assert_eq!(second["id"], first["id"].as_u64().unwrap() + 1);
+    assert_eq!(without_id(second), without_id(first));
+
+    client.disconnect().await.unwrap();
+    let _ = server_done_tx.send(());
+    server.await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_data_client_subscription_writes_keep_every_subscribed_market(
+    #[values(1, RESUB_DELTA_MARKET_IDS.len())] chunk_size: usize,
+) {
+    let (addr, _state) = start_mock_http().await;
+    let (stream_port, listener) = start_mock_stream().await;
+    let (mut client, _rx) = create_test_data_client(addr, stream_port);
+    let (subscriptions_tx, subscriptions_rx) = tokio::sync::oneshot::channel();
+    let (server_done_tx, server_done_rx) = tokio::sync::oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        let (mut reader, write_half) = accept_and_auth(&listener).await;
+        let mut subscriptions = Vec::new();
+
+        for _ in RESUB_DELTA_MARKET_IDS {
+            subscriptions.push(read_subscription(&mut reader).await);
+        }
+
+        let _ = subscriptions_tx.send(subscriptions);
+
+        let _ = server_done_rx.await;
+        drop(write_half);
+    });
+
+    client.connect().await.unwrap();
+
+    let ids: Vec<_> = RESUB_DELTA_MARKET_IDS
+        .iter()
+        .map(|market_id| {
+            nautilus_betfair::common::parse::make_instrument_id(
+                market_id,
+                6_146_434,
+                rust_decimal::Decimal::ZERO,
+            )
+        })
+        .collect();
+
+    for ids in ids.chunks(chunk_size) {
+        client
+            .subscribe_book_deltas(SubscribeBookDeltas::new(
+                ids,
+                BookType::L2_MBP,
+                None,
+                Some(*BETFAIR_VENUE),
+                UUID4::new(),
+                nautilus_core::UnixNanos::default(),
+                None,
+                false,
+                None,
+                None,
+            ))
+            .unwrap();
+    }
+
+    let subscriptions = subscriptions_rx.await.unwrap();
+
+    let markets = subscriptions
+        .iter()
+        .map(|subscription| {
+            let mut markets: Vec<String> =
+                serde_json::from_value(subscription["marketFilter"]["marketIds"].clone()).unwrap();
+            markets.sort();
+            markets
+        })
+        .collect::<Vec<_>>();
+
+    let expected = (1..=RESUB_DELTA_MARKET_IDS.len())
+        .map(|count| {
+            let mut markets = RESUB_DELTA_MARKET_IDS[..count]
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            markets.sort();
+            markets
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(markets, expected);
+
+    client.disconnect().await.unwrap();
+    let _ = server_done_tx.send(());
+    server.await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_data_client_unparsable_recovery_image_fails_its_recovery() {
+    let (addr, _state) = start_mock_http().await;
+    let (stream_port, listener) = start_mock_stream().await;
+    let (mut client, mut rx) = create_test_data_client(addr, stream_port);
+    let image = load_fixture("stream/mcm_live_IMAGE.json");
+    let update = load_fixture("stream/mcm_live_UPDATE.json");
+
+    let mut unparsable_update: Value = serde_json::from_str(&update).unwrap();
+    unparsable_update["mc"][0]["rc"][0]["atl"][0][1] = Value::from(-1);
+    let unparsable_update = unparsable_update.to_string();
+
+    // The first runner parses, so an image accepted before parsing would emit its snapshot
+    let mut unparsable_image: Value = serde_json::from_str(&image).unwrap();
+    unparsable_image["mc"][0]["rc"][1]["atb"][0][1] = Value::from(-1);
+    let unparsable_image = unparsable_image.to_string();
+
+    let (extra_tx, extra_rx) = tokio::sync::oneshot::channel();
+    let (server_done_tx, server_done_rx) = tokio::sync::oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        let (mut reader, mut write_half) = accept_and_auth(&listener).await;
+        let first = read_subscription(&mut reader).await;
+        let first_id = first["id"].as_u64().unwrap();
+        write_status(&mut write_half, first_id).await;
+        write_line(&mut write_half, &market_message(&image, first_id)).await;
+        write_line(
+            &mut write_half,
+            &market_message(&unparsable_update, first_id),
+        )
+        .await;
+
+        let second = tokio::time::timeout(Duration::from_secs(5), read_subscription(&mut reader))
+            .await
+            .expect("an unparsable update requests a fresh image");
+        let second_id = second["id"].as_u64().unwrap();
+        write_status(&mut write_half, second_id).await;
+        write_line(
+            &mut write_half,
+            &market_message(&unparsable_image, second_id),
+        )
+        .await;
+
+        let mut line = String::new();
+        let extra = tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line),
+        )
+        .await;
+        let _ = extra_tx.send((extra.is_ok(), line));
+
+        let _ = server_done_rx.await;
+        drop(write_half);
+    });
+
+    connect_data_market_ready(&mut client, &[LIVE_MARKET_ID]).await;
+    let (extra, line) = extra_rx.await.unwrap();
+    let books = receive_books(&mut rx, 3, Duration::from_millis(500)).await;
+
+    assert_eq!(
+        books,
+        vec![(live_runner(42_153), true), (live_runner(39_978), true)],
+    );
+    assert!(
+        !extra,
+        "an unparsable image restarted recovery with a fresh budget: {line}"
+    );
+
+    client.disconnect().await.unwrap();
+    let _ = server_done_tx.send(());
+    server.await.unwrap();
+}
+
+#[rstest]
+#[case::client(false)]
+#[case::stream(true)]
+fn test_constructor_rejects_invalid_config(#[case] stream: bool) {
+    let mut config = BetfairDataClientConfig {
+        market_ids: Some(vec!["1.1".to_string(), "1.1".to_string()]),
+        ..Default::default()
+    };
+
+    let mut stream_config = plain_stream_config(1);
+
+    if stream {
+        config.market_ids = None;
+        stream_config.heartbeat_secs = Some(0);
+    }
+
+    let http_client = create_test_http_client("127.0.0.1:1".parse().unwrap());
+    let error = BetfairDataClient::new(
+        *BETFAIR_CLIENT_ID,
+        http_client,
+        test_credential(),
+        stream_config,
+        config,
+        NavigationFilter::default(),
+        Currency::GBP(),
+        None,
+    )
+    .expect_err("invalid config must fail before client setup");
+
+    if stream {
+        assert_eq!(
+            error.to_string(),
+            "heartbeat_secs must be positive when set"
+        );
+    } else {
+        assert_eq!(
+            error.downcast_ref::<ConfigError>(),
+            Some(&ConfigError::duplicate("market_ids", None)),
+        );
+    }
 }

@@ -33,12 +33,13 @@ use nautilus_model::{
 use rust_decimal::Decimal;
 use ustr::Ustr;
 
-use super::KEY_CLASS;
+use super::validate_required_instrument_columns;
 use crate::arrow::{
     ArrowSchemaProvider, EncodeToRecordBatch, EncodingError, KEY_INSTRUMENT_ID,
-    KEY_PRICE_PRECISION, KEY_SIZE_PRECISION, extract_column, extract_column_by_name_or_index,
-    extract_optional_string_column_by_name, json_string_field, optional_ustr_value,
-    record_batch_with_timestamps, record_batch_with_u64_timestamps, timestamp_data_type,
+    KEY_PRICE_PRECISION, KEY_SIZE_PRECISION, extract_column, extract_column_by_name,
+    extract_optional_string_column_by_name, json_string_field, metadata_with_type_name,
+    optional_ustr_value, record_batch_with_timestamps, record_batch_with_u64_timestamps,
+    timestamp_data_type,
 };
 
 impl ArrowSchemaProvider for OptionContract {
@@ -66,22 +67,13 @@ impl ArrowSchemaProvider for OptionContract {
             Field::new("min_price", DataType::Utf8, true),    // nullable
             Field::new("margin_init", DataType::Utf8, false),
             Field::new("margin_maint", DataType::Utf8, false),
-            Field::new("maker_fee", DataType::Utf8, false),
-            Field::new("taker_fee", DataType::Utf8, false),
             Field::new("tick_scheme", DataType::Utf8, true),
             json_string_field("info", true),
             Field::new("ts_event", timestamp_data_type(), false),
             Field::new("ts_init", timestamp_data_type(), false),
         ];
 
-        let mut final_metadata = HashMap::new();
-        final_metadata.insert(KEY_CLASS.to_string(), "OptionContract".to_string());
-
-        if let Some(meta) = metadata {
-            final_metadata.extend(meta);
-        }
-
-        Schema::new_with_metadata(fields, final_metadata)
+        Schema::new_with_metadata(fields, metadata_with_type_name("OptionContract", metadata))
     }
 }
 
@@ -115,8 +107,6 @@ impl EncodeToRecordBatch for OptionContract {
         let mut min_price_builder = StringBuilder::new();
         let mut margin_init_builder = StringBuilder::new();
         let mut margin_maint_builder = StringBuilder::new();
-        let mut maker_fee_builder = StringBuilder::new();
-        let mut taker_fee_builder = StringBuilder::new();
         let mut tick_scheme_builder = StringBuilder::new();
         let mut info_builder = StringBuilder::new();
         let mut ts_event_builder = UInt64Array::builder(data.len());
@@ -172,8 +162,6 @@ impl EncodeToRecordBatch for OptionContract {
 
             margin_init_builder.append_value(oc.margin_init.to_string());
             margin_maint_builder.append_value(oc.margin_maint.to_string());
-            maker_fee_builder.append_value(oc.maker_fee.to_string());
-            taker_fee_builder.append_value(oc.taker_fee.to_string());
 
             if let Some(tick_scheme) = oc.tick_scheme {
                 tick_scheme_builder.append_value(tick_scheme);
@@ -200,11 +188,8 @@ impl EncodeToRecordBatch for OptionContract {
             ts_init_builder.append_value(oc.ts_init.as_u64());
         }
 
-        let mut final_metadata = metadata.clone();
-        final_metadata.insert(KEY_CLASS.to_string(), "OptionContract".to_string());
-
         record_batch_with_timestamps(
-            Self::get_schema(Some(final_metadata)).into(),
+            Self::get_schema(Some(metadata.clone())).into(),
             vec![
                 Arc::new(id_builder.finish()),
                 Arc::new(raw_symbol_builder.finish()),
@@ -228,8 +213,6 @@ impl EncodeToRecordBatch for OptionContract {
                 Arc::new(min_price_builder.finish()),
                 Arc::new(margin_init_builder.finish()),
                 Arc::new(margin_maint_builder.finish()),
-                Arc::new(maker_fee_builder.finish()),
-                Arc::new(taker_fee_builder.finish()),
                 Arc::new(tick_scheme_builder.finish()),
                 Arc::new(info_builder.finish()),
                 Arc::new(ts_event_builder.finish()),
@@ -259,13 +242,14 @@ impl EncodeToRecordBatch for OptionContract {
 ///
 /// # Errors
 ///
-/// Returns an `EncodingError` if the record batch cannot be decoded.
+/// Returns an error if the record batch cannot be decoded.
 ///
 /// [`DecodeFromRecordBatch`]: crate::arrow::DecodeFromRecordBatch
 pub fn decode_option_contract_batch(
-    #[allow(unused)] metadata: &HashMap<String, String>,
+    metadata: &HashMap<String, String>,
     record_batch: &RecordBatch,
 ) -> Result<Vec<OptionContract>, EncodingError> {
+    validate_required_instrument_columns::<OptionContract>(metadata, record_batch)?;
     let record_batch = record_batch_with_u64_timestamps(record_batch)?;
     let record_batch = &record_batch;
     let cols = record_batch.columns();
@@ -304,23 +288,12 @@ pub fn decode_option_contract_batch(
         extract_column::<StringArray>(cols, "margin_init", 20, DataType::Utf8)?;
     let margin_maint_values =
         extract_column::<StringArray>(cols, "margin_maint", 21, DataType::Utf8)?;
-    let maker_fee_values = extract_column::<StringArray>(cols, "maker_fee", 22, DataType::Utf8)?;
-    let taker_fee_values = extract_column::<StringArray>(cols, "taker_fee", 23, DataType::Utf8)?;
     let tick_scheme_values = extract_optional_string_column_by_name(record_batch, "tick_scheme")?;
-    let info_values =
-        extract_column_by_name_or_index::<StringArray>(record_batch, "info", 25, DataType::Utf8)?;
-    let ts_event_values = extract_column_by_name_or_index::<UInt64Array>(
-        record_batch,
-        "ts_event",
-        26,
-        DataType::UInt64,
-    )?;
-    let ts_init_values = extract_column_by_name_or_index::<UInt64Array>(
-        record_batch,
-        "ts_init",
-        27,
-        DataType::UInt64,
-    )?;
+    let info_values = extract_column_by_name::<StringArray>(record_batch, "info", DataType::Utf8)?;
+    let ts_event_values =
+        extract_column_by_name::<UInt64Array>(record_batch, "ts_event", DataType::UInt64)?;
+    let ts_init_values =
+        extract_column_by_name::<UInt64Array>(record_batch, "ts_init", DataType::UInt64)?;
 
     let mut result = Vec::with_capacity(num_rows);
 
@@ -373,10 +346,6 @@ pub fn decode_option_contract_batch(
             .map_err(|e| EncodingError::ParseError("margin_init", format!("row {i}: {e}")))?;
         let margin_maint = Decimal::from_str(margin_maint_values.value(i))
             .map_err(|e| EncodingError::ParseError("margin_maint", format!("row {i}: {e}")))?;
-        let maker_fee = Decimal::from_str(maker_fee_values.value(i))
-            .map_err(|e| EncodingError::ParseError("maker_fee", format!("row {i}: {e}")))?;
-        let taker_fee = Decimal::from_str(taker_fee_values.value(i))
-            .map_err(|e| EncodingError::ParseError("taker_fee", format!("row {i}: {e}")))?;
 
         let info = if info_values.is_null(i) {
             None
@@ -440,8 +409,6 @@ pub fn decode_option_contract_batch(
             )?)
             .margin_init(margin_init)
             .margin_maint(margin_maint)
-            .maker_fee(maker_fee)
-            .taker_fee(taker_fee)
             .maybe_tick_scheme(tick_scheme)
             .maybe_info(info)
             .ts_event(ts_event)

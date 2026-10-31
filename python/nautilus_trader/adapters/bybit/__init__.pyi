@@ -17,6 +17,7 @@ __all__ = [
     "BybitEnvironment",
     "BybitExecutionClientConfig",
     "BybitExecutionClientFactory",
+    "BybitLiquidation",
     "BybitMarginAction",
     "BybitMarginBorrowResult",
     "BybitMarginRepayResult",
@@ -64,7 +65,11 @@ class BybitDataClientConfig:
     @property
     def update_instruments_interval_mins(self) -> int | None: ...
     @property
+    def book_snapshot_timeout_secs(self) -> int: ...
+    @property
     def transport_backend(self) -> network.TransportBackend: ...
+    @property
+    def bars_timestamp_on_close(self) -> bool: ...
     def __init__(
         self,
         product_types: typing.Sequence[BybitProductType] | None = None,
@@ -84,6 +89,8 @@ class BybitDataClientConfig:
         update_instruments_interval_mins: int | None = None,
         instrument_status_poll_secs: int | None = None,
         transport_backend: network.TransportBackend | None = None,
+        book_snapshot_timeout_secs: int | None = None,
+        bars_timestamp_on_close: bool | None = None,
     ) -> None: ...
     @property
     def instrument_status_poll_secs(self) -> int | None: ...
@@ -250,6 +257,7 @@ class BybitHttpClient:
         venue_order_id: model.VenueOrderId | None = None,
         quantity: model.Quantity | None = None,
         price: model.Price | None = None,
+        trigger_price: model.Price | None = None,
     ) -> typing.Any: ...
     def cancel_order(
         self,
@@ -336,6 +344,38 @@ class BybitHttpClient:
         product_type: BybitProductType,
         instrument_id: model.InstrumentId | None = None,
     ) -> typing.Any: ...
+
+@typing.final
+class BybitLiquidation:
+    @property
+    def instrument_id(self) -> model.InstrumentId: ...
+    @property
+    def position_side(self) -> model.PositionSide: ...
+    @property
+    def bankruptcy_price(self) -> model.Price: ...
+    @property
+    def quantity(self) -> model.Quantity: ...
+    @property
+    def ts_event(self) -> int: ...
+    @property
+    def ts_init(self) -> int: ...
+    @classmethod
+    def decode_record_batch_py(
+        cls, metadata: typing.Mapping[str, str], py_batch: typing.Any
+    ) -> typing.Any: ...
+    def encode_record_batch_py(self, items: list) -> typing.Any: ...
+    def __new__(
+        cls,
+        instrument_id: model.InstrumentId,
+        position_side: model.PositionSide,
+        bankruptcy_price: model.Price,
+        quantity: model.Quantity,
+        ts_event: int,
+        ts_init: int,
+    ) -> BybitLiquidation: ...
+    def to_json(self) -> str: ...
+    @classmethod
+    def from_json(cls, data: typing.Any) -> typing.Any: ...
 
 @typing.final
 class BybitMarginBorrowResult:

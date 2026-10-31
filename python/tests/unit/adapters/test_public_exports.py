@@ -33,13 +33,12 @@ ADAPTERS_ROOT = Path(__file__).resolve().parents[3] / "nautilus_trader" / "adapt
 ADAPTERS = sorted(p.name for p in ADAPTERS_ROOT.iterdir() if (p / "__init__.py").exists())
 
 # Venue adapters expose canonical <VENUE>, <VENUE>_CLIENT_ID, <VENUE>_VENUE constants.
-# Data providers (databento, tardis), the blockchain data client, the sandbox exec
+# Data providers (coinapi, databento, finfeed, tardis), the blockchain data client, the sandbox exec
 # client, and the multi-venue interactive_brokers broker intentionally omit them.
 VENUE_ADAPTERS = {
     "architect_ax": "AX",
     "betfair": "BETFAIR",
     "binance": "BINANCE",
-    "bitmex": "BITMEX",
     "bybit": "BYBIT",
     "coinbase": "COINBASE",
     "deribit": "DERIBIT",
@@ -56,7 +55,6 @@ NON_VENUE_ADAPTERS = sorted(set(ADAPTERS) - set(VENUE_ADAPTERS))
 
 REMOVED_PYTHON_WEBSOCKET_TYPES = {
     "architect_ax": ("AxMdWebSocketClient", "AxOrdersWebSocketClient"),
-    "bitmex": ("BitmexWebSocketClient",),
     "bybit": (
         "BybitWebSocketClient",
         "BybitWebSocketError",
@@ -157,8 +155,9 @@ def test_facade_exposes_no_raw_clients_endpoints_or_url_resolvers(adapter: objec
     module = _import(adapter)
 
     leaked = [name for name in module.__all__ if _is_forbidden(name)]
+    expected = ["FinFeedHttpClient"] if adapter == "finfeed" else []
 
-    assert not leaked, f"{adapter} __all__ leaks private members: {leaked}"
+    assert leaked == expected, f"{adapter} __all__ has unexpected restricted exports: {leaked}"
 
 
 @pytest.mark.parametrize(
@@ -229,14 +228,15 @@ def test_known_adapter_set_is_complete() -> None:
         "architect_ax",
         "betfair",
         "binance",
-        "bitmex",
         "blockchain",
         "bybit",
+        "coinapi",
         "coinbase",
         "databento",
         "deribit",
         "derive",
         "dydx",
+        "finfeed",
         "hyperliquid",
         "interactive_brokers",
         "kraken",

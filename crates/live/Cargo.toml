@@ -129,14 +129,16 @@ nautilus-testkit = { workspace = true, default-features = false, features = [
   "testers",
 ] }
 
-arrow = { workspace = true }
+axum = { workspace = true }
 bytes = { workspace = true }
 criterion = { workspace = true }
+cucumber = { workspace = true }
 madsim = { workspace = true }
 proptest = { workspace = true }
 rstest = { workspace = true }
 rust_decimal_macros = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
+tokio-tungstenite = { workspace = true }
 toml = { workspace = true }
 ustr = { workspace = true }
 
@@ -151,7 +153,27 @@ name = "queue_monitor"
 harness = false
 required-features = ["node"]
 
+[[bench]]
+name = "reconciliation"
+path = "benches/reconciliation.rs"
+harness = false
+
+[[bench]]
+name = "msgbus_python"
+harness = false
+required-features = ["python"]
+
 [[test]]
 name = "integration"
 path = "tests/integration/main.rs"
+required-features = ["node"]
+
+[[test]]
+name = "book"
+path = "tests/book/main.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "spec"
+path = "tests/spec/main.rs"
 required-features = ["node"]

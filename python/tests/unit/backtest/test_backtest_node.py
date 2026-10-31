@@ -36,12 +36,14 @@ from nautilus_trader.analysis import create_tearsheet
 from nautilus_trader.analysis import tearsheet
 from nautilus_trader.analysis.reporter import ReportProvider
 from nautilus_trader.backtest import BacktestDataConfig
+from nautilus_trader.backtest import BacktestEngine
 from nautilus_trader.backtest import BacktestEngineConfig
 from nautilus_trader.backtest import BacktestNode
 from nautilus_trader.backtest import BacktestRunConfig
 from nautilus_trader.backtest import BacktestVenueConfig
 from nautilus_trader.common import ImportableActorConfig
 from nautilus_trader.core import UUID4
+from nautilus_trader.execution import MakerTakerFeeModel
 from nautilus_trader.execution import StaticLatencyModel
 from nautilus_trader.model import AccountType
 from nautilus_trader.model import BookType
@@ -57,6 +59,7 @@ from nautilus_trader.model import StandardMarginModel
 from nautilus_trader.model import Venue
 from nautilus_trader.persistence import DataCatalogConfig
 from nautilus_trader.persistence import ParquetDataCatalog
+from nautilus_trader.persistence import RotationConfig
 from nautilus_trader.persistence import StreamingConfig
 from nautilus_trader.trading import EmaCrossConfig
 from nautilus_trader.trading import ImportableExecutionAlgorithmConfig
@@ -75,10 +78,14 @@ def test_node_construction() -> None:
         account_type=AccountType.MARGIN,
         book_type=BookType.L1_MBP,
         starting_balances=["1_000_000 USD"],
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
     )
     data = BacktestDataConfig(
         data_type=NautilusDataType.QuoteTick,
-        catalog_path="/data/catalog",
+        catalog=DataCatalogConfig(path="/data/catalog"),
         instrument_id=InstrumentId.from_str("EUR/USD.SIM"),
     )
     config = BacktestRunConfig(venues=[venue], data=[data])
@@ -99,6 +106,10 @@ def test_node_installs_configured_margin_model() -> None:
         starting_balances=["1_000_000 USD"],
         base_currency=Currency.from_str("USD"),
         default_leverage=Decimal(10),
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
         margin_model=StandardMarginModel(),
     )
     config = BacktestRunConfig(
@@ -134,6 +145,10 @@ def test_node_uses_margin_account_default_leverage() -> None:
         book_type=BookType.L1_MBP,
         starting_balances=["1_000_000 USD"],
         base_currency=Currency.from_str("USD"),
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
     )
     config = BacktestRunConfig(
         venues=[venue],
@@ -169,11 +184,15 @@ def test_node_applies_configured_latency_model(tmp_path: Path) -> None:
         account_type=AccountType.MARGIN,
         book_type=BookType.L1_MBP,
         starting_balances=["1_000_000 USDT"],
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
         latency_model=StaticLatencyModel(base_latency_nanos=1_000_000_000),
     )
     data = BacktestDataConfig(
         data_type=NautilusDataType.QuoteTick,
-        catalog_path=str(catalog_path),
+        catalog=DataCatalogConfig(path=str(catalog_path)),
         instrument_id=instrument.id,
     )
     config = BacktestRunConfig(
@@ -219,6 +238,10 @@ def test_node_loads_every_instrument_class_from_one_instrument_config(tmp_path: 
             account_type=AccountType.MARGIN,
             book_type=BookType.L1_MBP,
             starting_balances=["1_000_000 USD"],
+            fee_model=MakerTakerFeeModel(
+                maker_rate=Decimal(0),
+                taker_rate=Decimal(0),
+            ),
         ),
         BacktestVenueConfig(
             name="XNAS",
@@ -226,11 +249,15 @@ def test_node_loads_every_instrument_class_from_one_instrument_config(tmp_path: 
             account_type=AccountType.CASH,
             book_type=BookType.L1_MBP,
             starting_balances=["1_000_000 USD"],
+            fee_model=MakerTakerFeeModel(
+                maker_rate=Decimal(0),
+                taker_rate=Decimal(0),
+            ),
         ),
     ]
     data = BacktestDataConfig(
         data_type=NautilusDataType.Instrument,
-        catalog_path=str(catalog_path),
+        catalog=DataCatalogConfig(path=str(catalog_path)),
         instrument_ids=[currency_pair.id, equity.id],
     )
     config = BacktestRunConfig(
@@ -392,6 +419,10 @@ def test_node_rejects_disposed_execution_algorithm_before_construction(
         account_type=AccountType.MARGIN,
         book_type=BookType.L1_MBP,
         starting_balances=["1_000_000 USD"],
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
     )
     config = BacktestRunConfig(
         venues=[venue],
@@ -448,12 +479,10 @@ def test_node_streams_output_to_new_or_replaced_directory(
             run_analysis=False,
             instance_id=instance_id,
             streaming=StreamingConfig(
-                catalog_path=str(output_path),
-                fs_protocol="file",
+                writer_path=str(output_path),
                 flush_interval_ms=1,
                 replace_existing=replace_existing,
-                rotation_mode="SIZE",
-                max_file_size=1,
+                rotation_config=RotationConfig.size(1),
             ),
         ),
     )
@@ -470,6 +499,93 @@ def test_node_streams_output_to_new_or_replaced_directory(
         assert len(quote_files) == 3
     finally:
         node.dispose()
+
+
+def test_engine_reset_reopens_streaming_writer(tmp_path: Path) -> None:
+    """
+    Test a reset engine streams the rows of its next run.
+    """
+    instance_id = UUID4()
+    output_path = tmp_path / "output"
+    instrument = TestInstrumentProvider.ethusdt_binance()
+    quotes = _whipsaw_quotes(instrument, count=3)
+    engine = BacktestEngine(
+        BacktestEngineConfig(
+            bypass_logging=True,
+            run_analysis=False,
+            instance_id=instance_id,
+            streaming=StreamingConfig(writer_path=str(output_path), flush_interval_ms=1),
+        ),
+    )
+    engine.add_venue(
+        venue=Venue("BINANCE"),
+        oms_type=OmsType.NETTING,
+        account_type=AccountType.MARGIN,
+        starting_balances=[Money.from_str("1_000_000 USDT")],
+        book_type=BookType.L1_MBP,
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
+    )
+    engine.add_instrument(instrument)
+    engine.add_data(quotes)
+
+    try:
+        engine.run()
+        engine.reset()
+        engine.run()
+        streamed = ParquetDataCatalog(str(output_path)).read_backtest(str(instance_id))
+
+        assert streamed == [quote for quote in quotes for _ in range(2)]
+    finally:
+        engine.dispose()
+
+
+def test_engine_streaming_promotes_into_separate_catalog(tmp_path: Path) -> None:
+    """
+    Test streaming stages under the writer path and promotes into the catalog.
+    """
+    instance_id = UUID4()
+    writer_path = tmp_path / "stream"
+    catalog_path = tmp_path / "catalog"
+    instrument = TestInstrumentProvider.ethusdt_binance()
+    quotes = _whipsaw_quotes(instrument, count=3)
+    engine = BacktestEngine(
+        BacktestEngineConfig(
+            bypass_logging=True,
+            run_analysis=False,
+            instance_id=instance_id,
+            streaming=StreamingConfig(
+                writer_path=str(writer_path),
+                catalog=DataCatalogConfig(path=str(catalog_path)),
+                data_types=[NautilusDataType.QuoteTick],
+            ),
+        ),
+    )
+    engine.add_venue(
+        venue=Venue("BINANCE"),
+        oms_type=OmsType.NETTING,
+        account_type=AccountType.MARGIN,
+        starting_balances=[Money.from_str("1_000_000 USDT")],
+        book_type=BookType.L1_MBP,
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
+    )
+    engine.add_instrument(instrument)
+    engine.add_data(quotes)
+
+    try:
+        engine.run()
+        promoted = ParquetDataCatalog(str(catalog_path)).query_quote_ticks()
+
+        assert promoted == quotes
+        assert (writer_path / "backtest" / str(instance_id) / "quotes").is_dir()
+        assert not (catalog_path / "backtest").exists()
+    finally:
+        engine.dispose()
 
 
 def test_node_builds_with_configured_catalog(tmp_path: Path) -> None:
@@ -533,6 +649,66 @@ def test_node_rejects_duplicate_configured_catalog_names(tmp_path: Path) -> None
         )
 
 
+@pytest.mark.parametrize("raise_exception", [True, False])
+def test_node_run_fails_when_fill_cost_exceeds_cash_balance(
+    tmp_path: Path,
+    raise_exception: bool,
+) -> None:
+    """
+    Test a fill the cash account cannot pay for fails the run per the error policy.
+    """
+    instrument = TestInstrumentProvider.aapl_equity()
+    catalog = ParquetDataCatalog(str(tmp_path))
+    catalog.write_instruments([instrument])
+    catalog.write_quote_ticks(
+        [
+            TestDataProviderPyo3.quote_tick(
+                instrument_id=instrument.id,
+                bid_price="99.99",
+                ask_price="100.00",
+                bid_size="250",
+                ask_size="250",
+            ),
+        ],
+    )
+    venue = BacktestVenueConfig(
+        name="XNAS",
+        oms_type="NETTING",
+        account_type="CASH",
+        starting_balances=["250_001 USD"],
+        book_type="L1_MBP",
+        fee_model=MakerTakerFeeModel(maker_rate=Decimal(0), taker_rate=Decimal(0)),
+    )
+    data = BacktestDataConfig(
+        data_type=NautilusDataType.QuoteTick,
+        catalog=DataCatalogConfig(path=str(tmp_path)),
+        instrument_id=instrument.id,
+    )
+    config = BacktestRunConfig(
+        venues=[venue],
+        data=[data],
+        engine=BacktestEngineConfig(bypass_logging=True, run_analysis=False),
+        raise_exception=raise_exception,
+    )
+    node = BacktestNode([config])
+    node.build()
+    node.add_strategy(
+        config.id,
+        StreamingWhipsaw(
+            StreamingWhipsawConfig(instrument_id=str(instrument.id), trade_size="2500"),
+        ),
+    )
+
+    try:
+        if raise_exception:
+            with pytest.raises(RuntimeError, match=r"balance would become negative: -21\.50 USD"):
+                node.run()
+        else:
+            assert node.run() == []
+    finally:
+        node.dispose()
+
+
 def test_node_exposes_builtin_strategy_registration() -> None:
     """
     Test node exposes builtin strategy registration.
@@ -558,10 +734,14 @@ def test_node_venue_mismatch_raises() -> None:
         account_type=AccountType.MARGIN,
         book_type=BookType.L1_MBP,
         starting_balances=["1_000_000 USD"],
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
     )
     data = BacktestDataConfig(
         data_type=NautilusDataType.QuoteTick,
-        catalog_path="/data/catalog",
+        catalog=DataCatalogConfig(path="/data/catalog"),
         instrument_id=InstrumentId.from_str("BTC/USDT.BINANCE"),
     )
     config = BacktestRunConfig(venues=[venue], data=[data])
@@ -579,10 +759,14 @@ def test_node_repr() -> None:
         account_type=AccountType.MARGIN,
         book_type=BookType.L1_MBP,
         starting_balances=["1_000_000 USD"],
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
     )
     data = BacktestDataConfig(
         data_type=NautilusDataType.QuoteTick,
-        catalog_path="/data/catalog",
+        catalog=DataCatalogConfig(path="/data/catalog"),
         instrument_id=InstrumentId.from_str("EUR/USD.SIM"),
     )
     config = BacktestRunConfig(venues=[venue], data=[data])
@@ -600,10 +784,14 @@ def test_node_dispose() -> None:
         account_type=AccountType.MARGIN,
         book_type=BookType.L1_MBP,
         starting_balances=["1_000_000 USD"],
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
     )
     data = BacktestDataConfig(
         data_type=NautilusDataType.QuoteTick,
-        catalog_path="/data/catalog",
+        catalog=DataCatalogConfig(path="/data/catalog"),
         instrument_id=InstrumentId.from_str("EUR/USD.SIM"),
     )
     config = BacktestRunConfig(venues=[venue], data=[data])
@@ -636,6 +824,10 @@ def test_node_post_run_inspection_unknown_config_raises(
         account_type=AccountType.MARGIN,
         book_type=BookType.L1_MBP,
         starting_balances=["1_000_000 USD"],
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
     )
     config = BacktestRunConfig(venues=[venue], data=[])
     node = BacktestNode([config])
@@ -665,10 +857,14 @@ def test_node_missing_engine_explains_build_requirement(
         account_type=AccountType.MARGIN,
         book_type=BookType.L1_MBP,
         starting_balances=["1_000_000 USD"],
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
     )
     data = BacktestDataConfig(
         data_type=NautilusDataType.QuoteTick,
-        catalog_path=str(tmp_path),
+        catalog=DataCatalogConfig(path=str(tmp_path)),
         instrument_id=InstrumentId.from_str("AAA.SIM"),
     )
     config = BacktestRunConfig(
@@ -861,10 +1057,14 @@ def _build_component_node(
         account_type="MARGIN",
         starting_balances=["1_000_000 USDT"],
         book_type="L1_MBP",
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
     )
     data = BacktestDataConfig(
         data_type=NautilusDataType.QuoteTick,
-        catalog_path=str(catalog_path),
+        catalog=DataCatalogConfig(path=str(catalog_path)),
         instrument_id=instrument.id,
     )
     config = BacktestRunConfig(
@@ -891,10 +1091,14 @@ def _build_ema_cross_node(
         account_type=AccountType.MARGIN,
         book_type=BookType.L1_MBP,
         starting_balances=["1_000_000 USDT"],
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
     )
     data = BacktestDataConfig(
         data_type=NautilusDataType.QuoteTick,
-        catalog_path=catalog_path,
+        catalog=DataCatalogConfig(path=catalog_path),
         instrument_id=instrument.id,
     )
     config = BacktestRunConfig(

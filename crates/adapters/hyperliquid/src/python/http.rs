@@ -76,7 +76,7 @@ impl HyperliquidHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns `Error.Auth` if required environment variables are not set.
+    /// Returns an error if required environment variables are not set.
     #[staticmethod]
     #[pyo3(name = "from_env", signature = (environment=HyperliquidEnvironment::Mainnet, include_builder_attribution=true))]
     fn py_from_env(
@@ -92,7 +92,7 @@ impl HyperliquidHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns `Error.Auth` if the private key is invalid or cannot be parsed.
+    /// Returns an error if the private key is invalid or cannot be parsed.
     #[staticmethod]
     #[pyo3(name = "from_credentials", signature = (private_key, vault_address=None, environment=HyperliquidEnvironment::Mainnet, timeout_secs=60, proxy_url=None, include_builder_attribution=true))]
     fn py_from_credentials(
@@ -144,7 +144,7 @@ impl HyperliquidHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns `Error.Auth` if the client has no signer configured.
+    /// Returns an error if the client has no signer configured.
     #[pyo3(name = "get_user_address")]
     fn py_get_user_address(&self) -> PyResult<String> {
         self.get_user_address().map_err(to_pyvalue_err)
@@ -739,17 +739,22 @@ impl HyperliquidHttpClient {
 
     /// Request account state (balances and margins) for a user.
     ///
-    /// Fetches perp and spot clearinghouse state from Hyperliquid and merges them
-    /// into a single `AccountState`. USDC comes from the perp margin summary only
-    /// when that summary reflects non-zero collateral, margin used, or withdrawable
-    /// balance; if the summary is absent or zeroed, spot USDC is used instead. Non-USDC
-    /// tokens are always appended from the spot balances.
+    /// Fetches perp and spot clearinghouse state and the account abstraction mode from
+    /// Hyperliquid and merges them into a single `AccountState`. For unified and portfolio
+    /// margin accounts, balances come from the spot state alone and spot USDC `hold` is the
+    /// account-wide margin. Otherwise USDC comes from the perp margin summary only when that
+    /// summary reflects non-zero collateral, margin used, or withdrawable balance; if the
+    /// summary is absent or zeroed, spot USDC is used instead. Non-USDC tokens are always
+    /// appended from the spot balances. Spot tokens the venue lists at zero are reported at
+    /// zero, and USDC is reported at zero when there is no USDC balance, so a previous balance
+    /// is cleared. On accounts without spot collateral this needs a perp summary in the response.
     ///
     /// # Errors
     ///
-    /// Returns an error if `account_id` is not set, or if either the perp or
-    /// spot clearinghouse request fails. Spot failures are propagated so the
-    /// caller sees real API errors instead of a silently truncated snapshot.
+    /// Returns an error if `account_id` is not set, or if the perp clearinghouse, spot
+    /// clearinghouse, or user abstraction request fails. Spot and abstraction failures are
+    /// propagated so the caller sees real API errors instead of a silently truncated or
+    /// misread snapshot.
     #[pyo3(name = "request_account_state")]
     fn py_request_account_state<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
@@ -872,10 +877,40 @@ impl HyperliquidHttpClient {
         })
     }
 
+    /// Arms, replaces, or clears the account-wide scheduled cancellation of all open orders.
+    ///
+    /// `time` is a Unix timestamp in milliseconds, at least five seconds after the local
+    /// clock when called. `None` clears the schedule. Allow extra time for rate limiting,
+    /// network latency, and clock skew. The venue can still reject a delayed request.
+    /// The schedule remains at the venue after disconnect or process exit; this method
+    /// does not start a refresh loop or close positions.
+    /// Convert Nautilus nanosecond timestamps to milliseconds before passing them here.
+    /// The venue requires $1,000,000 trading volume and permits at most ten schedule triggers
+    /// per day, resetting the trigger count at 00:00 UTC.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The timestamp is less than five seconds ahead of the local clock.
+    /// - Credentials are missing or the request fails.
+    /// - The venue rejects the action or returns an unexpected acknowledgement.
+    #[pyo3(name = "schedule_cancel", signature = (time=None))]
+    fn py_schedule_cancel<'py>(
+        &self,
+        py: Python<'py>,
+        time: Option<u64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client.schedule_cancel(time).await.map_err(to_pyvalue_err)?;
+            Ok(Python::attach(|py| py.None()))
+        })
+    }
+
     /// Split an HIP-4 outcome's quote tokens into matched Yes and No side tokens.
     ///
     /// Submits a `userOutcome` exchange action with the `splitOutcome` operation:
-    /// debits `amount` quote tokens (USDH) and credits `amount` Yes plus `amount`
+    /// debits `amount` quote tokens and credits `amount` Yes plus `amount`
     /// No side tokens for the given `outcome` index. Ordinary directional
     /// buys and sells on outcome instruments go through the standard order path
     /// without calling this; the action is for dual-side market making and

@@ -49,7 +49,7 @@ pub(super) const GROUP_HEADER_16_LENGTH: usize = 4;
 const VAR_STRING16_MAX_LEN: usize = (u16::MAX - 1) as usize;
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct MessageHeader {
+pub(in crate::sbe) struct MessageHeader {
     pub block_length: u16,
     pub template_id: u16,
     pub schema_id: u16,
@@ -132,7 +132,8 @@ pub(super) fn decode_price(cursor: &mut SbeCursor<'_>) -> Result<Price, SbeDecod
     let raw: PriceRaw =
         wire_to_raw(raw_i128).ok_or(SbeDecodeError::NumericOverflow { type_name: "Price" })?;
 
-    Ok(Price::from_raw(raw, precision))
+    Price::from_raw_checked(raw, precision)
+        .map_err(|_| SbeDecodeError::InvalidValue { field: "Price" })
 }
 
 #[inline]
@@ -153,7 +154,8 @@ pub(super) fn decode_quantity(cursor: &mut SbeCursor<'_>) -> Result<Quantity, Sb
         type_name: "Quantity",
     })?;
 
-    Ok(Quantity::from_raw(raw, precision))
+    Quantity::from_raw_checked(raw, precision)
+        .map_err(|_| SbeDecodeError::InvalidValue { field: "Quantity" })
 }
 
 #[inline]
@@ -440,6 +442,35 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    #[case(-1)]
+    #[case(1)]
+    fn test_decode_price_rejects_spurious_digits(#[case] raw: PriceRaw) {
+        let wire: i128 = raw_to_wire(raw);
+        let mut bytes = wire.to_le_bytes().to_vec();
+        bytes.push(0);
+        let mut cursor = SbeCursor::new(&bytes);
+
+        let result = decode_price(&mut cursor);
+
+        assert_eq!(result, Err(SbeDecodeError::InvalidValue { field: "Price" }));
+    }
+
+    #[rstest]
+    fn test_decode_quantity_rejects_spurious_digits() {
+        let wire: u128 = raw_to_wire(QuantityRaw::from(1_u8));
+        let mut bytes = wire.to_le_bytes().to_vec();
+        bytes.push(0);
+        let mut cursor = SbeCursor::new(&bytes);
+
+        let result = decode_quantity(&mut cursor);
+
+        assert_eq!(
+            result,
+            Err(SbeDecodeError::InvalidValue { field: "Quantity" })
+        );
+    }
 
     #[rstest]
     #[case(&[0, 0, 1, 0, b'X'], "InstrumentId.symbol")]

@@ -92,6 +92,66 @@ def test_parse_pyo3_items_tolerates_attribute_with_trailing_comment() -> None:
     assert items[0]["in_pymethods"] is True
 
 
+def test_parse_pyo3_items_keeps_doc_after_parameter_attribute() -> None:
+    """
+    Test parse pyo3 items keeps the doc of a function after a parameter attribute.
+    """
+    # Arrange: the parameter attribute must not swallow the next function's doc comment
+    lines = [
+        "#[pymethods]",
+        "impl PyCatalog {",
+        "    pub fn query(",
+        "        &mut self,",
+        '        #[gen_stub(override_type(type_repr = "model.NautilusDataType"))] data_type: &Bound<',
+        "            '_,",
+        "            PyAny,",
+        "        >,",
+        "    ) -> PyResult<()> {",
+        "        Ok(())",
+        "    }",
+        "}",
+        "",
+        "/// Reads a run.",
+        "#[pyfunction]",
+        "pub fn py_read_run() -> PyResult<()> {",
+        "    Ok(())",
+        "}",
+    ]
+
+    # Act
+    items = generate_docstrings.parse_pyo3_items(lines)
+
+    # Assert
+    assert items == [
+        {
+            "fn_name": "query",
+            "fn_line": 2,
+            "fn_signature": (
+                "pub fn query( &mut self, "
+                '#[gen_stub(override_type(type_repr = "model.NautilusDataType"))] data_type: &Bound< '
+                "'_, PyAny, >, ) -> PyResult<()> {"
+            ),
+            "impl_type": "PyCatalog",
+            "is_constructor": False,
+            "in_pymethods": True,
+            "doc_start": None,
+            "doc_end": None,
+            "insert_line": 2,
+        },
+        {
+            "fn_name": "py_read_run",
+            "fn_line": 15,
+            "fn_signature": "pub fn py_read_run() -> PyResult<()> {",
+            "impl_type": None,
+            "is_constructor": False,
+            "in_pymethods": False,
+            "doc_start": 13,
+            "doc_end": 13,
+            "insert_line": 13,
+        },
+    ]
+
+
 def test_parse_pyo3_items_captures_multiline_result_signature() -> None:
     """
     Test parse pyo3 items captures multiline result signature.
@@ -297,6 +357,126 @@ def test_process_crate_only_reports_traversal_when_verbose(
     assert verbose_output.err == ""
 
 
+@pytest.mark.parametrize("name", ["quote", "trade", "bar"])
+def test_process_crate_uses_indexed_cache_docs_for_shared_wrapper(
+    name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Distinguish indexed shared accessors from native latest reads.
+    """
+    monkeypatch.setattr(generate_docstrings, "ROOT", tmp_path)
+    src_dir = tmp_path / "crates" / "common" / "src"
+    python_dir = src_dir / "python"
+    python_dir.mkdir(parents=True)
+    (src_dir / "cache.rs").write_text(
+        f"""\
+impl Cache {{
+    /// Returns the latest {name}.
+    pub fn {name}(&self) {{}}
+    /// Returns the {name} at index, with index 0 most recent.
+    pub fn {name}_at_index(&self, index: usize) {{}}
+}}
+""",
+        encoding="utf-8",
+    )
+    binding_path = python_dir / "cache.rs"
+    binding_path.write_text(
+        f"""\
+#[pymethods]
+impl PyCache {{
+    fn py_{name}(&self, index: usize) {{}}
+}}
+#[pymethods]
+impl Cache {{
+    fn py_{name}(&self) {{}}
+}}
+""",
+        encoding="utf-8",
+    )
+
+    updates = generate_docstrings.process_crate("common", src_dir)
+    updated = binding_path.read_text(encoding="utf-8")
+    repeated_updates = generate_docstrings.process_crate("common", src_dir)
+
+    assert updates == 2
+    assert (
+        updated
+        == f"""\
+#[pymethods]
+impl PyCache {{
+    /// Returns the {name} at index, with index 0 most recent.
+    fn py_{name}(&self, index: usize) {{}}
+}}
+#[pymethods]
+impl Cache {{
+    /// Returns the latest {name}.
+    fn py_{name}(&self) {{}}
+}}
+"""
+    )
+    assert repeated_updates == 0
+    assert binding_path.read_text(encoding="utf-8") == updated
+
+
+def test_process_crate_copies_cache_history_docs_without_overwriting_other_wrappers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Copy history docs to PyCache while preserving unrelated wrapper documentation.
+    """
+    monkeypatch.setattr(generate_docstrings, "ROOT", tmp_path)
+    src_dir = tmp_path / "crates" / "common" / "src"
+    python_dir = src_dir / "python"
+    python_dir.mkdir(parents=True)
+    (src_dir / "cache.rs").write_text(
+        """\
+impl Cache {
+    /// Returns cached bars, newest first.
+    ///
+    /// Returns `None` if absent.
+    pub fn bars(&self) {}
+    /// Returns a native order reference.
+    pub fn order(&self) {}
+}
+""",
+        encoding="utf-8",
+    )
+    binding_path = python_dir / "cache.rs"
+    binding_path.write_text(
+        """\
+#[pymethods]
+impl PyCache {
+    fn py_bars(&self) {}
+    /// Returns a Python order snapshot.
+    fn py_order(&self) {}
+}
+""",
+        encoding="utf-8",
+    )
+
+    updates = generate_docstrings.process_crate("common", src_dir)
+    updated = binding_path.read_text(encoding="utf-8")
+
+    assert updates == 1
+    assert (
+        updated
+        == """\
+#[pymethods]
+impl PyCache {
+    /// Returns cached bars, newest first.
+    ///
+    /// Returns `None` if absent.
+    fn py_bars(&self) {}
+    /// Returns a Python order snapshot.
+    fn py_order(&self) {}
+}
+"""
+    )
+
+
 def test_collect_source_docs_attaches_doc_across_commented_attribute(tmp_path: Path) -> None:
     """
     Test collect source docs attaches doc across commented attribute.
@@ -324,3 +504,297 @@ pub struct Bar {}
     # Assert
     assert docs[(None, "Foo")] == ["Calculates the thing.", "", "More detail."]
     assert (None, "Bar") not in docs  # No doc comment on Bar
+
+
+def test_collect_source_docs_keeps_doc_after_parameter_attribute(tmp_path: Path) -> None:
+    """
+    Test collect source docs keeps the doc of an item after a parameter attribute.
+    """
+    # Arrange: the parameter attribute must not swallow the rest of the file
+    source = """\
+impl RetryManager {
+    /// Runs the operation.
+    pub fn run(
+        #[builder(start_fn)] operation_name: &str,
+    ) {
+    }
+}
+
+/// Creates the default retry manager.
+pub fn create_default_retry_manager() {}
+"""
+    (tmp_path / "lib.rs").write_text(source, encoding="utf-8")
+
+    # Act
+    docs = generate_docstrings.collect_source_docs(tmp_path)
+
+    # Assert
+    assert docs == {
+        ("RetryManager", "run"): ["Runs the operation."],
+        (None, "create_default_retry_manager"): ["Creates the default retry manager."],
+    }
+
+
+def test_process_crate_syncs_fields_forwarded_methods_and_enum_variants(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Sync wrapper docs from their inner type, including later source changes.
+    """
+    monkeypatch.setattr(generate_docstrings, "ROOT", tmp_path)
+    monkeypatch.setitem(generate_docstrings.TYPE_DOC_SOURCES, "PyFeed", "Feed")
+    monkeypatch.setitem(generate_docstrings.TYPE_DOC_SOURCES, "PyStatus", "Status")
+    src_dir = tmp_path / "crates" / "feed" / "src"
+    python_dir = src_dir / "python"
+    python_dir.mkdir(parents=True)
+    source = src_dir / "lib.rs"
+    source.write_text(
+        """\
+/// Provider response.
+pub struct Feed {
+    /// Maximum returned records.
+    #[serde(default)]
+    pub count: u64,
+}
+
+pub enum Status {
+    /// Feed accepts requests.
+    Ready,
+}
+
+impl Feed {
+    /// Retrieves the latest response.
+    pub fn latest(&self) {}
+}
+""",
+        encoding="utf-8",
+    )
+    binding = python_dir / "feed.rs"
+    binding.write_text(
+        """\
+pub struct PyFeed {
+    inner: Feed,
+}
+
+pub enum PyStatus {
+    /// Outdated variant description.
+    Ready,
+}
+
+impl From<Status> for PyStatus {
+    fn from(value: Status) -> Self { todo!() }
+}
+
+#[pymethods]
+impl PyFeed {
+    #[getter(count)]
+    fn py_count(&self) -> u64 { self.inner.count }
+
+    fn latest(&self) { self.inner.latest() }
+}
+
+fn latest() {}
+""",
+        encoding="utf-8",
+    )
+
+    updates = generate_docstrings.process_crate("feed", src_dir)
+    first = binding.read_text(encoding="utf-8")
+    repeated = generate_docstrings.process_crate("feed", src_dir)
+    source.write_text(
+        source.read_text(encoding="utf-8").replace("Maximum returned", "Maximum retained"),
+        encoding="utf-8",
+    )
+    refreshed = generate_docstrings.process_crate("feed", src_dir)
+    final = binding.read_text(encoding="utf-8")
+
+    assert updates == 3
+    assert repeated == 0
+    assert refreshed == 1
+    assert "    /// Maximum returned records.\n    #[getter(count)]" in first
+    assert "    /// Feed accepts requests.\n    Ready," in first
+    assert "    /// Retrieves the latest response.\n    fn latest(&self)" in first
+    assert first.endswith("\nfn latest() {}\n")
+    assert "Outdated variant description." not in first
+    assert final == first.replace("Maximum returned", "Maximum retained")
+
+
+def test_process_crate_reads_qualified_dependency_field_docs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Use the dependency field docs selected by an existing wrapper alias.
+    """
+    monkeypatch.setattr(generate_docstrings, "ROOT", tmp_path)
+    monkeypatch.setattr(generate_docstrings, "CRATES_DIR", tmp_path / "crates")
+    src_dir = tmp_path / "crates" / "finfeed" / "src"
+    python_dir = src_dir / "python"
+    python_dir.mkdir(parents=True)
+    dependency = tmp_path / "crates" / "network" / "src"
+    dependency.mkdir(parents=True)
+    (dependency / "retry.rs").write_text(
+        """\
+pub struct RetryConfig {
+    /// Retry attempts after the initial request.
+    pub max_retries: u32,
+}
+""",
+        encoding="utf-8",
+    )
+    binding = python_dir / "config.rs"
+    binding.write_text(
+        """\
+#[pymethods]
+impl FinFeedDataClientConfig {
+    #[getter]
+    fn max_retries(&self) -> u32 { self.http.retry.max_retries }
+}
+""",
+        encoding="utf-8",
+    )
+
+    updates = generate_docstrings.process_crate("finfeed", src_dir)
+
+    assert updates == 1
+    assert binding.read_text(encoding="utf-8") == (
+        "#[pymethods]\n"
+        "impl FinFeedDataClientConfig {\n"
+        "    /// Retry attempts after the initial request.\n"
+        "    #[getter]\n"
+        "    fn max_retries(&self) -> u32 { self.http.retry.max_retries }\n"
+        "}\n"
+    )
+
+
+@pytest.mark.parametrize("name", ["retry_operation_timeout_ms", "retry_max_elapsed_ms"])
+def test_finfeed_deadline_docs_preserve_required_timeouts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+) -> None:
+    """
+    Use required FinFeed deadline docs instead of generic optional timeouts.
+    """
+    root = Path(__file__).resolve().parents[3]
+    monkeypatch.setattr(generate_docstrings, "ROOT", tmp_path)
+    monkeypatch.setattr(generate_docstrings, "CRATES_DIR", tmp_path / "crates")
+    for relative in ["adapters/finfeed/src/http/client.rs", "network/src/retry.rs"]:
+        destination = tmp_path / "crates" / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(
+            (root / "crates" / relative).read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+    src_dir = tmp_path / "crates" / "adapters" / "finfeed" / "src"
+    python_dir = src_dir / "python"
+    python_dir.mkdir()
+    binding = python_dir / "config.rs"
+    binding.write_text(
+        "#[pymethods]\nimpl FinFeedDataClientConfig {\n"
+        f"    #[getter]\n    fn {name}(&self) -> Option<u64> {{ None }}\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    written = generate_docstrings.process_crate("finfeed", src_dir)
+    result = binding.read_text(encoding="utf-8")
+
+    assert written == 1
+    assert (
+        "/// Retry policy with required per-operation and total elapsed deadlines, in milliseconds."
+        in result
+    )
+    assert (
+        "/// Both include local admission waits; the total deadline also covers retries and backoff."
+        in result
+    )
+    assert (
+        "/// Deadlines must be positive and at most one day. Python `None` retains defaults;"
+        in result
+    )
+    assert "/// a Rust `None` deadline fails client validation." in result
+    assert "`None` disables" not in result
+
+
+def test_process_crate_syncs_enum_only_module_without_writing_in_dry_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Copy enum variant docs even when the module contains no methods.
+    """
+    monkeypatch.setattr(generate_docstrings, "ROOT", tmp_path)
+    monkeypatch.setitem(generate_docstrings.TYPE_DOC_SOURCES, "PyStatus", "Status")
+    python_dir = tmp_path / "python"
+    python_dir.mkdir()
+    (tmp_path / "lib.rs").write_text(
+        "pub enum Status {\n    /// Unrecognized source label.\n    Unknown,\n}\n",
+        encoding="utf-8",
+    )
+    binding = python_dir / "status.rs"
+    original = "pub enum PyStatus {\n    Unknown,\n}\n"
+    binding.write_text(original, encoding="utf-8")
+
+    planned = generate_docstrings.process_crate("feed", tmp_path, dry_run=True)
+    after_dry_run = binding.read_text(encoding="utf-8")
+    written = generate_docstrings.process_crate("feed", tmp_path)
+
+    assert planned == 1
+    assert after_dry_run == original
+    assert written == 1
+    assert binding.read_text(encoding="utf-8") == (
+        "pub enum PyStatus {\n    /// Unrecognized source label.\n    Unknown,\n}\n"
+    )
+
+
+def test_process_crate_preserves_predicate_method_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Keep predicate method docs distinct from optional-field presence getters.
+    """
+    monkeypatch.setattr(generate_docstrings, "ROOT", tmp_path)
+    python_dir = tmp_path / "python"
+    python_dir.mkdir()
+    (tmp_path / "lib.rs").write_text(
+        """\
+impl Cache {
+    /// Returns whether quotes exist for the requested instrument.
+    pub fn has_quotes(&self, instrument: InstrumentId) -> bool { todo!() }
+}
+
+pub struct FinFeedDataClientConfig {
+    /// Optional explicit credential.
+    pub api_key: Option<SecretString>,
+}
+""",
+        encoding="utf-8",
+    )
+    binding = python_dir / "cache.rs"
+    binding.write_text(
+        """\
+#[pymethods]
+impl Cache {
+    fn py_has_quotes(&self, instrument: InstrumentId) -> bool { todo!() }
+}
+
+#[pymethods]
+impl FinFeedDataClientConfig {
+    #[getter]
+    fn has_api_key(&self) -> bool { self.api_key.is_some() }
+}
+""",
+        encoding="utf-8",
+    )
+
+    written = generate_docstrings.process_crate("feed", tmp_path)
+    repeated = generate_docstrings.process_crate("feed", tmp_path)
+    result = binding.read_text(encoding="utf-8")
+
+    assert written == 2
+    assert repeated == 0
+    assert "    /// Returns whether quotes exist for the requested instrument.\n" in result
+    assert "    /// Returns whether `api_key` is set.\n    #[getter]\n" in result

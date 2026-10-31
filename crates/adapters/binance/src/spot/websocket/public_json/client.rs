@@ -31,6 +31,7 @@ use nautilus_live::{
 };
 use nautilus_model::instruments::{Instrument, InstrumentAny};
 use nautilus_network::{
+    ConnectionUrl,
     http::create_standard_nautilus_headers,
     mode::ConnectionMode,
     websocket::{
@@ -71,7 +72,7 @@ struct ConnectionSlot {
 /// Binance Spot public JSON WebSocket client.
 #[derive(Clone)]
 pub struct BinanceSpotPublicJsonWebSocketClient {
-    url: String,
+    url: ConnectionUrl,
     heartbeat: Option<u64>,
     signal: Arc<AtomicBool>,
     slots: Arc<ConnectionSlots>,
@@ -115,7 +116,7 @@ impl BinanceSpotPublicJsonWebSocketClient {
         );
 
         Self {
-            url,
+            url: url.into(),
             heartbeat,
             signal: Arc::new(AtomicBool::new(false)),
             slots: Arc::new(ConnectionSlots(Mutex::new(Vec::new()))),
@@ -213,7 +214,7 @@ impl BinanceSpotPublicJsonWebSocketClient {
 
         log::debug!(
             "Connected to Binance Spot public JSON stream pool: url={}",
-            self.url
+            self.url.origin()
         );
         Ok(())
     }
@@ -358,7 +359,7 @@ impl BinanceSpotPublicJsonWebSocketClient {
             log::debug!(
                 "Spot JSON pool slot {} connected: url={}",
                 slot_count - 1,
-                self.url
+                self.url.origin()
             );
         }
 
@@ -505,7 +506,7 @@ impl BinanceSpotPublicJsonWebSocketClient {
         let headers = create_standard_nautilus_headers();
 
         let config = WebSocketConfig {
-            url: self.url.clone(),
+            url: self.url.expose().to_owned(),
             headers,
             heartbeat_interval_secs: self.heartbeat,
             heartbeat_payload: None,
@@ -517,11 +518,14 @@ impl BinanceSpotPublicJsonWebSocketClient {
             reconnect_max_attempts: None,
             heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
+            writer_capacity: None,
             backend: self.transport_backend,
             proxy_url: self
                 .proxy_url
                 .as_ref()
                 .map(|value| value.expose_secret().to_owned()),
+            max_message_size_bytes: None,
+            max_frame_size_bytes: None,
         };
 
         let keyed_quotas = vec![(

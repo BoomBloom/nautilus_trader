@@ -130,7 +130,7 @@ impl OptionChainManager {
             msgbus_priority,
             bootstrapped,
             deferred_cmd_queue,
-            clock: clock.clone(),
+            clock: Rc::clone(clock),
             client_id,
             raw_mode,
         };
@@ -250,7 +250,7 @@ impl OptionChainManager {
 
         for instrument_id in instrument_ids {
             client.execute_subscribe_intent(SubscribeCommand::Quotes(SubscribeQuotes {
-                instrument_id: *instrument_id,
+                instrument_ids: vec![*instrument_id],
                 client_id: cmd.client_id,
                 venue: Some(venue),
                 command_id: UUID4::new(),
@@ -260,7 +260,7 @@ impl OptionChainManager {
             }));
             client.execute_subscribe_intent(SubscribeCommand::OptionGreeks(
                 SubscribeOptionGreeks {
-                    instrument_id: *instrument_id,
+                    instrument_ids: vec![*instrument_id],
                     client_id: cmd.client_id,
                     venue: Some(venue),
                     command_id: UUID4::new(),
@@ -271,7 +271,7 @@ impl OptionChainManager {
             ));
             client.execute_subscribe_intent(SubscribeCommand::InstrumentStatus(
                 SubscribeInstrumentStatus {
-                    instrument_id: *instrument_id,
+                    instrument_ids: vec![*instrument_id],
                     client_id: cmd.client_id,
                     venue: Some(venue),
                     command_id: UUID4::new(),
@@ -529,8 +529,8 @@ impl OptionChainManager {
 
     /// Adds a dynamically discovered instrument to this option chain.
     ///
-    /// Registers msgbus handlers when the instrument falls in the active
-    /// range and forwards wire-level subscriptions via `client`.
+    /// Registers msgbus handlers and forwards wire-level subscriptions via
+    /// `client` when the instrument falls in the active range.
     /// Returns `true` if the instrument was newly inserted.
     pub fn add_instrument(
         &mut self,
@@ -546,10 +546,9 @@ impl OptionChainManager {
 
         if self.aggregator.active_ids().contains(&instrument_id) {
             self.register_handlers_for_instrument(instrument_id);
+            let venue = self.aggregator.series_id().venue;
+            Self::forward_instrument_subscriptions(client, instrument_id, venue, clock);
         }
-
-        let venue = self.aggregator.series_id().venue;
-        Self::forward_instrument_subscriptions(client, instrument_id, venue, clock);
 
         log::info!(
             "Added instrument {instrument_id} to option chain {} (active={})",
@@ -579,7 +578,7 @@ impl OptionChainManager {
         let mut queue = self.deferred_cmd_queue.borrow_mut();
         queue.push_back(DeferredCommand::Subscribe(SubscribeCommand::Quotes(
             SubscribeQuotes {
-                instrument_id,
+                instrument_ids: vec![instrument_id],
                 client_id: self.client_id,
                 venue: Some(venue),
                 command_id: UUID4::new(),
@@ -590,7 +589,7 @@ impl OptionChainManager {
         )));
         queue.push_back(DeferredCommand::Subscribe(SubscribeCommand::OptionGreeks(
             SubscribeOptionGreeks {
-                instrument_id,
+                instrument_ids: vec![instrument_id],
                 client_id: self.client_id,
                 venue: Some(venue),
                 command_id: UUID4::new(),
@@ -601,7 +600,7 @@ impl OptionChainManager {
         )));
         queue.push_back(DeferredCommand::Subscribe(
             SubscribeCommand::InstrumentStatus(SubscribeInstrumentStatus {
-                instrument_id,
+                instrument_ids: vec![instrument_id],
                 client_id: self.client_id,
                 venue: Some(venue),
                 command_id: UUID4::new(),
@@ -619,7 +618,7 @@ impl OptionChainManager {
         let mut queue = self.deferred_cmd_queue.borrow_mut();
         queue.push_back(DeferredCommand::Unsubscribe(UnsubscribeCommand::Quotes(
             UnsubscribeQuotes {
-                instrument_id,
+                instrument_ids: vec![instrument_id],
                 client_id: self.client_id,
                 venue: Some(venue),
                 command_id: UUID4::new(),
@@ -630,7 +629,7 @@ impl OptionChainManager {
         )));
         queue.push_back(DeferredCommand::Unsubscribe(
             UnsubscribeCommand::OptionGreeks(UnsubscribeOptionGreeks {
-                instrument_id,
+                instrument_ids: vec![instrument_id],
                 client_id: self.client_id,
                 venue: Some(venue),
                 command_id: UUID4::new(),
@@ -641,7 +640,7 @@ impl OptionChainManager {
         ));
         queue.push_back(DeferredCommand::Unsubscribe(
             UnsubscribeCommand::InstrumentStatus(UnsubscribeInstrumentStatus {
-                instrument_id,
+                instrument_ids: vec![instrument_id],
                 client_id: self.client_id,
                 venue: Some(venue),
                 command_id: UUID4::new(),
@@ -669,7 +668,7 @@ impl OptionChainManager {
         let ts_init = clock.borrow().timestamp_ns();
 
         client.execute_subscribe_intent(SubscribeCommand::Quotes(SubscribeQuotes {
-            instrument_id,
+            instrument_ids: vec![instrument_id],
             client_id: None,
             venue: Some(venue),
             command_id: UUID4::new(),
@@ -678,7 +677,7 @@ impl OptionChainManager {
             params: None,
         }));
         client.execute_subscribe_intent(SubscribeCommand::OptionGreeks(SubscribeOptionGreeks {
-            instrument_id,
+            instrument_ids: vec![instrument_id],
             client_id: None,
             venue: Some(venue),
             command_id: UUID4::new(),
@@ -688,7 +687,7 @@ impl OptionChainManager {
         }));
         client.execute_subscribe_intent(SubscribeCommand::InstrumentStatus(
             SubscribeInstrumentStatus {
-                instrument_id,
+                instrument_ids: vec![instrument_id],
                 client_id: None,
                 venue: Some(venue),
                 command_id: UUID4::new(),
@@ -841,7 +840,7 @@ mod tests {
     use super::*;
 
     fn make_series_id() -> OptionSeriesId {
-        OptionSeriesId::new(
+        OptionSeriesId::new_derived(
             Venue::new("DERIBIT"),
             ustr::Ustr::from("BTC"),
             ustr::Ustr::from("BTC"),
@@ -874,7 +873,7 @@ mod tests {
             timer_name: None,
             msgbus_priority: 0,
             bootstrapped: true,
-            deferred_cmd_queue: queue.clone(),
+            deferred_cmd_queue: Rc::clone(&queue),
             clock,
             client_id: None,
             raw_mode: false,
@@ -951,7 +950,7 @@ mod tests {
             timer_name: None,
             msgbus_priority: 0,
             bootstrapped: false,
-            deferred_cmd_queue: queue.clone(),
+            deferred_cmd_queue: Rc::clone(&queue),
             clock,
             client_id: None,
             raw_mode: false,

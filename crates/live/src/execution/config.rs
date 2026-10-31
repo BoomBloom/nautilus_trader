@@ -51,7 +51,6 @@ pub struct ExecutionManagerConfig {
     /// Maximum number of retries for inflight checks.
     pub inflight_max_retries: u32,
     /// Policy when a submitted order exhausts automatic recovery.
-    /// Reserved for future use; the runtime currently resolves locally for both variants.
     pub submission_recovery_policy: SubmissionRecoveryPolicy,
     /// The lookback minutes for open order checks.
     pub open_check_lookback_mins: Option<u64>,
@@ -77,7 +76,8 @@ pub struct ExecutionManagerConfig {
     pub purge_closed_positions_buffer_mins: Option<u32>,
     /// The time buffer (minutes) before account events can be purged.
     pub purge_account_events_lookback_mins: Option<u32>,
-    /// If purge operations should also delete from the backing database.
+    /// If purging also deletes orders and positions from the backing database.
+    /// Redis and PostgreSQL retain persisted account events for replay.
     pub purge_from_database: bool,
 }
 
@@ -116,8 +116,8 @@ impl ExecutionManagerConfig {
     ///
     /// # Errors
     ///
-    /// Returns a [`ConfigError`] (a [`ConfigError::Multiple`] when more than one field is
-    /// invalid) if any field fails validation.
+    /// Returns an error if any field fails validation. Multiple validation failures are collected
+    /// into one error.
     pub fn validate(&self) -> ConfigResult<()> {
         let mut errors = ConfigErrorCollector::with_capacity(3);
 

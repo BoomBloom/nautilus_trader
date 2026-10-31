@@ -15,7 +15,8 @@
 
 //! Python bindings for Betfair configuration.
 
-use nautilus_core::string::secret::SecretString;
+use nautilus_core::{python::to_pyvalue_err, string::secret::SecretString};
+use nautilus_live::book::DEFAULT_BOOK_SNAPSHOT_TIMEOUT_SECS;
 use nautilus_model::identifiers::AccountId;
 use pyo3::prelude::*;
 use rust_decimal::Decimal;
@@ -58,6 +59,8 @@ impl BetfairDataClientConfig {
         subscription_delay_secs = None,
         subscribe_race_data = false,
         subscribe_cricket_data = false,
+        book_snapshot_timeout_secs = None,
+        certs_dir = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -87,8 +90,10 @@ impl BetfairDataClientConfig {
         subscription_delay_secs: Option<u64>,
         subscribe_race_data: bool,
         subscribe_cricket_data: bool,
-    ) -> Self {
-        Self {
+        book_snapshot_timeout_secs: Option<u64>,
+        certs_dir: Option<String>,
+    ) -> PyResult<Self> {
+        let config = Self {
             account_currency: account_currency.unwrap_or_else(|| "GBP".to_string()),
             username: username.map(SecretString::from),
             password: password.map(SecretString::from),
@@ -115,7 +120,13 @@ impl BetfairDataClientConfig {
             subscription_delay_secs: subscription_delay_secs.unwrap_or(3),
             subscribe_race_data,
             subscribe_cricket_data,
-        }
+            book_snapshot_timeout_secs: book_snapshot_timeout_secs
+                .unwrap_or(DEFAULT_BOOK_SNAPSHOT_TIMEOUT_SECS),
+            certs_dir,
+        };
+
+        config.validate().map_err(to_pyvalue_err)?;
+        Ok(config)
     }
 
     /// Returns the username.
@@ -163,6 +174,7 @@ impl BetfairExecutionClientConfig {
         reconcile_market_ids = None,
         use_market_version = false,
         stream_gap_recovery_lookback_mins = 10,
+        certs_dir = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -189,8 +201,9 @@ impl BetfairExecutionClientConfig {
         reconcile_market_ids: Option<Vec<String>>,
         use_market_version: bool,
         stream_gap_recovery_lookback_mins: u64,
-    ) -> Self {
-        Self {
+        certs_dir: Option<String>,
+    ) -> PyResult<Self> {
+        let config = Self {
             account_id: account_id.unwrap_or_else(|| AccountId::from("BETFAIR-001")),
             account_currency: account_currency.unwrap_or_else(|| "GBP".to_string()),
             username: username.map(SecretString::from),
@@ -214,7 +227,11 @@ impl BetfairExecutionClientConfig {
             reconcile_market_ids,
             use_market_version,
             stream_gap_recovery_lookback_mins,
-        }
+            certs_dir,
+        };
+
+        config.validate().map_err(to_pyvalue_err)?;
+        Ok(config)
     }
 
     /// Returns the username.

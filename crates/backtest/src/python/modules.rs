@@ -206,8 +206,7 @@ impl PySimulationModuleContext {
 #[pyclass(
     module = "nautilus_trader.backtest",
     name = "AccountAdjustmentOutcome",
-    frozen,
-    skip_from_py_object
+    frozen
 )]
 #[derive(Debug, Clone)]
 pub struct PyAccountAdjustmentOutcome {
@@ -424,14 +423,12 @@ pub fn simulation_module_any_to_pyobject(
 impl InterestRateRecord {
     /// A single interest rate data entry.
     #[new]
-    fn py_new(location: String, time: String, value: f64) -> PyResult<Self> {
-        let record = Self {
+    fn py_new(location: String, time: String, value: Decimal) -> Self {
+        Self {
             location,
             time,
             value,
-        };
-        record.validate().map_err(to_pyvalue_err)?;
-        Ok(record)
+        }
     }
 
     fn __repr__(&self) -> String {
@@ -449,9 +446,9 @@ impl FXRolloverInterestModule {
     /// rollovers are tripled (Wednesday for T+2 settlement, Friday for the weekend).
     #[new]
     #[gen_stub(override_return_type(type_repr = "typing.Self", imports = ("typing",)))]
-    fn py_new(records: Vec<InterestRateRecord>) -> PyResult<PyClassInitializer<Self>> {
-        let module = Self::new(records).map_err(to_pyvalue_err)?;
-        Ok(PyClassInitializer::from(PySimulationModule).add_subclass(module))
+    fn py_new(records: Vec<InterestRateRecord>) -> PyClassInitializer<Self> {
+        let module = Self::new(records);
+        PyClassInitializer::from(PySimulationModule).add_subclass(module)
     }
 
     fn __repr__(&self) -> String {
@@ -525,6 +522,7 @@ mod tests {
 
     use indexmap::IndexMap;
     use nautilus_common::cache::Cache;
+    use nautilus_execution::models::fee::{FeeModelAny, MakerTakerFeeModel};
     use nautilus_model::{
         data::Data,
         enums::{AccountType, BookType, OmsType},
@@ -747,6 +745,7 @@ mod tests {
                     .book_type(BookType::L1_MBP)
                     .starting_balances(vec![Money::from("1000 USD")])
                     .modules(vec![module])
+                    .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
                     .build()
                     .unwrap(),
             )
@@ -786,7 +785,7 @@ mod tests {
 
             assert_eq!(
                 engine.run(None, None, None, false).unwrap_err().to_string(),
-                format!("Simulation module failure requires exchange reset: {message}")
+                format!("Simulation callback failure requires exchange reset: {message}")
             );
         });
     }

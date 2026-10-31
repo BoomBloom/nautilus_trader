@@ -29,13 +29,15 @@ use std::{
 };
 
 use ahash::AHashSet;
-use nautilus_common::live::block_on_nautilus_with;
+use nautilus_common::{enums::Environment, live::block_on_nautilus_with};
 use nautilus_core::UnixNanos;
 use nautilus_model::data::Data;
+use object_store::path::Path as ObjectPath;
 
 use crate::{
     common::{
-        conversion::FeatherConversionSummary, paths::normalize_path_separators,
+        conversion::FeatherConversionSummary,
+        paths::{environment_directory, environment_from_directory, normalize_path_separators},
         storage::StorageBackend,
     },
     writer::{
@@ -46,10 +48,10 @@ use crate::{
 
 pub(crate) fn list_session_feather_files(
     storage: &StorageBackend,
-    kind: &str,
+    environment: Environment,
     instance_id: &str,
 ) -> anyhow::Result<Vec<String>> {
-    let run_directory = format!("{kind}/{instance_id}");
+    let run_directory = format!("{}/{instance_id}", environment_directory(environment));
     let mut files =
         block_on_nautilus_with(|| storage.list_files(&run_directory, Some(".feather")))?;
     files.sort();
@@ -58,18 +60,26 @@ pub(crate) fn list_session_feather_files(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PromotionSession {
-    pub(crate) catalog_uri: String,
-    pub(crate) kind: String,
+    pub(crate) root_uri: String,
+    pub(crate) environment: Environment,
     pub(crate) instance_id: String,
 }
 
 impl PromotionSession {
     pub(crate) fn from_uri(uri: &str) -> Option<Self> {
-        if let Ok(url) = url::Url::parse(uri)
+        let uri_local_encoded = uri.starts_with("file://").then(|| {
+            normalize_path_separators(uri)
+                .replace('%', "%25")
+                .replace('#', "%23")
+                .replace('?', "%3F")
+        });
+
+        if let Ok(url) = url::Url::parse(uri_local_encoded.as_deref().unwrap_or(uri))
             && let Some(session) = Self::from_url(url)
         {
             return Some(session);
         }
+
         Self::from_local_path(uri)
     }
 
@@ -82,24 +92,32 @@ impl PromotionSession {
             .map(str::to_string)
             .collect::<Vec<_>>();
         let instance_id = components.last()?.clone();
-        let kind = components.get(components.len().checked_sub(2)?)?.clone();
-        if !is_run_kind(&kind) {
-            return None;
-        }
+        let environment =
+            environment_from_directory(components.get(components.len().checked_sub(2)?)?)?;
 
-        let catalog_segments = &components[..components.len().saturating_sub(2)];
-        let catalog_path = if catalog_segments.is_empty() {
+        let root_segments = &components[..components.len().saturating_sub(2)];
+
+        let root_path = if root_segments.is_empty() {
             "/".to_string()
         } else {
-            format!("/{}", catalog_segments.join("/"))
+            format!("/{}", root_segments.join("/"))
         };
-        url.set_path(&catalog_path);
+
+        url.set_path(&root_path);
         url.set_query(None);
         url.set_fragment(None);
 
+        let root_uri = if url.scheme() == "file" {
+            let root_path = ObjectPath::from_url_path(url.path()).ok()?;
+            let root_prefix = url.as_str().strip_suffix(url.path())?;
+            format!("{root_prefix}/{root_path}")
+        } else {
+            url.to_string()
+        };
+
         Some(Self {
-            catalog_uri: url.to_string(),
-            kind,
+            root_uri,
+            environment,
             instance_id,
         })
     }
@@ -108,21 +126,16 @@ impl PromotionSession {
         let normalized = normalize_path_separators(path);
         let path = PathBuf::from(&normalized);
         let instance_id = path.file_name()?.to_string_lossy().to_string();
-        let kind = path.parent()?.file_name()?.to_string_lossy().to_string();
-        if !is_run_kind(&kind) {
-            return None;
-        }
-        let catalog_uri = path.parent()?.parent()?.to_string_lossy().to_string();
+        let environment =
+            environment_from_directory(&path.parent()?.file_name()?.to_string_lossy())?;
+
+        let root_uri = path.parent()?.parent()?.to_string_lossy().to_string();
         Some(Self {
-            catalog_uri,
-            kind,
+            root_uri,
+            environment,
             instance_id,
         })
     }
-}
-
-fn is_run_kind(kind: &str) -> bool {
-    matches!(kind, "backtest" | "live" | "sandbox")
 }
 
 pub(crate) trait PromotionSink: Send {
@@ -169,6 +182,7 @@ where
         if data.is_empty() {
             return Ok(());
         }
+
         self.stage_batch(data)?;
         self.mark_run_non_empty()?;
         self.maybe_promote_by_period()
@@ -181,6 +195,7 @@ where
             self.mark_run_non_empty()?;
             self.maybe_promote_by_period()?;
         }
+
         Ok(handled)
     }
 
@@ -299,6 +314,7 @@ where
     files: Vec<String>,
     use_ts_event_for_ts_init: bool,
     delete_feather_after_commit: bool,
+    schedule: Option<Arc<Mutex<PromotionSchedule>>>,
 }
 
 impl<B> PromotionWork<B>
@@ -320,13 +336,20 @@ where
             files,
             use_ts_event_for_ts_init,
             delete_feather_after_commit,
+            schedule: None,
         }
+    }
+
+    pub(crate) fn with_schedule(mut self, schedule: Arc<Mutex<PromotionSchedule>>) -> Self {
+        self.schedule = Some(schedule);
+        self
     }
 
     pub(crate) fn execute(self) -> PromotionResult {
         let files = self.files.clone();
+        let schedule = self.schedule.clone();
 
-        match panic::catch_unwind(AssertUnwindSafe(|| self.execute_inner())) {
+        let result = match panic::catch_unwind(AssertUnwindSafe(|| self.execute_inner())) {
             Ok(result) => result,
             Err(payload) => PromotionResult {
                 files,
@@ -340,7 +363,16 @@ where
                     panic_payload_message(payload.as_ref()),
                 )),
             },
+        };
+
+        if let Some(schedule) = schedule {
+            schedule
+                .lock()
+                .expect("promotion schedule lock poisoned")
+                .complete(&result);
         }
+
+        result
     }
 
     pub(crate) fn files(&self) -> &[String] {
@@ -374,6 +406,7 @@ where
                 Vec::new()
             }
         };
+
         deleted_paths.extend(leftovers.iter().cloned());
         let convert_files = self
             .files
@@ -413,8 +446,10 @@ where
                             }
                         }
                     }
+
                     converted.push(summary);
                     committed_paths.push(file.clone());
+
                     if record_error.is_some() {
                         // Keep the staged file so the retried promotion can re-run the
                         // record write; the replay dedup makes the re-run a no-op.
@@ -458,6 +493,7 @@ where
 
         if !errors.is_empty() {
             let error = errors.join("; ");
+
             let run_state_recorded = match self.backend.record_run_state(
                 &self.source,
                 &self.staging_uri,
@@ -474,6 +510,7 @@ where
                     false
                 }
             };
+
             return PromotionResult {
                 files: self.files,
                 committed_paths,
@@ -505,11 +542,13 @@ where
                 ),
             };
         }
+
         let run_state_recorded = if B::RECORDS_PROMOTED_ATOMICALLY {
             promoted_recorded
         } else {
             !converted.is_empty()
         };
+
         PromotionResult {
             files: self.files,
             committed_paths,
@@ -542,6 +581,7 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(message) = payload.downcast_ref::<String>() {
         return message.clone();
     }
+
     "unknown panic payload".to_string()
 }
 
@@ -568,6 +608,7 @@ impl PromotionTimer {
         anyhow::ensure!(interval_ms > 0, "Promotion timer interval must be positive");
         let (stop_tx, stop_rx) = mpsc::sync_channel(1);
         let interval = Duration::from_millis(interval_ms);
+
         let handle = std::thread::Builder::new() // dst-ok: timer performs blocking catalog I/O
             .name(thread_name.to_string())
             .spawn(move || {
@@ -578,6 +619,7 @@ impl PromotionTimer {
                     }
                 }
             })?;
+
         Ok(Self {
             stop_tx,
             handle: Some(handle),
@@ -632,10 +674,12 @@ where
 {
     pub(crate) fn submit(&self, work: T) -> anyhow::Result<()> {
         self.pending.fetch_add(1, Ordering::AcqRel);
+
         if let Err(e) = self.tx.send(PromotionMessage::Work(Box::new(work))) {
             self.pending.fetch_sub(1, Ordering::AcqRel);
             anyhow::bail!("Promotion worker disconnected: {e}");
         }
+
         Ok(())
     }
 }
@@ -657,6 +701,7 @@ where
     pub(crate) fn spawn(thread_name: &str) -> anyhow::Result<Self> {
         let (tx, work_rx) = mpsc::sync_channel::<PromotionMessage<T>>(1);
         let (result_tx, rx) = mpsc::channel::<T::Output>();
+
         let handle = std::thread::Builder::new() // dst-ok: catalog promotion performs blocking I/O
             .name(thread_name.to_string())
             .spawn(move || {
@@ -676,10 +721,6 @@ where
             handle: Some(handle),
             pending: Arc::new(AtomicUsize::new(0)),
         })
-    }
-
-    pub(crate) fn submit(&self, work: T) -> anyhow::Result<()> {
-        self.submitter().submit(work)
     }
 
     pub(crate) fn submitter(&self) -> PromotionSubmitter<T> {
@@ -740,7 +781,7 @@ where
     B: StagedPromotionBackend,
 {
     worker: Option<PromotionWorker<PromotionWork<B>>>,
-    scheduled_paths: Arc<Mutex<AHashSet<String>>>,
+    schedule: Arc<Mutex<PromotionSchedule>>,
     last_commit_time_ns: UnixNanos,
 }
 
@@ -748,10 +789,13 @@ impl<B> PromotionDriver<B>
 where
     B: StagedPromotionBackend,
 {
-    pub(crate) fn new(last_commit_time_ns: UnixNanos) -> Self {
+    pub(crate) fn new(last_commit_time_ns: UnixNanos, files: Vec<String>) -> Self {
         Self {
             worker: None,
-            scheduled_paths: Arc::new(Mutex::new(AHashSet::new())),
+            schedule: Arc::new(Mutex::new(PromotionSchedule {
+                pending_paths: files.into_iter().collect(),
+                scheduled_paths: AHashSet::new(),
+            })),
             last_commit_time_ns,
         }
     }
@@ -766,10 +810,6 @@ where
         self.last_commit_time_ns = now;
     }
 
-    pub(crate) fn schedule_new(&self, files: Vec<String>) -> anyhow::Result<Vec<String>> {
-        schedule_new_paths(&self.scheduled_paths, files)
-    }
-
     pub(crate) fn submit(
         &mut self,
         work: PromotionWork<B>,
@@ -777,14 +817,14 @@ where
     ) -> anyhow::Result<()> {
         let files = work.files().to_vec();
 
-        if self.worker.is_none() {
-            self.worker = Some(PromotionWorker::spawn(worker_name)?);
-        }
-
-        if let Err(e) = self.worker.as_mut().unwrap().submit(work) {
+        if let Err(e) = self
+            .submitter(worker_name)
+            .and_then(|submitter| submitter.submit(work))
+        {
             self.unschedule(&files);
             return Err(e);
         }
+
         Ok(())
     }
 
@@ -795,11 +835,12 @@ where
         if self.worker.is_none() {
             self.worker = Some(PromotionWorker::spawn(worker_name)?);
         }
+
         Ok(self.worker.as_ref().unwrap().submitter())
     }
 
-    pub(crate) fn scheduled_paths(&self) -> Arc<Mutex<AHashSet<String>>> {
-        Arc::clone(&self.scheduled_paths)
+    pub(crate) fn schedule(&self) -> Arc<Mutex<PromotionSchedule>> {
+        Arc::clone(&self.schedule)
     }
 
     pub(crate) fn drain_completed(&mut self) -> anyhow::Result<Vec<PromotionResult>> {
@@ -836,46 +877,58 @@ where
     }
 
     pub(crate) fn unschedule(&self, files: &[String]) {
-        let mut scheduled_paths = self
-            .scheduled_paths
+        self.schedule
             .lock()
-            .expect("promotion schedule lock poisoned");
+            .expect("promotion schedule lock poisoned")
+            .unschedule(files);
+    }
+}
 
+pub(crate) struct PromotionSchedule {
+    pending_paths: AHashSet<String>,
+    scheduled_paths: AHashSet<String>,
+}
+
+impl PromotionSchedule {
+    pub(crate) fn unschedule(&mut self, files: &[String]) {
         for file in files {
-            scheduled_paths.remove(file);
+            self.scheduled_paths.remove(file);
         }
     }
 
-    pub(crate) fn unschedule_uncommitted(&self, files: &[String], committed_paths: &[String]) {
-        let committed_paths = committed_paths
+    fn complete(&mut self, result: &PromotionResult) {
+        let committed = result
+            .committed_paths
             .iter()
-            .map(String::as_str)
+            .chain(&result.deleted_paths)
             .collect::<AHashSet<_>>();
 
-        let mut scheduled_paths = self
-            .scheduled_paths
-            .lock()
-            .expect("promotion schedule lock poisoned");
-
-        for file in files {
-            if !committed_paths.contains(file.as_str()) {
-                scheduled_paths.remove(file);
+        for file in &result.files {
+            if result.converted.is_ok() || committed.contains(file) {
+                self.scheduled_paths.remove(file);
+                self.pending_paths.remove(file);
             }
         }
     }
 }
 
 pub(crate) fn schedule_new_paths(
-    scheduled_paths: &Arc<Mutex<AHashSet<String>>>,
+    schedule: &Arc<Mutex<PromotionSchedule>>,
     files: Vec<String>,
 ) -> anyhow::Result<Vec<String>> {
-    let mut scheduled = scheduled_paths
+    let mut schedule = schedule
         .lock()
         .map_err(|e| anyhow::anyhow!("Promotion schedule lock poisoned: {e}"))?;
-    Ok(files
-        .into_iter()
-        .filter(|file| scheduled.insert(file.clone()))
-        .collect())
+    schedule.pending_paths.extend(files);
+    let mut files = schedule
+        .pending_paths
+        .iter()
+        .filter(|file| !schedule.scheduled_paths.contains(*file))
+        .cloned()
+        .collect::<Vec<_>>();
+    files.sort();
+    schedule.scheduled_paths.extend(files.iter().cloned());
+    Ok(files)
 }
 
 impl<B> PromotionTask for PromotionWork<B>
@@ -890,17 +943,19 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{
         any::Any,
         sync::{Arc, Mutex},
     };
 
-    use nautilus_model::data::Data;
+    use nautilus_common::enums::Environment;
+    use nautilus_model::data::{Data, NautilusDataType};
     use rstest::rstest;
 
     use super::{
-        PromotionBackend, PromotionSession, PromotionSink, PromotionWork, StagedPromotionBackend,
+        PromotionBackend, PromotionSchedule, PromotionSession, PromotionSink, PromotionWork,
+        StagedPromotionBackend,
     };
     use crate::{
         common::{conversion::FeatherConversionSummary, storage::create_storage_backend_from_path},
@@ -941,7 +996,7 @@ mod tests {
                 .converted
                 .push((file.to_string(), record_promoted));
             Ok(Some(FeatherConversionSummary {
-                type_name: "quotes".to_string(),
+                data_type: NautilusDataType::QuoteTick.into(),
                 identifier: None,
                 feather_path: file.to_string(),
                 native_version: Some(1),
@@ -990,12 +1045,14 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let storage =
             create_storage_backend_from_path(temp.path().to_str().unwrap(), None).unwrap();
-        let source = FeatherSessionSource::new(storage, "backtest", "run-leftovers");
+        let source = FeatherSessionSource::new(storage, Environment::Backtest, "run-leftovers");
         let state = Arc::new(Mutex::new(RecordingState::default()));
+
         let backend = RecordingBackend {
             leftovers: vec!["backtest/run-leftovers/b.feather".to_string()],
             state: Arc::clone(&state),
         };
+
         let files = vec![
             "backtest/run-leftovers/a.feather".to_string(),
             "backtest/run-leftovers/b.feather".to_string(),
@@ -1139,8 +1196,8 @@ mod tests {
         let session =
             PromotionSession::from_uri(r"C:\catalog\backtest\run-1").expect("valid run path");
 
-        assert_eq!(session.catalog_uri, "C:/catalog");
-        assert_eq!(session.kind, "backtest");
+        assert_eq!(session.root_uri, "C:/catalog");
+        assert_eq!(session.environment, Environment::Backtest);
         assert_eq!(session.instance_id, "run-1");
     }
 
@@ -1149,9 +1206,9 @@ mod tests {
         let session =
             PromotionSession::from_uri(r"\\server\share\live\run-2").expect("valid UNC run path");
 
-        // catalog_uri is platform-dependent here (Windows retains a trailing
-        // separator at the UNC prefix+root floor), so only kind/instance_id are asserted.
-        assert_eq!(session.kind, "live");
+        // root_uri is platform-dependent here (Windows retains a trailing
+        // separator at the UNC prefix+root floor), so only environment/instance_id are asserted.
+        assert_eq!(session.environment, Environment::Live);
         assert_eq!(session.instance_id, "run-2");
     }
 
@@ -1160,8 +1217,8 @@ mod tests {
         let session =
             PromotionSession::from_uri("/tmp/catalog/sandbox/run-3").expect("valid run path");
 
-        assert_eq!(session.catalog_uri, "/tmp/catalog");
-        assert_eq!(session.kind, "sandbox");
+        assert_eq!(session.root_uri, "/tmp/catalog");
+        assert_eq!(session.environment, Environment::Sandbox);
         assert_eq!(session.instance_id, "run-3");
     }
 
@@ -1200,5 +1257,12 @@ mod tests {
                 "promote",
             ]
         );
+    }
+
+    pub(crate) fn assert_scheduled_count(
+        schedule: &Arc<Mutex<PromotionSchedule>>,
+        expected: usize,
+    ) {
+        assert_eq!(schedule.lock().unwrap().scheduled_paths.len(), expected);
     }
 }

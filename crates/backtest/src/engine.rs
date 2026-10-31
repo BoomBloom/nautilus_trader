@@ -59,6 +59,7 @@ use nautilus_model::{
     instruments::{Instrument, InstrumentAny},
     position::Position,
 };
+use nautilus_portfolio::portfolio::is_snapshot_timer;
 #[cfg(feature = "python")]
 use nautilus_system::trader::Trader;
 use nautilus_system::{config::NautilusKernelConfig, kernel::NautilusKernel};
@@ -346,15 +347,22 @@ impl BacktestEngine {
 
     /// Adds an instrument to the backtest engine for the specified venue.
     ///
+    /// Adding an instrument that is already registered with the same definition is a
+    /// no-op. Event timestamps are ignored when comparing definitions.
+    ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The instrument's associated venue has not been added via `add_venue`.
+    /// - An instrument with the same ID is already registered with a different definition.
     /// - Attempting to add a `CurrencyPair` instrument for a single-currency CASH account.
     pub fn add_instrument(&mut self, instrument: &InstrumentAny) -> anyhow::Result<()> {
         let instrument_id = instrument.id();
         if let Some(exchange) = self.venues.get(&instrument.id().venue) {
-            let previous_expiration_ns = exchange.borrow().instrument_expiration(instrument_id);
+            if exchange.borrow().is_instrument_registered(instrument)? {
+                log::debug!("Instrument {instrument_id} is already registered");
+                return Ok(());
+            }
 
             if matches!(
                 instrument,
@@ -369,19 +377,6 @@ impl BacktestEngine {
             exchange.borrow_mut().add_instrument(instrument.clone())?;
             if let Some(expiration_ns) = instrument.expiration_ns() {
                 self.set_instrument_expiration_timer(exchange, instrument_id, expiration_ns)?;
-            }
-
-            if let Some(previous_expiration_ns) = previous_expiration_ns
-                && instrument.expiration_ns() != Some(previous_expiration_ns)
-                && !exchange
-                    .borrow()
-                    .has_unprocessed_instrument_expiration(previous_expiration_ns)
-            {
-                let timer_name = Self::instrument_expiration_timer_name(
-                    instrument_id.venue,
-                    previous_expiration_ns,
-                );
-                self.kernel.clock.borrow_mut().cancel_timer(&timer_name);
             }
         } else {
             anyhow::bail!(
@@ -410,6 +405,7 @@ impl BacktestEngine {
     ///
     /// Returns an error if:
     /// - `data` is empty.
+    /// - `data` contains DeFi data and this crate is built without its `defi` feature.
     /// - `validate` is `true`, the first element is built-in market data (excluding
     ///   custom and DeFi data), and its instrument has not been added to the cache via
     ///   [`add_instrument`](Self::add_instrument).
@@ -442,7 +438,7 @@ impl BacktestEngine {
     ///
     /// # Errors
     ///
-    /// Returns an error under the same conditions as [`add_data`](Self::add_data).
+    /// Returns an error if [`add_data`](Self::add_data) fails.
     pub fn add_data_batch(
         &mut self,
         data: DataBatch,
@@ -474,15 +470,16 @@ impl BacktestEngine {
             anyhow::bail!("data was empty");
         };
 
+        #[cfg(not(feature = "defi"))]
+        anyhow::ensure!(
+            !items.clone().any(is_defi),
+            "DeFi data requires the nautilus-backtest `defi` feature"
+        );
+
         if validate {
             // Validate against the first element only and assume the batch is
             // homogeneous (documented contract on add_data).
-            #[cfg(feature = "defi")]
-            let first_is_defi = matches!(first, DataRef::Defi(_));
-            #[cfg(not(feature = "defi"))]
-            let first_is_defi = false;
-
-            if !first_is_defi && !matches!(first, DataRef::Custom(_)) {
+            if !is_defi(first) && !matches!(first, DataRef::Custom(_)) {
                 let first_instrument_id = first.instrument_id();
                 anyhow::ensure!(
                     self.kernel
@@ -514,7 +511,7 @@ impl BacktestEngine {
         let mut batch_max_ts: Option<UnixNanos> = None;
 
         #[cfg(feature = "defi")]
-        if items.clone().any(|item| matches!(item, DataRef::Defi(_))) {
+        if items.clone().any(is_defi) {
             self.add_defi_data_client_if_not_exists(client_id);
         }
 
@@ -524,8 +521,7 @@ impl BacktestEngine {
             batch_min_ts = Some(batch_min_ts.map_or(ts, |cur| cur.min(ts)));
             batch_max_ts = Some(batch_max_ts.map_or(ts, |cur| cur.max(ts)));
 
-            #[cfg(feature = "defi")]
-            if matches!(item, DataRef::Defi(_)) {
+            if is_defi(item) {
                 continue;
             }
 
@@ -694,7 +690,8 @@ impl BacktestEngine {
     ///
     /// Returns an error if the backtest encounters an unrecoverable state.
     /// Callback dispatch failures abort the run and stop the trader and engines, including when
-    /// a failure is already latched before entry.
+    /// a failure is already latched before entry. An account rejecting a fill's balance update,
+    /// such as a cash balance going negative without borrowing, also aborts the run.
     pub fn run(
         &mut self,
         start: Option<UnixNanos>,
@@ -710,17 +707,24 @@ impl BacktestEngine {
         if let Some(error) = &self.funding_error {
             anyhow::bail!("{error}");
         }
-        self.check_module_errors()?;
+
+        if let Err(e) = self.check_exchange_errors() {
+            self.abort_run();
+            return Err(e);
+        }
+
+        self.check_balance_error()?;
 
         if let Err(e) = self.run_impl(start, end, run_config_id, streaming) {
             let callback_error = actor::callback_failure();
             if callback_error.is_some()
                 || e.is::<CallbackDispatchError>()
                 || self.funding_error.is_some()
+                || self.kernel.portfolio.borrow().balance_error().is_some()
                 || self
                     .venues
                     .values()
-                    .any(|exchange| exchange.borrow().has_module_error())
+                    .any(|exchange| exchange.borrow().has_callback_error())
             {
                 self.abort_run();
             }
@@ -974,8 +978,9 @@ impl BacktestEngine {
             | DataRef::BookDepth(_)
             | DataRef::Quote(_)
             | DataRef::Trade(_)
-            | DataRef::Bar(_) => SettlementScope::Data(Some(data.instrument_id())),
-            DataRef::MarkPrice(_) | DataRef::IndexPrice(_) => SettlementScope::Data(None),
+            | DataRef::Bar(_)
+            | DataRef::MarkPrice(_) => SettlementScope::Data(Some(data.instrument_id())),
+            DataRef::IndexPrice(_) => SettlementScope::Data(None),
             DataRef::FundingRate(_) => SettlementScope::Data(Some(data.instrument_id())),
             DataRef::OptionGreeks(_) => SettlementScope::Data(None),
             DataRef::InstrumentStatus(_) | DataRef::InstrumentClose(_) => {
@@ -984,6 +989,12 @@ impl BacktestEngine {
             DataRef::Instrument(_) | DataRef::Custom(_) => SettlementScope::Data(None),
             #[cfg(feature = "defi")]
             DataRef::Defi(_) => SettlementScope::Data(None),
+            #[cfg(not(feature = "defi"))]
+            #[allow(
+                unreachable_patterns,
+                reason = "DeFi variants can exist without this crate's defi feature"
+            )]
+            _ => SettlementScope::Data(None),
         }
     }
 
@@ -1008,14 +1019,19 @@ impl BacktestEngine {
     ///
     /// # Errors
     ///
-    /// Returns an error if callback dispatch or ownership cleanup fails, actor or strategy state
-    /// cannot be saved, or a simulation module cannot produce its diagnostics. Callback errors
-    /// trigger abort cleanup, stopping the trader and engines.
+    /// Returns an error if callback dispatch or ownership cleanup fails, an account rejects a
+    /// fill's balance update, actor or strategy state cannot be saved, or a simulation module
+    /// cannot produce its diagnostics. Callback errors and balance rejections trigger abort
+    /// cleanup, stopping the trader and engines.
     pub fn end(&mut self) -> anyhow::Result<()> {
         let result = self.end_impl();
-        if result
-            .as_ref()
-            .is_err_and(anyhow::Error::is::<CallbackDispatchError>)
+        if let Err(e) = &result
+            && (e.is::<CallbackDispatchError>()
+                || self.kernel.portfolio.borrow().balance_error().is_some()
+                || self
+                    .venues
+                    .values()
+                    .any(|exchange| exchange.borrow().has_callback_error()))
         {
             self.abort_run();
         }
@@ -1030,6 +1046,7 @@ impl BacktestEngine {
         if let Some(error) = &self.funding_error {
             anyhow::bail!("{error}");
         }
+        self.check_balance_error()?;
 
         // Flush remaining timer events to the backtest end boundary so that
         // tail alerts/expiries scheduled after the last data point still fire.
@@ -1050,7 +1067,7 @@ impl BacktestEngine {
                     || self
                         .venues
                         .values()
-                        .any(|exchange| exchange.borrow().has_module_error())
+                        .any(|exchange| exchange.borrow().has_callback_error())
                 {
                     self.abort_run();
                 }
@@ -1102,7 +1119,7 @@ impl BacktestEngine {
         self.kernel.risk_engine.borrow_mut().stop();
         self.kernel.exec_engine.borrow_mut().stop();
 
-        let streaming_result = self.kernel.flush_streaming();
+        let streaming_result = self.kernel.close_streaming_writer();
 
         self.run_finished = Some(UnixNanos::from(nanos_since_unix_epoch()));
         self.backtest_end = Some(self.kernel.clock.borrow().timestamp_ns());
@@ -1210,6 +1227,13 @@ impl BacktestEngine {
 
         // Reset all iterator cursors to beginning (data persists)
         self.data_iterator.reset_all_cursors();
+
+        // `end` closed the streaming writer, so the next run needs it open again
+        if let Err(e) = self.kernel.reopen_streaming_writer()
+            && reset_error.is_none()
+        {
+            reset_error = Some(e);
+        }
 
         clear_command_queues();
 
@@ -1401,7 +1425,8 @@ impl BacktestEngine {
             .collect();
         drop(trader);
 
-        let outcome = if self.funding_error.is_some() {
+        let balance_error = self.kernel.portfolio.borrow().balance_error().is_some();
+        let outcome = if self.funding_error.is_some() || balance_error {
             CanonicalRunOutcome::Failed
         } else if self.run_finished.is_none() {
             CanonicalRunOutcome::Incomplete
@@ -1410,14 +1435,16 @@ impl BacktestEngine {
         } else {
             CanonicalRunOutcome::Completed
         };
-        let diagnostics = self
-            .funding_error
-            .as_ref()
-            .map(|_| CanonicalDiagnostic {
-                code: CanonicalDiagnosticCode::FundingSettlementFailed,
-            })
-            .into_iter()
-            .collect();
+        let diagnostics = [
+            self.funding_error
+                .as_ref()
+                .map(|_| CanonicalDiagnosticCode::FundingSettlementFailed),
+            balance_error.then_some(CanonicalDiagnosticCode::AccountBalanceRejected),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|code| CanonicalDiagnostic { code })
+        .collect();
         let statistics = nautilus_analysis::PortfolioStatistics {
             pnls: result.stats_pnls,
             returns: result.stats_returns,
@@ -1560,16 +1587,12 @@ impl BacktestEngine {
     ) -> anyhow::Result<()> {
         if matches!(
             data,
-            DataRef::Instrument(_)
-                | DataRef::MarkPrice(_)
-                | DataRef::IndexPrice(_)
-                | DataRef::OptionGreeks(_)
-                | DataRef::Custom(_)
+            DataRef::IndexPrice(_) | DataRef::OptionGreeks(_) | DataRef::Custom(_)
         ) {
             return Ok(());
         }
-        #[cfg(feature = "defi")]
-        if matches!(data, DataRef::Defi(_)) {
+
+        if is_defi(data) {
             return Ok(());
         }
 
@@ -1579,6 +1602,7 @@ impl BacktestEngine {
             let mut processed_book_data = false;
 
             match data {
+                DataRef::Instrument(instrument) => exchange_ref.update_instrument(instrument)?,
                 DataRef::BookDelta(delta) => {
                     exchange_ref.process_order_book_delta(*delta)?;
                     processed_book_data = true;
@@ -1594,7 +1618,8 @@ impl BacktestEngine {
                 DataRef::Quote(quote) => exchange_ref.process_quote_tick(quote)?,
                 DataRef::Trade(trade) => exchange_ref.process_trade_tick(trade)?,
                 DataRef::Bar(bar) => exchange_ref.process_bar(*bar)?,
-                DataRef::MarkPrice(_) | DataRef::IndexPrice(_) => {
+                DataRef::MarkPrice(mark) => exchange_ref.process_mark_price(mark)?,
+                DataRef::IndexPrice(_) => {
                     unreachable!("filtered before exchange routing")
                 }
                 DataRef::FundingRate(funding) => {
@@ -1609,11 +1634,17 @@ impl BacktestEngine {
                 DataRef::InstrumentClose(close) => {
                     exchange_ref.process_instrument_close(*close)?;
                 }
-                DataRef::Instrument(_) | DataRef::Custom(_) => {
+                DataRef::Custom(_) => {
                     unreachable!("filtered before exchange routing")
                 }
                 #[cfg(feature = "defi")]
                 DataRef::Defi(_) => unreachable!("filtered before exchange routing"),
+                #[cfg(not(feature = "defi"))]
+                #[allow(
+                    unreachable_patterns,
+                    reason = "DeFi variants can exist without this crate's defi feature"
+                )]
+                _ => unreachable!("filtered before exchange routing"),
             }
 
             drop(exchange_ref);
@@ -1627,9 +1658,16 @@ impl BacktestEngine {
         Ok(())
     }
 
-    fn check_module_errors(&self) -> anyhow::Result<()> {
+    fn check_exchange_errors(&self) -> anyhow::Result<()> {
         for exchange in self.venues.values() {
-            exchange.borrow().check_module_error()?;
+            exchange.borrow().check_callback_error()?;
+        }
+        Ok(())
+    }
+
+    fn check_balance_error(&self) -> anyhow::Result<()> {
+        if let Some(error) = self.kernel.portfolio.borrow().balance_error() {
+            anyhow::bail!("{error}");
         }
         Ok(())
     }
@@ -1653,14 +1691,15 @@ impl BacktestEngine {
             .peek_next_time()
             .filter(|ts_event| *ts_event <= ts_before)
         {
-            self.run_timer_handlers_at(clocks, ts_event, ts_now)?;
+            let settlement_scope = self.run_timer_handlers_at(clocks, ts_event, ts_now)?;
 
             if self.kernel.is_shutdown_requested() {
                 self.accumulator.clear();
                 shutdown_at = Some(ts_event);
                 break;
             }
-            self.finalize_timestamp(clocks, ts_event, SettlementScope::All)?;
+
+            self.finalize_timestamp(clocks, ts_event, settlement_scope)?;
 
             if self.kernel.is_shutdown_requested() {
                 self.accumulator.clear();
@@ -1708,13 +1747,14 @@ impl BacktestEngine {
             .peek_next_time()
             .filter(|ts_event| *ts_event <= ts_now)
         {
-            self.run_timer_handlers_at(clocks, ts_event, ts_now)?;
+            let settlement_scope = self.run_timer_handlers_at(clocks, ts_event, ts_now)?;
 
             if self.kernel.is_shutdown_requested() {
                 self.accumulator.clear();
                 break;
             }
-            self.finalize_timestamp(clocks, ts_event, SettlementScope::All)?;
+
+            self.finalize_timestamp(clocks, ts_event, settlement_scope)?;
 
             if self.kernel.is_shutdown_requested() {
                 self.accumulator.clear();
@@ -1769,27 +1809,35 @@ impl BacktestEngine {
         clocks: &[Rc<RefCell<dyn Clock>>],
         ts_event: UnixNanos,
         advance_to: UnixNanos,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<SettlementScope> {
         self.last_ns = ts_event;
+        let mut settlement_scope = SettlementScope::Data(None);
+
         while self.accumulator.peek_next_time() == Some(ts_event) {
             let handler = self
                 .accumulator
                 .pop_next_at_or_before(ts_event)
                 .expect("timer exists at timestamp");
+
+            if !is_snapshot_timer(handler.event.name.as_str()) {
+                settlement_scope = SettlementScope::All;
+            }
+
             Self::set_all_clocks_time(clocks, ts_event);
             logging_clock_set_static_time(ts_event.as_u64());
             handler.run();
             self.drain_command_queues()?;
 
             if self.kernel.is_shutdown_requested() {
-                return Ok(());
+                return Ok(settlement_scope);
             }
 
             for clock in clocks {
                 Self::advance_clock_on_accumulator(&mut self.accumulator, clock, advance_to, false);
             }
         }
-        Ok(())
+
+        Ok(settlement_scope)
     }
 
     fn finalize_timestamp(
@@ -1811,8 +1859,13 @@ impl BacktestEngine {
             }
 
             if self.accumulator.peek_next_time() == Some(ts_now) {
-                self.run_timer_handlers_at(clocks, ts_now, ts_now)?;
-                settlement_scope = SettlementScope::All;
+                if matches!(
+                    self.run_timer_handlers_at(clocks, ts_now, ts_now)?,
+                    SettlementScope::All
+                ) {
+                    settlement_scope = SettlementScope::All;
+                }
+
                 continue;
             }
 
@@ -2134,7 +2187,9 @@ impl BacktestEngine {
         loop {
             drain_trading_cmd_queue();
             drain_data_cmd_queue();
+            self.check_exchange_errors()?;
             self.drain_exec_client_events();
+            self.check_balance_error()?;
 
             let callbacks_pending = actor::drain_callbacks(CALLBACK_DRAIN_BUDGET)?;
 
@@ -2394,6 +2449,33 @@ fn log_portfolio_performance(analyzer: &PortfolioAnalyzer) {
     log_info!("-----------------------------------------------------------------", color = LogColor::Cyan);
 }
 
+fn is_defi(data: DataRef<'_>) -> bool {
+    match data {
+        DataRef::Instrument(_)
+        | DataRef::BookDelta(_)
+        | DataRef::BookDeltas(_)
+        | DataRef::BookDepth(_)
+        | DataRef::Quote(_)
+        | DataRef::Trade(_)
+        | DataRef::Bar(_)
+        | DataRef::MarkPrice(_)
+        | DataRef::IndexPrice(_)
+        | DataRef::FundingRate(_)
+        | DataRef::OptionGreeks(_)
+        | DataRef::InstrumentStatus(_)
+        | DataRef::InstrumentClose(_)
+        | DataRef::Custom(_) => false,
+        #[cfg(feature = "defi")]
+        DataRef::Defi(_) => true,
+        #[cfg(not(feature = "defi"))]
+        #[allow(
+            unreachable_patterns,
+            reason = "DeFi variants can exist without this crate's defi feature"
+        )]
+        _ => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{cell::Cell, rc::Rc};
@@ -2404,22 +2486,33 @@ mod tests {
         enums::Environment,
         messages::{
             data::{DataCommand, UnsubscribeCommand},
-            execution::{BatchModifyOrders, ModifyOrder, SubmitOrder, TradingCommand},
+            execution::{
+                BatchModifyOrders, CancelAllOrders, ModifyOrder, SubmitOrder, TradingCommand,
+            },
         },
         msgbus::{
             self, MessagingSwitchboard, TypedHandler,
             stubs::{TypedIntoMessageSavingHandler, get_typed_into_message_saving_handler},
         },
     };
-    use nautilus_execution::engine::{SnapshotAnchorer, stubs::StubExecutionClient};
+    use nautilus_execution::{
+        engine::{SnapshotAnchorer, stubs::StubExecutionClient},
+        models::{
+            fee::{FeeModelAny, MakerTakerFeeModel},
+            latency::{LatencyModelHandle, StaticLatencyModel},
+        },
+    };
     use nautilus_model::{
         data::{Data, InstrumentStatus, QuoteTick},
         enums::{
-            AccountType, BookType, LiquiditySide, MarketStatus, MarketStatusAction, OmsType,
-            OrderSide, OrderStatus, OrderType, PositionSide, TriggerType,
+            AccountType, BookType, ContingencyType, LiquiditySide, MarketStatus,
+            MarketStatusAction, OmsType, OrderSide, OrderStatus, OrderType, PositionSide,
+            TriggerType,
         },
         events::OrderEventAny,
-        identifiers::{AccountId, ActorId, ClientId, ClientOrderId, PositionId, StrategyId, Venue},
+        identifiers::{
+            AccountId, ActorId, ClientId, ClientOrderId, PositionId, StrategyId, TraderId, Venue,
+        },
         instruments::{
             CryptoPerpetual, Instrument, InstrumentAny, stubs::crypto_perpetual_ethusdt,
         },
@@ -2514,6 +2607,183 @@ mod tests {
 
     nautilus_strategy!(TestStrategy);
 
+    // How the canceled order's submit and acceptance events come to be deferred
+    #[derive(Clone, Copy, Debug)]
+    enum DeferredAcceptance {
+        // Limit order submitted earlier in the canceling handler
+        Initialized,
+        // Emulated stop-limit order released by the quote being handled
+        Released,
+        // OCO sibling of a leg submitted earlier in the canceling handler
+        OcoSibling,
+        // Take-profit and stop-loss parked by the venue until the bracket entry fills
+        BracketChildren,
+    }
+
+    // Cancels a resting order while its submit and acceptance events are deferred
+    #[derive(Debug)]
+    struct DeferredAcceptanceCancelStrategy {
+        core: StrategyCore,
+        instrument_id: InstrumentId,
+        scenario: DeferredAcceptance,
+        cancel_all: bool,
+        quote_count: usize,
+        target: Option<ClientOrderId>,
+    }
+
+    impl DeferredAcceptanceCancelStrategy {
+        const STRATEGY_ID: &str = "DEFERRED-CANCEL-001";
+
+        fn new(
+            instrument_id: InstrumentId,
+            scenario: DeferredAcceptance,
+            cancel_all: bool,
+        ) -> Self {
+            Self {
+                core: StrategyCore::new(StrategyConfig {
+                    strategy_id: Some(StrategyId::from(Self::STRATEGY_ID)),
+                    ..Default::default()
+                }),
+                instrument_id,
+                scenario,
+                cancel_all,
+                quote_count: 0,
+                target: None,
+            }
+        }
+
+        fn oco_leg(
+            &self,
+            client_order_id: &str,
+            sibling_id: &str,
+            side: OrderSide,
+            price: &str,
+        ) -> OrderAny {
+            OrderTestBuilder::new(OrderType::Limit)
+                .trader_id(self.trader_id().unwrap())
+                .strategy_id(StrategyId::from(Self::STRATEGY_ID))
+                .instrument_id(self.instrument_id)
+                .client_order_id(ClientOrderId::from(client_order_id))
+                .side(side)
+                .quantity(Quantity::from("1.000"))
+                .price(Price::from(price))
+                .contingency_type(ContingencyType::Oco)
+                .linked_order_ids(vec![ClientOrderId::from(sibling_id)])
+                .build()
+        }
+
+        fn submit(&mut self) -> anyhow::Result<()> {
+            let instrument_id = self.instrument_id;
+            let quantity = Quantity::from("1.000");
+            let price = Price::from("900.00");
+
+            match self.scenario {
+                DeferredAcceptance::Initialized => {
+                    let order = self.order().limit(
+                        instrument_id,
+                        OrderSide::Buy,
+                        quantity,
+                        price,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    );
+                    self.target = Some(order.client_order_id());
+                    self.submit_order(order, None, None, None)
+                }
+                DeferredAcceptance::Released => {
+                    let order = self.order().stop_limit(
+                        instrument_id,
+                        OrderSide::Buy,
+                        quantity,
+                        price,
+                        Price::from("1002.00"),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(TriggerType::Default),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    );
+                    self.target = Some(order.client_order_id());
+                    self.submit_order(order, None, None, None)
+                }
+                DeferredAcceptance::OcoSibling => {
+                    let leg = self.oco_leg("O-OCO-A", "O-OCO-B", OrderSide::Buy, "900.00");
+                    let sibling = self.oco_leg("O-OCO-B", "O-OCO-A", OrderSide::Sell, "1100.00");
+                    self.target = Some(leg.client_order_id());
+                    self.submit_order_list(vec![leg, sibling], None, None, None)
+                }
+                DeferredAcceptance::BracketChildren => {
+                    let orders = self
+                        .order()
+                        .bracket()
+                        .instrument_id(instrument_id)
+                        .order_side(OrderSide::Buy)
+                        .quantity(quantity)
+                        .entry_order_type(OrderType::Limit)
+                        .entry_price(price)
+                        .tp_price(Price::from("1100.00"))
+                        .sl_trigger_price(Price::from("800.00"))
+                        .call();
+                    self.target = Some(orders[0].client_order_id());
+                    self.submit_order_list(orders, None, None, None)
+                }
+            }
+        }
+    }
+
+    impl DataActor for DeferredAcceptanceCancelStrategy {
+        fn on_start(&mut self) -> anyhow::Result<()> {
+            self.subscribe_quotes(self.instrument_id, None, None);
+            Ok(())
+        }
+
+        fn on_quote(&mut self, _quote: &QuoteTick) -> anyhow::Result<()> {
+            self.quote_count += 1;
+
+            if self.quote_count == 1 {
+                self.submit()?;
+            }
+
+            // The second quote triggers and releases the emulated order before this handler
+            let cancel_quote = match self.scenario {
+                DeferredAcceptance::Released => 2,
+                DeferredAcceptance::Initialized
+                | DeferredAcceptance::OcoSibling
+                | DeferredAcceptance::BracketChildren => 1,
+            };
+
+            if self.quote_count != cancel_quote {
+                return Ok(());
+            }
+
+            if self.cancel_all {
+                self.cancel_all_orders(self.instrument_id, None, None, true, None)
+            } else {
+                self.cancel_order(self.target.unwrap(), None, None)
+            }
+        }
+    }
+
+    nautilus_strategy!(DeferredAcceptanceCancelStrategy);
+
     struct TestSimulationModule {
         process_count: Rc<Cell<u32>>,
     }
@@ -2553,6 +2823,7 @@ mod tests {
             .account_type(AccountType::Margin)
             .book_type(BookType::L1_MBP)
             .starting_balances(vec![Money::from("1_000_000 USDT")])
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
             .build()
             .unwrap();
         engine.add_venue(venue_config).unwrap();
@@ -2560,6 +2831,13 @@ mod tests {
     }
 
     fn create_immediate_engine(instrument: &CryptoPerpetual) -> BacktestEngine {
+        create_engine_with_message_queue(instrument, false)
+    }
+
+    fn create_engine_with_message_queue(
+        instrument: &CryptoPerpetual,
+        use_message_queue: bool,
+    ) -> BacktestEngine {
         let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
         let venue_config = SimulatedVenueConfig::builder()
             .venue(instrument.id().venue)
@@ -2567,7 +2845,8 @@ mod tests {
             .account_type(AccountType::Margin)
             .book_type(BookType::L1_MBP)
             .starting_balances(vec![Money::from("1_000_000 USDT")])
-            .use_message_queue(false)
+            .use_message_queue(use_message_queue)
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
             .build()
             .unwrap();
         engine.add_venue(venue_config).unwrap();
@@ -2659,6 +2938,7 @@ mod tests {
                 .book_type(BookType::L1_MBP)
                 .starting_balances(vec![Money::from("1_000_000 USDT")])
                 .modules(modules)
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
                 .build()
                 .unwrap();
             engine.add_venue(venue_config).unwrap();
@@ -2700,6 +2980,7 @@ mod tests {
                 .book_type(BookType::L1_MBP)
                 .starting_balances(vec![Money::from("1_000_000 USDT")])
                 .liquidation_enabled(enabled)
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
                 .build()
                 .unwrap();
             engine.add_venue(venue_config).unwrap();
@@ -2948,6 +3229,7 @@ mod tests {
             .book_type(BookType::L1_MBP)
             .starting_balances(vec![Money::from("1_000_000 USDT")])
             .use_message_queue(use_message_queue)
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
             .build()
             .unwrap();
         engine.add_venue(venue_config).unwrap();
@@ -3149,28 +3431,469 @@ mod tests {
     }
 
     #[rstest]
-    fn test_timer_handler_sets_last_ns_to_fire_time() {
-        let mut engine = create_engine();
-        engine.last_ns = UnixNanos::from(30);
-        let fired = Rc::new(Cell::new(false));
-        let fired_clone = Rc::clone(&fired);
-        let callback = TimeEventCallback::RustLocal(Rc::new(move |_| {
-            fired_clone.set(true);
-        }));
+    fn test_immediate_cancel_of_order_with_deferred_acceptance(
+        #[values(
+            DeferredAcceptance::Initialized,
+            DeferredAcceptance::Released,
+            DeferredAcceptance::OcoSibling,
+            DeferredAcceptance::BracketChildren
+        )]
+        scenario: DeferredAcceptance,
+        #[values(true, false)] cancel_all: bool,
+        crypto_perpetual_ethusdt: CryptoPerpetual,
+    ) {
+        let mut engine = create_immediate_engine(&crypto_perpetual_ethusdt);
+        let instrument_id = crypto_perpetual_ethusdt.id;
         engine
-            .kernel
-            .clock
-            .borrow_mut()
-            .set_timer_ns(
-                "ROLL",
-                DurationNanos::new(1),
-                Some(UnixNanos::from(20)),
+            .add_strategy(DeferredAcceptanceCancelStrategy::new(
+                instrument_id,
+                scenario,
+                cancel_all,
+            ))
+            .unwrap();
+        let quote = |bid: &str, ask: &str, ts: u64| {
+            Data::Quote(QuoteTick::new(
+                instrument_id,
+                Price::from(bid),
+                Price::from(ask),
+                Quantity::from("1.000"),
+                Quantity::from("1.000"),
+                UnixNanos::from(ts),
+                UnixNanos::from(ts),
+            ))
+        };
+        engine
+            .add_data(
+                vec![
+                    quote("1000.00", "1001.00", 1),
+                    quote("1002.00", "1003.00", 2),
+                ],
                 None,
-                Some(callback),
-                Some(true),
-                Some(true),
+                true,
+                true,
             )
             .unwrap();
+
+        engine.run(None, None, None, false).unwrap();
+
+        assert!(
+            engine.venues[&instrument_id.venue]
+                .borrow()
+                .get_open_orders(Some(instrument_id))
+                .is_empty()
+        );
+        let cache = engine.kernel.cache.borrow();
+        let orders = cache.orders(None, Some(&instrument_id), None, None, None);
+        let expected_orders = match scenario {
+            DeferredAcceptance::BracketChildren => 3,
+            DeferredAcceptance::OcoSibling => 2,
+            DeferredAcceptance::Initialized | DeferredAcceptance::Released => 1,
+        };
+        assert_eq!(orders.len(), expected_orders);
+
+        for order in &orders {
+            assert_eq!(order.status(), OrderStatus::Canceled);
+            let events = order.events();
+
+            // Parked bracket children are canceled before the venue accepts them
+            let matched = if order.parent_order_id().is_some() {
+                matches!(
+                    events.as_slice(),
+                    [
+                        OrderEventAny::Initialized(_),
+                        OrderEventAny::Submitted(_),
+                        OrderEventAny::Canceled(_),
+                    ]
+                )
+            } else {
+                matches!(
+                    events.as_slice(),
+                    [
+                        ..,
+                        OrderEventAny::Submitted(_),
+                        OrderEventAny::Accepted(_),
+                        OrderEventAny::Canceled(_),
+                    ]
+                )
+            };
+            assert!(matched, "unexpected events {events:?}");
+        }
+    }
+
+    // Cancels a bracket's parked take-profit, then lets the entry fill on a later quote
+    #[derive(Debug)]
+    struct CancelParkedChildStrategy {
+        core: StrategyCore,
+        instrument_id: InstrumentId,
+        same_handler: bool,
+        quote_count: usize,
+        take_profit: Option<ClientOrderId>,
+    }
+
+    impl CancelParkedChildStrategy {
+        fn new(instrument_id: InstrumentId, same_handler: bool) -> Self {
+            Self {
+                core: StrategyCore::new(StrategyConfig {
+                    strategy_id: Some(StrategyId::from("PARKED-CANCEL-001")),
+                    ..Default::default()
+                }),
+                instrument_id,
+                same_handler,
+                quote_count: 0,
+                take_profit: None,
+            }
+        }
+    }
+
+    impl DataActor for CancelParkedChildStrategy {
+        fn on_start(&mut self) -> anyhow::Result<()> {
+            self.subscribe_quotes(self.instrument_id, None, None);
+            Ok(())
+        }
+
+        fn on_quote(&mut self, _quote: &QuoteTick) -> anyhow::Result<()> {
+            self.quote_count += 1;
+
+            if self.quote_count == 1 {
+                let instrument_id = self.instrument_id;
+                let orders = self
+                    .order()
+                    .bracket()
+                    .instrument_id(instrument_id)
+                    .order_side(OrderSide::Buy)
+                    .quantity(Quantity::from("1.000"))
+                    .entry_order_type(OrderType::Limit)
+                    .entry_price(Price::from("1000.00"))
+                    .tp_price(Price::from("1100.00"))
+                    .sl_trigger_price(Price::from("800.00"))
+                    .call();
+                self.take_profit = orders
+                    .iter()
+                    .find(|order| {
+                        order.order_type() == OrderType::Limit && order.parent_order_id().is_some()
+                    })
+                    .map(Order::client_order_id);
+                self.submit_order_list(orders, None, None, None)?;
+            }
+
+            let cancel_quote = if self.same_handler { 1 } else { 2 };
+
+            if self.quote_count == cancel_quote {
+                self.cancel_order(self.take_profit.unwrap(), None, None)?;
+            }
+            Ok(())
+        }
+    }
+
+    nautilus_strategy!(CancelParkedChildStrategy);
+
+    #[rstest]
+    fn test_cancel_parked_oto_child_stays_canceled_after_entry_fills(
+        #[values(false, true)] use_message_queue: bool,
+        #[values(false, true)] same_handler: bool,
+        crypto_perpetual_ethusdt: CryptoPerpetual,
+    ) {
+        let mut engine =
+            create_engine_with_message_queue(&crypto_perpetual_ethusdt, use_message_queue);
+        let instrument_id = crypto_perpetual_ethusdt.id;
+        engine
+            .add_strategy(CancelParkedChildStrategy::new(instrument_id, same_handler))
+            .unwrap();
+        let quote = |bid: &str, ask: &str, ts: u64| {
+            Data::Quote(QuoteTick::new(
+                instrument_id,
+                Price::from(bid),
+                Price::from(ask),
+                Quantity::from("1.000"),
+                Quantity::from("1.000"),
+                UnixNanos::from(ts),
+                UnixNanos::from(ts),
+            ))
+        };
+        engine
+            .add_data(
+                vec![
+                    quote("999.00", "1001.00", 1),
+                    quote("999.00", "1001.00", 2),
+                    quote("999.00", "1000.00", 3),
+                ],
+                None,
+                true,
+                true,
+            )
+            .unwrap();
+
+        engine.run(None, None, None, false).unwrap();
+
+        assert!(
+            engine.venues[&instrument_id.venue]
+                .borrow()
+                .get_open_orders(Some(instrument_id))
+                .is_empty()
+        );
+        let cache = engine.kernel.cache.borrow();
+        let orders = cache.orders(None, Some(&instrument_id), None, None, None);
+        assert_eq!(orders.len(), 3);
+
+        for order in &orders {
+            // Canceling the take-profit also cancels its OUO stop-loss
+            let expected = if order.parent_order_id().is_some() {
+                OrderStatus::Canceled
+            } else {
+                OrderStatus::Filled
+            };
+            assert_eq!(
+                order.status(),
+                expected,
+                "unexpected events {:?}",
+                order.events()
+            );
+        }
+    }
+
+    // Submits a bracket whose post-only entry crosses, then starts a market exit
+    #[derive(Debug)]
+    struct RejectedEntryExitStrategy {
+        core: StrategyCore,
+        instrument_id: InstrumentId,
+        quote_count: usize,
+        exits: Rc<Cell<usize>>,
+    }
+
+    impl DataActor for RejectedEntryExitStrategy {
+        fn on_start(&mut self) -> anyhow::Result<()> {
+            self.subscribe_quotes(self.instrument_id, None, None);
+            Ok(())
+        }
+
+        fn on_quote(&mut self, _quote: &QuoteTick) -> anyhow::Result<()> {
+            self.quote_count += 1;
+
+            match self.quote_count {
+                1 => {
+                    let instrument_id = self.instrument_id;
+                    let orders = self
+                        .order()
+                        .bracket()
+                        .instrument_id(instrument_id)
+                        .order_side(OrderSide::Buy)
+                        .quantity(Quantity::from("1.000"))
+                        .entry_order_type(OrderType::Limit)
+                        .entry_price(Price::from("1001.00"))
+                        .entry_post_only(true)
+                        .tp_price(Price::from("1100.00"))
+                        .sl_trigger_price(Price::from("800.00"))
+                        .call();
+                    self.submit_order_list(orders, None, None, None)
+                }
+                2 => self.market_exit(),
+                _ => Ok(()),
+            }
+        }
+    }
+
+    nautilus_strategy!(RejectedEntryExitStrategy, {
+        fn post_market_exit(&mut self) {
+            self.exits.set(self.exits.get() + 1);
+        }
+    });
+
+    #[rstest]
+    fn test_rejected_oto_parent_rejects_children_and_market_exit_completes(
+        #[values(false, true)] use_message_queue: bool,
+        crypto_perpetual_ethusdt: CryptoPerpetual,
+    ) {
+        let mut engine =
+            create_engine_with_message_queue(&crypto_perpetual_ethusdt, use_message_queue);
+        let instrument_id = crypto_perpetual_ethusdt.id;
+        let exits = Rc::new(Cell::new(0));
+        engine
+            .add_strategy(RejectedEntryExitStrategy {
+                core: StrategyCore::new(StrategyConfig {
+                    strategy_id: Some(StrategyId::from("REJECTED-ENTRY-001")),
+                    ..Default::default()
+                }),
+                instrument_id,
+                quote_count: 0,
+                exits: Rc::clone(&exits),
+            })
+            .unwrap();
+        let quotes = [1, 2, 3]
+            .into_iter()
+            .map(|secs: u64| {
+                let ts = UnixNanos::from(secs * 1_000_000_000);
+                Data::Quote(QuoteTick::new(
+                    instrument_id,
+                    Price::from("1000.00"),
+                    Price::from("1001.00"),
+                    Quantity::from("1.000"),
+                    Quantity::from("1.000"),
+                    ts,
+                    ts,
+                ))
+            })
+            .collect();
+        engine.add_data(quotes, None, true, true).unwrap();
+
+        engine.run(None, None, None, false).unwrap();
+
+        let cache = engine.kernel.cache.borrow();
+        let orders = cache.orders(None, Some(&instrument_id), None, None, None);
+        assert_eq!(orders.len(), 3);
+
+        for order in &orders {
+            assert_eq!(
+                order.status(),
+                OrderStatus::Rejected,
+                "unexpected events {:?}",
+                order.events()
+            );
+        }
+        assert_eq!(exits.get(), 1);
+    }
+
+    // Submits a bracket whose market entry is larger than the top-of-book size
+    #[derive(Debug)]
+    struct MultiStepEntryStrategy {
+        core: StrategyCore,
+        instrument_id: InstrumentId,
+        submitted: bool,
+    }
+
+    impl DataActor for MultiStepEntryStrategy {
+        fn on_start(&mut self) -> anyhow::Result<()> {
+            self.subscribe_quotes(self.instrument_id, None, None);
+            Ok(())
+        }
+
+        fn on_quote(&mut self, _quote: &QuoteTick) -> anyhow::Result<()> {
+            if self.submitted {
+                return Ok(());
+            }
+            self.submitted = true;
+            let orders = self
+                .order()
+                .bracket()
+                .instrument_id(self.instrument_id)
+                .order_side(OrderSide::Buy)
+                .quantity(Quantity::from("2.000"))
+                .tp_price(Price::from("1100.00"))
+                .sl_trigger_price(Price::from("800.00"))
+                .call();
+            self.submit_order_list(orders, None, None, None)
+        }
+    }
+
+    nautilus_strategy!(MultiStepEntryStrategy);
+
+    #[rstest]
+    fn test_full_trigger_market_entry_filling_in_steps_releases_children(
+        crypto_perpetual_ethusdt: CryptoPerpetual,
+    ) {
+        let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+        let instrument_id = crypto_perpetual_ethusdt.id;
+        let venue_config = SimulatedVenueConfig::builder()
+            .venue(instrument_id.venue)
+            .oms_type(OmsType::Netting)
+            .account_type(AccountType::Margin)
+            .book_type(BookType::L1_MBP)
+            .starting_balances(vec![Money::from("1_000_000 USDT")])
+            .oto_full_trigger(true)
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+            .build()
+            .unwrap();
+        engine.add_venue(venue_config).unwrap();
+        engine
+            .add_instrument(&InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt))
+            .unwrap();
+        engine
+            .add_strategy(MultiStepEntryStrategy {
+                core: StrategyCore::new(StrategyConfig {
+                    strategy_id: Some(StrategyId::from("MULTI-STEP-001")),
+                    ..Default::default()
+                }),
+                instrument_id,
+                submitted: false,
+            })
+            .unwrap();
+        let quotes = [1, 2]
+            .into_iter()
+            .map(|secs: u64| {
+                let ts = UnixNanos::from(secs * 1_000_000_000);
+                Data::Quote(QuoteTick::new(
+                    instrument_id,
+                    Price::from("1000.00"),
+                    Price::from("1001.00"),
+                    Quantity::from("1.000"),
+                    Quantity::from("1.000"),
+                    ts,
+                    ts,
+                ))
+            })
+            .collect();
+        engine.add_data(quotes, None, true, true).unwrap();
+
+        engine.run(None, None, None, false).unwrap();
+
+        let cache = engine.kernel.cache.borrow();
+        let orders = cache.orders(None, Some(&instrument_id), None, None, None);
+        assert_eq!(orders.len(), 3);
+
+        for order in &orders {
+            let fill_count = order
+                .events()
+                .iter()
+                .filter(|event| matches!(event, OrderEventAny::Filled(_)))
+                .count();
+            let expected = if order.parent_order_id().is_none() {
+                assert!(fill_count > 1, "entry filled in {fill_count} step(s)");
+                OrderStatus::Filled
+            } else {
+                OrderStatus::Accepted
+            };
+            assert_eq!(
+                order.status(),
+                expected,
+                "unexpected events {:?}",
+                order.events()
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::strategy(&["ROLL"], true)]
+    #[case::snapshots(&["portfolio_equity_curve.SIM-001", "portfolio_snapshot.SIM-001"], false)]
+    #[case::strategy_first(&["a_strategy", "portfolio_equity_curve.SIM-001"], true)]
+    #[case::strategy_last(&["portfolio_equity_curve.SIM-001", "z_strategy"], true)]
+    fn test_timer_handler_sets_last_ns_to_fire_time(
+        #[case] timer_names: &[&str],
+        #[case] settle_all: bool,
+    ) {
+        let mut engine = create_engine();
+        engine.last_ns = UnixNanos::from(30);
+        let fired = Rc::new(Cell::new(0));
+        let fired_clone = Rc::clone(&fired);
+        let callback = TimeEventCallback::RustLocal(Rc::new(move |_| {
+            fired_clone.set(fired_clone.get() + 1);
+        }));
+
+        for name in timer_names {
+            engine
+                .kernel
+                .clock
+                .borrow_mut()
+                .set_timer_ns(
+                    name,
+                    DurationNanos::new(1),
+                    Some(UnixNanos::from(20)),
+                    None,
+                    Some(callback.clone()),
+                    Some(true),
+                    Some(true),
+                )
+                .unwrap();
+        }
+
         let clocks = engine.collect_all_clocks();
 
         for clock in &clocks {
@@ -3181,12 +3904,18 @@ mod tests {
                 false,
             );
         }
-        engine
+
+        let settlement_scope = engine
             .run_timer_handlers_at(&clocks, UnixNanos::from(20), UnixNanos::from(30))
             .unwrap();
 
-        assert!(fired.get());
+        assert_eq!(fired.get(), timer_names.len());
         assert_eq!(engine.last_ns, UnixNanos::from(20));
+        assert_eq!(matches!(settlement_scope, SettlementScope::All), settle_all);
+        assert_eq!(
+            matches!(settlement_scope, SettlementScope::Data(None)),
+            !settle_all,
+        );
     }
 
     #[rstest]
@@ -3236,6 +3965,204 @@ mod tests {
         assert_eq!(engine.last_ns, UnixNanos::from(expected_last_ns));
     }
 
+    // Returns an engine with `instrument` registered and a quote in its book
+    fn engine_with_quoted_instrument(instrument: &InstrumentAny) -> BacktestEngine {
+        let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+        let venue = instrument.id().venue;
+        let venue_config = SimulatedVenueConfig::builder()
+            .venue(venue)
+            .oms_type(OmsType::Netting)
+            .account_type(AccountType::Margin)
+            .book_type(BookType::L1_MBP)
+            .starting_balances(vec![Money::from("1_000_000 USDT")])
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+            .build()
+            .unwrap();
+        engine.add_venue(venue_config).unwrap();
+        engine.add_instrument(instrument).unwrap();
+        let quote = QuoteTick::new(
+            instrument.id(),
+            Price::from("1000.00"),
+            Price::from("1001.00"),
+            Quantity::from("1.000"),
+            Quantity::from("1.000"),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+        );
+        msgbus::send_quote(
+            format!("SimulatedExchange.process_new_quote.{venue}").into(),
+            &quote,
+        );
+        engine
+    }
+
+    fn assert_original_registration_kept(engine: &BacktestEngine, instrument: &InstrumentAny) {
+        let instrument_id = instrument.id();
+        let exchange = engine.venues.get(&instrument_id.venue).unwrap().borrow();
+        let matching_engine = exchange.get_matching_engine(&instrument_id).unwrap();
+        assert_eq!(matching_engine.raw_id, 1);
+        assert_eq!(
+            exchange.best_bid_price(instrument_id),
+            Some(Price::from("1000.00"))
+        );
+        assert_eq!(
+            exchange.best_ask_price(instrument_id),
+            Some(Price::from("1001.00"))
+        );
+        let cache = engine.kernel.cache.borrow();
+        let cached = cache.instrument(&instrument_id).unwrap();
+        assert_eq!(Instrument::ts_init(cached), Instrument::ts_init(instrument));
+        assert_eq!(cached.max_quantity(), instrument.max_quantity());
+    }
+
+    #[rstest]
+    fn test_readd_identical_instrument_keeps_matching_engine(
+        crypto_perpetual_ethusdt: CryptoPerpetual,
+    ) {
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt.clone());
+        let mut engine = engine_with_quoted_instrument(&instrument);
+        let mut restamped = crypto_perpetual_ethusdt;
+        restamped.ts_event = UnixNanos::from(5);
+        restamped.ts_init = UnixNanos::from(5);
+
+        engine
+            .add_instrument(&InstrumentAny::CryptoPerpetual(restamped))
+            .unwrap();
+
+        assert_original_registration_kept(&engine, &instrument);
+    }
+
+    #[rstest]
+    fn test_readd_changed_instrument_is_rejected_and_keeps_matching_engine(
+        crypto_perpetual_ethusdt: CryptoPerpetual,
+    ) {
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt.clone());
+        let mut engine = engine_with_quoted_instrument(&instrument);
+        let mut changed = crypto_perpetual_ethusdt;
+        changed.max_quantity = Some(Quantity::from("1.000"));
+
+        let result = engine.add_instrument(&InstrumentAny::CryptoPerpetual(changed));
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Instrument ETHUSDT-PERP.BINANCE is already registered with a different definition"
+        );
+        assert_original_registration_kept(&engine, &instrument);
+    }
+
+    #[rstest]
+    #[case::unchanged("0.01", "0.01", false)]
+    #[case::finer("0.10", "0.01", true)]
+    #[case::coarser("0.01", "0.10", true)]
+    #[case::precision("0.01", "0.001", true)]
+    fn test_replay_instrument_updates(
+        mut crypto_perpetual_ethusdt: CryptoPerpetual,
+        #[case] initial_tick: &str,
+        #[case] revised_tick: &str,
+        #[case] clears_book: bool,
+    ) {
+        crypto_perpetual_ethusdt.price_increment = Price::from(initial_tick);
+        let original = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt.clone());
+        let id = original.id();
+        let mut engine = engine_with_quoted_instrument(&original);
+        let cache = engine.kernel.cache();
+        let exchange = Rc::clone(&engine.venues[&id.venue]);
+        let observed = Rc::new(Cell::new(0));
+        let received = Rc::clone(&observed);
+        let updated_exchange = Rc::clone(&exchange);
+        let order_id = ClientOrderId::from("O-REPLAY-UPDATE");
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .trader_id(engine.trader_id())
+            .instrument_id(id)
+            .client_order_id(order_id)
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.000"))
+            .price(Price::from("1000.00") + original.price_increment())
+            .build();
+        let order_cache = Rc::clone(&cache);
+        msgbus::subscribe_instruments(
+            nautilus_common::msgbus::switchboard::get_instruments_pattern(id.venue),
+            TypedHandler::from(move |instrument: &InstrumentAny| {
+                let exchange = updated_exchange.borrow();
+                let matching = exchange.get_matching_engine(&id).unwrap();
+                let increment = instrument.price_increment();
+                assert_eq!(matching.instrument.price_increment(), increment);
+                assert_eq!(matching.get_core().price_increment, increment);
+                drop(exchange);
+
+                if received.get() == 0 {
+                    order_cache
+                        .borrow_mut()
+                        .add_order(order.clone(), None, None, false)
+                        .unwrap();
+                    send_execution_command(TradingCommand::SubmitOrder(
+                        create_submit_order_command(&order),
+                    ));
+                }
+                received.set(received.get() + 1);
+            }),
+            None,
+        );
+        let increment = Price::from(revised_tick);
+        crypto_perpetual_ethusdt.price_precision = increment.precision;
+        crypto_perpetual_ethusdt.price_increment = increment;
+        let quote = QuoteTick::new(
+            id,
+            Price::from("1000.00"),
+            Price::from("1001.00"),
+            Quantity::from("1.000"),
+            Quantity::from("1.000"),
+            1.into(),
+            1.into(),
+        );
+        let mut data = vec![
+            Data::Instrument(Box::new(original.clone())),
+            Data::Quote(quote),
+        ];
+        data.extend([2, 3].map(|timestamp| {
+            let mut revised = crypto_perpetual_ethusdt.clone();
+            revised.ts_event = UnixNanos::from(timestamp);
+            revised.ts_init = UnixNanos::from(timestamp);
+            Data::Instrument(Box::new(InstrumentAny::CryptoPerpetual(revised)))
+        }));
+        engine.add_data(data, None, true, true).unwrap();
+
+        for _ in 0..2 {
+            engine.run(None, None, None, false).unwrap();
+            assert_eq!(observed.replace(0), 3);
+            assert_eq!(
+                cache.borrow().instrument(&id).unwrap().price_increment(),
+                increment
+            );
+            assert_eq!(
+                cache.borrow().order(&order_id).unwrap().status(),
+                if revised_tick == "0.10" {
+                    OrderStatus::Canceled
+                } else {
+                    OrderStatus::Accepted
+                }
+            );
+            {
+                let exchange = exchange.borrow();
+                let matching = exchange.get_matching_engine(&id).unwrap();
+                assert_eq!(matching.raw_id, 1);
+                assert_eq!(matching.instrument.price_precision(), increment.precision);
+                assert_eq!(exchange.best_bid_price(id).is_none(), clears_book);
+            }
+            engine.reset().unwrap();
+        }
+        assert_eq!(
+            cache.borrow().instrument(&id).unwrap().price_increment(),
+            original.price_increment()
+        );
+        let exchange = exchange.borrow();
+        let matching = exchange.get_matching_engine(&id).unwrap();
+        assert_eq!(
+            matching.get_core().price_increment,
+            original.price_increment()
+        );
+    }
+
     #[rstest]
     fn test_add_duplicate_venue_preserves_original_exchange(
         crypto_perpetual_ethusdt: CryptoPerpetual,
@@ -3248,6 +4175,7 @@ mod tests {
             .account_type(AccountType::Margin)
             .book_type(BookType::L1_MBP)
             .starting_balances(vec![Money::from("1_000_000 USDT")])
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
             .build()
             .unwrap();
         engine.add_venue(venue_config).unwrap();
@@ -3292,6 +4220,7 @@ mod tests {
             .account_type(AccountType::Margin)
             .book_type(BookType::L1_MBP)
             .starting_balances(vec![Money::from("1_000_000 USDT")])
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
             .build()
             .unwrap();
         assert!(engine.add_venue(duplicate_config).is_err());
@@ -3376,6 +4305,7 @@ mod tests {
             .account_type(AccountType::Margin)
             .book_type(BookType::L1_MBP)
             .starting_balances(vec![Money::from("1_000_000 USD")])
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
             .build()
             .unwrap();
         assert!(engine.add_venue(venue_config).is_err());
@@ -3564,6 +4494,82 @@ mod tests {
             ComponentState::Running
         );
         assert_eq!(engine.running_strategy_ids(), vec![strategy_id]);
+    }
+
+    #[rstest]
+    #[case::end(false)]
+    #[case::streaming_resume(true)]
+    fn test_latched_latency_failure_aborts_on_end_or_streaming_resume(#[case] resume: bool) {
+        let mut engine = create_engine();
+        let ts_now = UnixNanos::new(1);
+        engine
+            .run(Some(ts_now), Some(UnixNanos::new(2)), None, true)
+            .unwrap();
+        assert_eq!(engine.kernel.clock.borrow().timestamp_ns(), ts_now);
+        assert!(engine.kernel.trader.borrow().is_running());
+        let client_id = engine.exec_clients[0].client_id();
+        let connected_before = engine
+            .kernel
+            .exec_engine
+            .borrow()
+            .get_client(&client_id)
+            .unwrap()
+            .is_connected();
+        assert!(connected_before);
+
+        let venue = Venue::from("BINANCE");
+        engine.venues[&venue]
+            .borrow_mut()
+            .set_latency_model(LatencyModelHandle::new(StaticLatencyModel::new(
+                DurationNanos::ZERO,
+                DurationNanos::ZERO,
+                DurationNanos::ZERO,
+                DurationNanos::MAX,
+            )));
+        engine
+            .kernel
+            .exec_engine
+            .borrow()
+            .execute(TradingCommand::CancelAllOrders(CancelAllOrders::new(
+                TraderId::from("TRADER-001"),
+                None,
+                StrategyId::from("LATENCY-001"),
+                InstrumentId::from("ETHUSDT-PERP.BINANCE"),
+                None,
+                UUID4::new(),
+                ts_now,
+                None,
+                None,
+            )));
+
+        let error = if resume {
+            engine.run(None, None, None, true).unwrap_err()
+        } else {
+            engine.end().unwrap_err()
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("Latency arrival timestamp exceeds u64 nanoseconds")
+        );
+        assert!(!engine.kernel.trader.borrow().is_running());
+        let connected_after = engine
+            .kernel
+            .exec_engine
+            .borrow()
+            .get_client(&client_id)
+            .unwrap()
+            .is_connected();
+        assert!(!connected_after);
+        assert_eq!(engine.backtest_end(), Some(ts_now));
+        engine.reset().unwrap();
+        assert!(
+            engine.venues[&venue]
+                .borrow()
+                .check_callback_error()
+                .is_ok()
+        );
     }
 
     #[rstest]
@@ -3772,6 +4778,7 @@ mod tests {
             .account_type(AccountType::Margin)
             .book_type(BookType::L1_MBP)
             .starting_balances(vec![Money::from("1_000_000 USDT")])
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
             .build()
             .unwrap();
         engine.add_venue(venue_config).unwrap();
@@ -3827,7 +4834,7 @@ mod tests {
         assert!(commands.iter().any(|command| matches!(
             command,
             DataCommand::Unsubscribe(UnsubscribeCommand::Quotes(command))
-                if command.instrument_id == instrument_id
+                if command.instrument_ids == [instrument_id]
         )));
     }
 

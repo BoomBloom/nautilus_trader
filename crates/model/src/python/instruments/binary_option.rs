@@ -39,7 +39,7 @@ impl BinaryOption {
     /// Represents a generic binary option instrument.
     #[expect(clippy::too_many_arguments)]
     #[new]
-    #[pyo3(signature = (instrument_id, raw_symbol, asset_class, currency, activation_ns, expiration_ns, price_precision, size_precision, price_increment, size_increment, ts_event, ts_init, outcome=None, description=None, max_quantity=None, min_quantity=None, max_notional=None, min_notional=None, max_price=None, min_price=None, margin_init=None, margin_maint=None, maker_fee=None, taker_fee=None, tick_scheme=None, info=None, event_id=None))]
+    #[pyo3(signature = (instrument_id, raw_symbol, asset_class, currency, activation_ns, expiration_ns, price_precision, size_precision, price_increment, size_increment, ts_event, ts_init, outcome=None, description=None, max_quantity=None, min_quantity=None, max_notional=None, min_notional=None, max_price=None, min_price=None, margin_init=None, margin_maint=None, tick_scheme=None, info=None, event_id=None))]
     fn py_new(
         instrument_id: InstrumentId,
         raw_symbol: Symbol,
@@ -63,8 +63,6 @@ impl BinaryOption {
         min_price: Option<Price>,
         margin_init: Option<Decimal>,
         margin_maint: Option<Decimal>,
-        maker_fee: Option<Decimal>,
-        taker_fee: Option<Decimal>,
         tick_scheme: Option<String>,
         info: Option<Py<PyDict>>,
         event_id: Option<String>,
@@ -98,8 +96,6 @@ impl BinaryOption {
             .maybe_min_price(min_price)
             .maybe_margin_init(margin_init)
             .maybe_margin_maint(margin_maint)
-            .maybe_maker_fee(maker_fee)
-            .maybe_taker_fee(taker_fee)
             .maybe_tick_scheme(tick_scheme.map(|name| ustr::Ustr::from(name.as_str())))
             .maybe_info(info_map)
             .ts_event(ts_event.into())
@@ -260,34 +256,11 @@ impl BinaryOption {
     }
 
     #[getter]
-    #[pyo3(name = "maker_fee")]
-    fn py_maker_fee(&self) -> Decimal {
-        self.maker_fee
-    }
-
-    #[getter]
-    #[pyo3(name = "taker_fee")]
-    fn py_taker_fee(&self) -> Decimal {
-        self.taker_fee
-    }
-
-    #[getter]
     #[pyo3(name = "info")]
     fn py_info(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        // Convert HashMap<String, serde_json::Value> back to Python dict
-        if let Some(ref info_map) = self.info {
-            let py_dict = PyDict::new(py);
-
-            for (key, value) in info_map {
-                // Convert serde_json::Value back to Python object via JSON
-                let json_str = serde_json::to_string(value).map_err(to_pyvalue_err)?;
-                let py_value =
-                    PyModule::import(py, "json")?.call_method("loads", (json_str,), None)?;
-                py_dict.set_item(key, py_value)?;
-            }
-            Ok(py_dict.unbind())
-        } else {
-            Ok(PyDict::new(py).unbind())
+        match &self.info {
+            Some(info) => info.to_pydict(py),
+            None => Ok(PyDict::new(py).unbind()),
         }
     }
 
@@ -325,25 +298,9 @@ impl BinaryOption {
         dict.set_item("size_increment", self.size_increment.to_string())?;
         dict.set_item("margin_init", self.margin_init.to_string())?;
         dict.set_item("margin_maint", self.margin_maint.to_string())?;
-        dict.set_item("maker_fee", self.maker_fee.to_string())?;
-        dict.set_item("taker_fee", self.taker_fee.to_string())?;
         dict.set_item("ts_event", self.ts_event.as_u64())?;
         dict.set_item("ts_init", self.ts_init.as_u64())?;
-        // Serialize info dict
-        if let Some(ref info_map) = self.info {
-            let info_dict = PyDict::new(py);
-
-            for (key, value) in info_map {
-                let json_str = serde_json::to_string(value).map_err(to_pyvalue_err)?;
-                let py_value =
-                    PyModule::import(py, "json")?.call_method("loads", (json_str,), None)?;
-                info_dict.set_item(key, py_value)?;
-            }
-            dict.set_item("info", info_dict)?;
-        } else {
-            dict.set_item("info", PyDict::new(py))?;
-        }
-
+        dict.set_item("info", self.py_info(py)?)?;
         dict.set_item("event_id", self.event_id.map(|value| value.to_string()))?;
 
         match &self.outcome {
@@ -395,6 +352,8 @@ impl BinaryOption {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use pyo3::{prelude::*, types::PyDict};
     use rstest::rstest;
 
@@ -465,14 +424,37 @@ mod tests {
     #[rstest]
     fn test_dict_round_trip(mut binary_option: BinaryOption) {
         binary_option.event_id = Some("event-123".into());
-        let mut info = nautilus_core::Params::new();
-        info.insert(
-            "gamma_market".to_string(),
-            "0.1234567890123456789012345678".into(),
+
+        let info = nautilus_core::Params::new(
+            [(
+                "gamma_market".to_string(),
+                "0.1234567890123456789012345678".into(),
+            )]
+            .into(),
         );
+        let mut info = info.to_shared_map();
+
+        let event = Arc::new(
+            serde_json::json!({"markets": ["first", "second"]})
+                .to_string()
+                .into(),
+        );
+        info.insert("gamma_event".to_string(), Arc::clone(&event));
+        let info = nautilus_core::Params::from_shared(info);
+        let retained = info.estimated_heap_size();
         binary_option.info = Some(info);
         Python::initialize();
         Python::attach(|py| {
+            let info = binary_option.py_info(py).unwrap();
+            assert_eq!(
+                info.bind(py)
+                    .get_item("gamma_event")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                event.as_str().unwrap()
+            );
             let values = binary_option.py_to_dict(py).unwrap();
             let values: Py<PyDict> = values.extract(py).unwrap();
             let new_binary_option = BinaryOption::py_from_dict(py, values).unwrap();
@@ -482,5 +464,10 @@ mod tests {
                 serde_json::to_value(&new_binary_option).unwrap(),
             );
         });
+
+        assert_eq!(
+            binary_option.info.as_ref().unwrap().estimated_heap_size(),
+            retained
+        );
     }
 }

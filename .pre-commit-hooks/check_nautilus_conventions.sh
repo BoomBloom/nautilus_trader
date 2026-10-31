@@ -367,9 +367,9 @@ architect_ax nautilus_architect_ax::python::architect_ax
 backtest nautilus_backtest::python::backtest
 betfair nautilus_betfair::python::betfair
 binance nautilus_binance::python::binance
-bitmex nautilus_bitmex::python::bitmex
 blockchain nautilus_blockchain::python::blockchain
 bybit nautilus_bybit::python::bybit
+coinapi nautilus_coinapi::python::coinapi
 coinbase nautilus_coinbase::python::coinbase
 common nautilus_common::python::common
 core nautilus_core::python::core
@@ -380,6 +380,7 @@ deribit nautilus_deribit::python::deribit
 derive nautilus_derive::python::derive
 dydx nautilus_dydx::python::dydx
 execution nautilus_execution::python::execution
+finfeed nautilus_finfeed::python::finfeed
 hyperliquid nautilus_hyperliquid::python::hyperliquid
 indicators nautilus_indicators::python::indicators
 infrastructure nautilus_infrastructure::python::infrastructure

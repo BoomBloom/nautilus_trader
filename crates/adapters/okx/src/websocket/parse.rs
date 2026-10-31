@@ -65,6 +65,7 @@ use crate::{
             parse_instrument_any, parse_instrument_id, parse_message_vec,
             parse_millisecond_timestamp, parse_parent_client_order_id, parse_price, parse_quantity,
             parse_spread_order_status_report as parse_common_spread_order_status_report,
+            venue_position_id,
         },
     },
     http::models::OKXSpreadOrder,
@@ -149,44 +150,23 @@ pub const fn is_terminal_order_state(state: OKXOrderStatus) -> bool {
     )
 }
 
-/// Extracts fee rates from a cached instrument.
+/// Extracts margin rates from a cached instrument.
 ///
-/// Returns a tuple of (`margin_init`, `margin_maint`, `maker_fee`, `taker_fee`).
-/// All values are None if the instrument type doesn't support fees.
+/// Returns a tuple of (`margin_init`, `margin_maint`).
+/// Both values are None if the instrument type doesn't carry margins.
 pub(crate) fn extract_fees_from_cached_instrument(
     instrument: &InstrumentAny,
-) -> (
-    Option<Decimal>,
-    Option<Decimal>,
-    Option<Decimal>,
-    Option<Decimal>,
-) {
+) -> (Option<Decimal>, Option<Decimal>) {
     match instrument {
-        InstrumentAny::CurrencyPair(pair) => (
-            Some(pair.margin_init),
-            Some(pair.margin_maint),
-            Some(pair.maker_fee),
-            Some(pair.taker_fee),
-        ),
-        InstrumentAny::CryptoPerpetual(perp) => (
-            Some(perp.margin_init),
-            Some(perp.margin_maint),
-            Some(perp.maker_fee),
-            Some(perp.taker_fee),
-        ),
-        InstrumentAny::CryptoFuture(future) => (
-            Some(future.margin_init),
-            Some(future.margin_maint),
-            Some(future.maker_fee),
-            Some(future.taker_fee),
-        ),
-        InstrumentAny::CryptoOption(option) => (
-            Some(option.margin_init),
-            Some(option.margin_maint),
-            Some(option.maker_fee),
-            Some(option.taker_fee),
-        ),
-        _ => (None, None, None, None),
+        InstrumentAny::CurrencyPair(pair) => (Some(pair.margin_init), Some(pair.margin_maint)),
+        InstrumentAny::CryptoPerpetual(perp) => (Some(perp.margin_init), Some(perp.margin_maint)),
+        InstrumentAny::CryptoFuture(future) => {
+            (Some(future.margin_init), Some(future.margin_maint))
+        }
+        InstrumentAny::CryptoOption(option) => {
+            (Some(option.margin_init), Some(option.margin_maint))
+        }
+        _ => (None, None),
     }
 }
 
@@ -1669,7 +1649,7 @@ pub fn parse_algo_order_status_report(
     }
 
     report.trigger_type = Some(trigger_type);
-
+    report.venue_position_id = venue_position_id(instrument.id(), msg.pos_side);
     if let Some(limit_price) = price {
         report.price = Some(limit_price);
     }
@@ -1901,15 +1881,11 @@ pub fn parse_order_status_report(
         (quantity, filled_qty)
     };
 
-    // For quote-quantity orders marked as FILLED, adjust quantity to match filled_qty
-    // to avoid precision mismatches from quote-to-base conversion
-    let (quantity, filled_qty) = if (is_quote_qty_explicit || is_quote_qty_heuristic)
-        && msg.state == OKXOrderStatus::Filled
-        && filled_qty.is_positive()
-    {
-        (filled_qty, filled_qty)
+    // Normalize quote conversion and base shortfalls to the venue's terminal filled size
+    let quantity = if msg.state == OKXOrderStatus::Filled && filled_qty.is_positive() {
+        filled_qty
     } else {
-        (quantity, filled_qty)
+        quantity
     };
 
     let ts_accepted = parse_millisecond_timestamp(msg.c_time);
@@ -1959,6 +1935,8 @@ pub fn parse_order_status_report(
     );
 
     let price_precision = instrument.price_precision();
+
+    report.venue_position_id = venue_position_id(instrument.id(), msg.pos_side);
 
     if okx_order_type == OKXOrderType::Trigger {
         // For triggered orders coming through regular orders channel,
@@ -2319,7 +2297,7 @@ pub fn parse_fill_report(
         commission,
         liquidity_side,
         client_order_id,
-        None,
+        venue_position_id(instrument.id(), msg.pos_side),
         ts_event,
         ts_init,
         None, // Generate UUID4 automatically
@@ -2416,9 +2394,8 @@ pub fn parse_option_summary_greeks(
 ///
 /// # Panics
 ///
-/// Panics only in the case where `okx_channel_to_bar_spec(channel)` returns
-/// `None` after a prior `is_some` check - an unreachable scenario indicating a
-/// logic error.
+/// Panics if `okx_channel_to_bar_spec(channel)` returns `None` after a prior `is_some` check, an
+/// unreachable scenario indicating a logic error.
 #[expect(clippy::too_many_arguments)]
 pub fn parse_ws_message_data(
     channel: &OKXWsChannel,
@@ -2435,10 +2412,8 @@ pub fn parse_ws_message_data(
             if let Ok(msg) = serde_json::from_value::<OKXInstrument>(data) {
                 let inst_key = msg.inst_id;
                 let cached_instrument = instruments_cache.get(&inst_key);
-                let (margin_init, margin_maint, maker_fee, taker_fee) = cached_instrument.map_or(
-                    (None, None, None, None),
-                    extract_fees_from_cached_instrument,
-                );
+                let (margin_init, margin_maint) =
+                    cached_instrument.map_or((None, None), extract_fees_from_cached_instrument);
                 let instrument_id =
                     cached_instrument.map_or_else(|| parse_instrument_id(inst_key), Instrument::id);
 
@@ -2455,14 +2430,7 @@ pub fn parse_ws_message_data(
                     None,
                 );
 
-                match parse_instrument_any(
-                    &msg,
-                    margin_init,
-                    margin_maint,
-                    maker_fee,
-                    taker_fee,
-                    ts_init,
-                ) {
+                match parse_instrument_any(&msg, margin_init, margin_maint, ts_init) {
                     Ok(Some(inst_any)) => Ok(Some(NautilusWsMessage::Instrument(
                         Box::new(inst_any),
                         Some(status),
@@ -2567,13 +2535,12 @@ mod tests {
     use nautilus_model::{
         data::bar::BAR_SPEC_1_DAY_LAST,
         enums::{AccountType, BookType, GreeksConvention},
-        identifiers::{ClientOrderId, Symbol, VenueOrderId},
-        instruments::CryptoPerpetual,
+        identifiers::{ClientOrderId, PositionId, Symbol, VenueOrderId},
+        instruments::{CryptoPerpetual, CurrencyPair},
         orderbook::OrderBook,
         types::Currency,
     };
     use rstest::rstest;
-    use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use serde_json::Value;
     use ustr::Ustr;
@@ -3539,6 +3506,89 @@ mod tests {
         assert_eq!(order_status_report.order_status, OrderStatus::Filled);
         assert_eq!(order_status_report.quantity, Quantity::from("0.03000000"));
         assert_eq!(order_status_report.filled_qty, Quantity::from("0.03000000"));
+    }
+
+    #[rstest]
+    #[case::base_filled(
+        OKXOrderStatus::Filled,
+        OKXTargetCurrency::BaseCcy,
+        "0.00296487",
+        "0.00296475",
+        "0.00296475"
+    )]
+    #[case::base_partial(
+        OKXOrderStatus::PartiallyFilled,
+        OKXTargetCurrency::BaseCcy,
+        "0.00296487",
+        "0.00296475",
+        "0.00296487"
+    )]
+    #[case::base_canceled(
+        OKXOrderStatus::Canceled,
+        OKXTargetCurrency::BaseCcy,
+        "0.00296487",
+        "0.00296475",
+        "0.00296487"
+    )]
+    #[case::base_zero_fill(
+        OKXOrderStatus::Filled,
+        OKXTargetCurrency::BaseCcy,
+        "0.00296487",
+        "0",
+        "0.00296487"
+    )]
+    #[case::quote_filled(
+        OKXOrderStatus::Filled,
+        OKXTargetCurrency::QuoteCcy,
+        "296.487",
+        "0.00296475",
+        "0.00296475"
+    )]
+    fn test_parse_order_status_report_terminal_quantity(
+        #[values("", "0")] price: &str,
+        #[case] state: OKXOrderStatus,
+        #[case] target: OKXTargetCurrency,
+        #[case] size: &str,
+        #[case] filled: &str,
+        #[case] expected_quantity: &str,
+    ) {
+        let payload: Value = serde_json::from_str(&load_test_json("ws_orders.json")).unwrap();
+        let mut order: OKXOrderMsg = serde_json::from_value(payload["data"][0].clone()).unwrap();
+        order.inst_type = OKXInstrumentType::Spot;
+        order.ord_type = OKXOrderType::Market;
+        order.side = OKXSide::Buy;
+        order.tgt_ccy = Some(target);
+        order.state = state;
+        order.sz = size.to_string();
+        order.acc_fill_sz = Some(filled.to_string());
+        order.px = price.to_string();
+        order.avg_px = "100000".to_string();
+        let instrument = CurrencyPair::builder()
+            .instrument_id(InstrumentId::from("BTC-USDC.OKX"))
+            .raw_symbol(Symbol::from("BTC-USDC"))
+            .base_currency(Currency::BTC())
+            .quote_currency(Currency::USDC())
+            .price_precision(2)
+            .size_precision(8)
+            .price_increment(Price::from("0.01"))
+            .size_increment(Quantity::from("0.00000001"))
+            .ts_event(UnixNanos::default())
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap();
+
+        let report = parse_order_status_report(
+            &order,
+            &InstrumentAny::CurrencyPair(instrument),
+            AccountId::from("OKX-001"),
+            UnixNanos::default(),
+        )
+        .unwrap();
+
+        assert_eq!(report.price, None);
+        assert_eq!(report.order_status, OrderStatus::try_from(state).unwrap());
+        assert_eq!(report.quantity, Quantity::from(expected_quantity));
+        assert_eq!(report.filled_qty, Quantity::from(filled));
     }
 
     #[rstest]
@@ -5458,14 +5508,7 @@ mod tests {
 
         let ts_init = UnixNanos::default();
 
-        // Create initial instrument with fees (simulating HTTP load)
-        // These values are already in Nautilus format (HTTP client negates OKX values)
-        let initial_fees = (
-            Some(Decimal::new(8, 4)),  // Nautilus: 0.0008 (commission)
-            Some(Decimal::new(10, 4)), // Nautilus: 0.0010 (commission)
-        );
-
-        // Deserialize initial instrument from JSON
+        // Deserialize the initial instrument from JSON.
         let initial_inst_json = serde_json::json!({
             "instType": "SPOT",
             "instId": "BTC-USD",
@@ -5502,25 +5545,14 @@ mod tests {
         let initial_inst: OKXInstrument = serde_json::from_value(initial_inst_json)
             .expect("Failed to deserialize initial instrument");
 
-        // Parse initial instrument with fees
-        let parsed_initial = parse_instrument_any(
-            &initial_inst,
-            None,
-            None,
-            initial_fees.0,
-            initial_fees.1,
-            ts_init,
-        )
-        .expect("Failed to parse initial instrument")
-        .expect("Initial instrument should not be None");
+        // Parse the initial instrument.
+        let parsed_initial = parse_instrument_any(&initial_inst, None, None, ts_init)
+            .expect("Failed to parse initial instrument")
+            .expect("Initial instrument should not be None");
 
-        // Verify fees were applied
-        if let InstrumentAny::CurrencyPair(ref pair) = parsed_initial {
-            assert_eq!(pair.maker_fee, dec!(0.0008));
-            assert_eq!(pair.taker_fee, dec!(0.0010));
-        } else {
+        let InstrumentAny::CurrencyPair(_) = parsed_initial else {
             panic!("Expected CurrencyPair instrument");
-        }
+        };
 
         // Build instrument cache with the initial instrument
         let mut instruments_cache = AHashMap::new();
@@ -5576,22 +5608,10 @@ mod tests {
         )
         .expect("Failed to parse WebSocket instrument update");
 
-        // Verify the update preserves the cached fees
         if let Some(NautilusWsMessage::Instrument(boxed_inst, _status)) = result {
-            if let InstrumentAny::CurrencyPair(pair) = *boxed_inst {
-                assert_eq!(
-                    pair.maker_fee,
-                    Decimal::new(8, 4),
-                    "Maker fee should be preserved from cache"
-                );
-                assert_eq!(
-                    pair.taker_fee,
-                    Decimal::new(10, 4),
-                    "Taker fee should be preserved from cache"
-                );
-            } else {
+            let InstrumentAny::CurrencyPair(_) = *boxed_inst else {
                 panic!("Expected CurrencyPair instrument from WebSocket update");
-            }
+            };
         } else {
             panic!("Expected Instrument message from WebSocket update");
         }
@@ -7592,7 +7612,7 @@ mod tests {
 
         let ts_init = UnixNanos::default();
 
-        // Build a cached instrument with fees
+        // Build a cached instrument.
         let inst_json = serde_json::json!({
             "instType": "SPOT",
             "instId": "BTC-USD",
@@ -7625,7 +7645,7 @@ mod tests {
             "instFamily": ""
         });
         let initial: OKXInstrument = serde_json::from_value(inst_json).unwrap();
-        let parsed = parse_instrument_any(&initial, None, None, None, None, ts_init)
+        let parsed = parse_instrument_any(&initial, None, None, ts_init)
             .unwrap()
             .unwrap();
 
@@ -7791,7 +7811,7 @@ mod tests {
             "instFamily": ""
         });
         let initial: OKXInstrument = serde_json::from_value(inst_json).unwrap();
-        let parsed = parse_instrument_any(&initial, None, None, None, None, ts_init)
+        let parsed = parse_instrument_any(&initial, None, None, ts_init)
             .unwrap()
             .unwrap();
 
@@ -8257,5 +8277,55 @@ mod tests {
             .expect("should have an ask delta");
         assert_eq!(bid.order.price.as_decimal(), dec!(16.65));
         assert_eq!(ask.order.price.as_decimal(), dec!(16.7));
+    }
+
+    #[rstest]
+    #[case(OKXPositionSide::Long, Some("BTC-USDT-SWAP.OKX-LONG"))]
+    #[case(OKXPositionSide::Short, Some("BTC-USDT-SWAP.OKX-SHORT"))]
+    #[case(OKXPositionSide::Net, None)]
+    #[case(OKXPositionSide::None, None)]
+    fn test_order_and_fill_position_ids(
+        #[case] side: OKXPositionSide,
+        #[case] expected: Option<&str>,
+    ) {
+        let payload: Value = serde_json::from_str(&load_test_json("ws_orders.json")).unwrap();
+        let mut msg: OKXOrderMsg = serde_json::from_value(payload["data"][0].clone()).unwrap();
+        msg.pos_side = side;
+        let instrument = InstrumentAny::CryptoPerpetual(create_stub_instrument());
+        let account_id = AccountId::from("OKX-001");
+        let order =
+            parse_order_status_report(&msg, &instrument, account_id, UnixNanos::default()).unwrap();
+        let fill = parse_fill_report(
+            &msg,
+            &instrument,
+            account_id,
+            None,
+            None,
+            UnixNanos::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let expected = expected.map(PositionId::from);
+        assert_eq!(order.venue_position_id, expected);
+        assert_eq!(fill.venue_position_id, expected);
+    }
+
+    #[rstest]
+    #[case(OKXPositionSide::Long, Some("BTC-USDT-SWAP.OKX-LONG"))]
+    #[case(OKXPositionSide::Short, Some("BTC-USDT-SWAP.OKX-SHORT"))]
+    #[case(OKXPositionSide::Net, None)]
+    fn test_algo_order_position_id(#[case] side: OKXPositionSide, #[case] expected: Option<&str>) {
+        let payload: Value = serde_json::from_str(&load_test_json("ws_orders_algo.json")).unwrap();
+        let mut msg: OKXAlgoOrderMsg = serde_json::from_value(payload["data"][0].clone()).unwrap();
+        msg.pos_side = side;
+        let instrument = InstrumentAny::CryptoPerpetual(create_stub_instrument());
+        let report = parse_algo_order_status_report(
+            &msg,
+            &instrument,
+            AccountId::from("OKX-001"),
+            UnixNanos::default(),
+        )
+        .unwrap();
+        assert_eq!(report.venue_position_id, expected.map(PositionId::from));
     }
 }

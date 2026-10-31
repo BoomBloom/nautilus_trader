@@ -77,6 +77,8 @@ from nautilus_trader.model import VenueOrderId
 from nautilus_trader.trading import Strategy
 
 
+pytestmark = pytest.mark.usefixtures("collect_node_cycles")
+
 INSTRUMENT_ID = InstrumentId.from_str("EUR/USD.PYTHON")
 
 
@@ -118,20 +120,21 @@ class Client(MarketDataClient):
     async def _subscribe_quotes(self, command):
         self.command = command
         self.callback_thread = threading.get_ident()
-        self._handle_data(
-            QuoteTick(
-                instrument_id=command.instrument_id,
-                bid_price=Price.from_str("1.12345"),
-                ask_price=Price.from_str("1.12349"),
-                bid_size=Quantity.from_str("17"),
-                ask_size=Quantity.from_str("23"),
-                ts_event=19,
-                ts_init=29,
-            ),
-        )
+        for instrument_id in command.instrument_ids:
+            self._handle_data(
+                QuoteTick(
+                    instrument_id=instrument_id,
+                    bid_price=Price.from_str("1.12345"),
+                    ask_price=Price.from_str("1.12349"),
+                    bid_size=Quantity.from_str("17"),
+                    ask_size=Quantity.from_str("23"),
+                    ts_event=19,
+                    ts_init=29,
+                ),
+            )
 
     async def _unsubscribe_quotes(self, command):
-        self.unsubscribed = command.instrument_id
+        self.unsubscribed = command.instrument_ids
 
 
 class Factory(DataClientFactory):
@@ -272,11 +275,11 @@ def test_factory_cannot_reuse_another_nodes_client() -> None:
         def create(**kwargs: object) -> object:
             return client
 
-    try:
-        with pytest.raises(RuntimeError, match="owning factory cache view"):
-            build_node(ReusingFactory, config=client.config)
-    finally:
-        node.dispose()
+    node.dispose()
+    del node
+
+    with pytest.raises(RuntimeError, match="owning factory cache view"):
+        build_node(ReusingFactory, config=client.config)
 
 
 @pytest.mark.parametrize("registration", ["named", "instance", "importable", "direct_importable"])
@@ -628,7 +631,7 @@ async def test_typed_subscription_and_data_reach_strategy(subscription, callback
     assert received == [expected]
     assert len(commands) == 1
     command = commands[0]
-    assert command.instrument_id == INSTRUMENT_ID
+    assert command.instrument_ids == [INSTRUMENT_ID]
     assert command.client_id == ClientId("PYTHON")
     assert command.venue == Venue("PYTHON")
     expected_params = {**params, "start_ns": None} if subscription == "trades" else params
@@ -637,7 +640,7 @@ async def test_typed_subscription_and_data_reach_strategy(subscription, callback
     changed["nested"]["sequence"] = 97
     assert command.params == expected_params
     with pytest.raises(AttributeError):
-        command.instrument_id = InstrumentId.from_str("GBP/USD.PYTHON")
+        command.instrument_ids = [InstrumentId.from_str("GBP/USD.PYTHON")]
 
 
 @pytest.mark.asyncio
@@ -1067,17 +1070,28 @@ async def test_historical_data_families_preserve_payload_and_correlation(
         "data",
         "instruments",
         "instrument",
+        "instrument_batch",
         "book_deltas",
+        "book_deltas_batch",
         "book_depth",
+        "book_depth_batch",
         "quotes",
         "trades",
+        "trades_batch",
         "mark_prices",
+        "mark_prices_batch",
         "index_prices",
+        "index_prices_batch",
         "funding_rates",
+        "funding_rates_batch",
         "bars",
+        "bars_batch",
         "instrument_status",
+        "instrument_status_batch",
         "instrument_close",
+        "instrument_close_batch",
         "option_greeks",
+        "option_greeks_batch",
     ],
 )
 async def test_all_subscription_families_preserve_subscribe_and_unsubscribe_fields(kind) -> None:  # noqa: C901 - Keep typed family dispatch and field assertions together.
@@ -1087,6 +1101,11 @@ async def test_all_subscription_families_preserve_subscribe_and_unsubscribe_fiel
     from nautilus_trader.model import BarType
     from nautilus_trader.model import DataType
 
+    batch = kind.endswith("_batch")
+    if batch:
+        kind = kind.removesuffix("_batch")
+    parts = 1
+    second = InstrumentId.from_str("GBP/USD.PYTHON")
     subscribed = asyncio.Event()
     unsubscribed = asyncio.Event()
     commands = []
@@ -1097,6 +1116,15 @@ async def test_all_subscription_families_preserve_subscribe_and_unsubscribe_fiel
         kind,
         INSTRUMENT_ID,
     )
+
+    bar_second = BarType.from_str("EUR/USD.PYTHON-5-MINUTE-LAST-EXTERNAL")
+
+    if batch:
+        identity = (
+            [bar_type, bar_second, bar_type]
+            if kind == "bars"
+            else [INSTRUMENT_ID, second, INSTRUMENT_ID]
+        )
     extra = (
         {"book_type": BookType.L2_MBP, "managed": False}
         if kind in ("book_deltas", "book_depth")
@@ -1111,11 +1139,13 @@ async def test_all_subscription_families_preserve_subscribe_and_unsubscribe_fiel
 
     async def subscribe(self, command):
         commands.append(command)
-        subscribed.set()
+        if len(commands) == parts:
+            subscribed.set()
 
     async def unsubscribe(self, command):
         commands.append(command)
-        unsubscribed.set()
+        if len(commands) == parts * 2:
+            unsubscribed.set()
 
     suffix = "" if kind == "data" else f"_{kind}"
     setattr(TypedClient, f"_subscribe{suffix}", subscribe)
@@ -1145,8 +1175,8 @@ async def test_all_subscription_families_preserve_subscribe_and_unsubscribe_fiel
             await subscribed.wait()
             getattr(consumer, f"unsubscribe_{kind}")(
                 identity,
-                client_id=ClientId("PYTHON"),
-                params=params,
+                client_id=ClientId("FALLBACK") if batch else ClientId("PYTHON"),
+                params={"route": "fallback"} if batch else params,
             )
             await unsubscribed.wait()
     finally:
@@ -1154,14 +1184,15 @@ async def test_all_subscription_families_preserve_subscribe_and_unsubscribe_fiel
         async with asyncio.timeout(5):
             await task
 
-    assert len(commands) == 2
-    assert commands[0].command_id != commands[1].command_id
+    assert len(commands) == parts * 2
+    assert commands[0].command_id != commands[parts].command_id
     for index, command in enumerate(commands):
         assert command.client_id == ClientId("PYTHON")
         assert command.venue == (None if kind == "data" else Venue("PYTHON"))
         expected_params = (
             {**params, "start_ns": None}
-            if kind in ("data", "quotes", "trades", "bars") and index == 0
+            if (kind == "bars" and index < parts)
+            or (kind in ("data", "quotes", "trades") and not batch and index == 0)
             else params
         )
         assert command.params == expected_params
@@ -1171,9 +1202,14 @@ async def test_all_subscription_families_preserve_subscribe_and_unsubscribe_fiel
         if kind == "data":
             assert command.data_type == data_type
         elif kind == "bars":
-            assert command.bar_type == bar_type
+            assert command.bar_types == ([bar_type, bar_second] if batch else [bar_type])
+            snapshot = command.bar_types
+            snapshot.clear()
+            assert command.bar_types == ([bar_type, bar_second] if batch else [bar_type])
+            with pytest.raises(AttributeError):
+                command.bar_types = []
         elif kind != "instruments":
-            assert command.instrument_id == INSTRUMENT_ID
+            assert command.instrument_ids == ([INSTRUMENT_ID, second] if batch else [INSTRUMENT_ID])
         with pytest.raises(AttributeError):
             command.ts_init = 131
     if kind in ("book_deltas", "book_depth"):
@@ -1566,11 +1602,11 @@ def test_factory_cannot_reclaim_registered_output_with_replaced_context() -> Non
             return clients[0]
 
     node = build_node(ReusingFactory)
-    try:
-        with pytest.raises(RuntimeError, match="A client instance cannot be registered twice"):
-            build_node(ReusingFactory)
-    finally:
-        node.dispose()
+    node.dispose()
+    del node
+
+    with pytest.raises(RuntimeError, match="A client instance cannot be registered twice"):
+        build_node(ReusingFactory)
 
     with pytest.raises(RuntimeError, match="disposed"):
         clients[0].cache.instrument(INSTRUMENT_ID)
@@ -1677,11 +1713,13 @@ def test_failed_lifecycle_releases_background_tasks_and_cache(operation, launch)
     message = (
         "readiness timeout while waiting for engine connections"
         if operation == "connect"
-        else "Adapter disconnection failed"
+        else "Failed to disconnect data clients: PYTHON"
     )
-    with pytest.raises(RuntimeError, match=message):
+    with pytest.raises(RuntimeError, match=message) as error:
         run()
 
+    assert "Adapter connection failed" not in str(error.value)
+    assert "Adapter disconnection failed" not in str(error.value)
     assert calls == ["background_closed"]
     assert clients[0]._runtime.complete is True
     # A failed disconnect must not report a successfully disconnected transport
@@ -1757,3 +1795,86 @@ async def test_node_rechecks_incomplete_cleanup_until_background_task_finishes(
 
     assert pending == (False, False)
     assert clients[0]._runtime.complete is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("consumer_kind", ["actor", "strategy"])
+@pytest.mark.parametrize("collection", [list, tuple])
+@pytest.mark.parametrize("mixed_venues", [False, True])
+async def test_bar_lists_validate_before_effects_and_preserve_keyword(
+    consumer_kind,
+    collection,
+    mixed_venues,
+) -> None:
+    """
+    Validate lists before subscription effects and retain the scalar keyword.
+    """
+    from nautilus_trader.common import DataActor
+    from nautilus_trader.model import BarType
+
+    first = BarType.from_str("EUR/USD.PYTHON-1-MINUTE-LAST-EXTERNAL")
+    second = BarType.from_str(
+        "EUR/USD.OTHER-5-MINUTE-LAST-EXTERNAL"
+        if mixed_venues
+        else "EUR/USD.PYTHON-5-MINUTE-LAST-EXTERNAL",
+    )
+    other_venue = BarType.from_str("EUR/USD.OTHER-1-MINUTE-LAST-EXTERNAL")
+    subscribed = asyncio.Event()
+    unsubscribed = asyncio.Event()
+    commands = []
+
+    class BarClient(Client):
+        async def _subscribe_bars(self, command):
+            commands.append(command)
+            if len(commands) == 1:
+                subscribed.set()
+
+        async def _unsubscribe_bars(self, command):
+            commands.append(command)
+            if len(commands) == 2:
+                unsubscribed.set()
+
+    class BarFactory(DataClientFactory):
+        @staticmethod
+        def create(**kwargs: object) -> object:
+            return BarClient(**kwargs, venue=Venue("PYTHON"))
+
+    base = DataActor if consumer_kind == "actor" else Strategy
+
+    class Consumer(base):
+        def on_start(self):
+            for method in (self.subscribe_bars, self.unsubscribe_bars):
+                for invalid in (None, "", [first, None], [first, "wrong"], [1]):
+                    with pytest.raises(TypeError, match="expected BarType"):
+                        method(bar_type=invalid)
+                with pytest.raises(ValueError, match="bar types cannot be empty"):
+                    method(bar_type=collection())
+                with pytest.raises(ValueError, match="explicit client ID"):
+                    method(bar_type=collection([first, other_venue]))
+            self.subscribe_bars(
+                bar_type=collection([second, first, second]),
+                client_id=ClientId("PYTHON"),
+            )
+
+    consumer = Consumer()
+    node = build_node(BarFactory)
+    getattr(node, "add_actor" if consumer_kind == "actor" else "add_strategy")(consumer)
+    handle = node.handle()
+    task = asyncio.create_task(node.run_async())
+    try:
+        async with asyncio.timeout(5):
+            await subscribed.wait()
+            consumer.unsubscribe_bars(
+                bar_type=collection([first, second, first]),
+                client_id=ClientId("FALLBACK"),
+            )
+            await unsubscribed.wait()
+    finally:
+        handle.stop()
+        async with asyncio.timeout(5):
+            await task
+    assert [command.bar_types for command in commands] == [[second, first], [first, second]]
+    assert [command.client_id for command in commands] == [ClientId("PYTHON")] * 2
+    assert [command.venue for command in commands] == [
+        None if mixed_venues else Venue("PYTHON"),
+    ] * 2

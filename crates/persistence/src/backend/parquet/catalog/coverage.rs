@@ -16,8 +16,8 @@
 //! Interval coverage and missing-interval checks for the Parquet catalog.
 
 use super::{
-    Cow, ParquetDataCatalog, extract_bar_type_instrument_id, parse_filename_timestamps,
-    query::is_parquet_bar_prefix, query_interval_diff, urisafe_instrument_id, urlencoding,
+    ParquetDataCatalog, extract_bar_type_instrument_id, parse_filename_timestamps,
+    query::is_parquet_bar_prefix, query_interval_diff, urisafe_instrument_id,
 };
 use crate::catalog::types::{CatalogDataType, parquet_catalog_data_type_path_prefixes};
 
@@ -288,14 +288,14 @@ impl ParquetDataCatalog {
         let directory = self.make_path(data_cls, identifier)?;
         let intervals = self.get_directory_intervals(&directory)?;
 
-        if identifier.is_none() {
+        let Some(identifier) = identifier else {
             // `get_directory_intervals` already recursed through every per-identifier
             // subdirectory via `object_store.list`, so intervals from different
             // identifiers can overlap. Merge overlaps into a disjoint sorted union
             // so callers like `query_last_timestamp` see the true max end and
             // `consolidate_data_by_period` sees contiguous coverage.
             return Ok(merge_overlapping(intervals));
-        }
+        };
 
         // For bars, fall back to partial matching when the exact directory
         // doesn't exist (callers may pass an instrument_id like "EUR/USD.SIM"
@@ -305,7 +305,7 @@ impl ParquetDataCatalog {
             return Ok(intervals);
         }
 
-        let safe_id = urisafe_instrument_id(identifier.unwrap());
+        let safe_id = urisafe_instrument_id(identifier);
 
         // Use relative path so list_directory_stems doesn't double-prefix
         // for remote catalogs (make_path already includes base_path)
@@ -315,14 +315,12 @@ impl ParquetDataCatalog {
         let mut all_intervals = Vec::new();
 
         for subdir in &subdirs {
-            let decoded = urlencoding::decode(subdir).unwrap_or(Cow::Borrowed(subdir));
-
-            if extract_bar_type_instrument_id(&decoded) == Some(safe_id.as_str()) {
-                // Use decoded name to avoid double percent-encoding
-                // (to_object_path uses Path::from which re-encodes)
-                let subdir_path = self.make_path(data_cls, Some(&decoded))?;
-                all_intervals.extend(self.get_directory_intervals(&subdir_path)?);
+            if extract_bar_type_instrument_id(subdir) != Some(safe_id.as_str()) {
+                continue;
             }
+
+            let subdir_path = self.make_path(data_cls, Some(subdir))?;
+            all_intervals.extend(self.get_directory_intervals(&subdir_path)?);
         }
 
         all_intervals.sort_by_key(|&(start, _)| start);
@@ -381,12 +379,8 @@ impl ParquetDataCatalog {
     /// # Ok::<(), anyhow::Error>(())
     /// ```
     pub fn get_directory_intervals(&self, directory: &str) -> anyhow::Result<Vec<(u64, u64)>> {
-        // Use object store for all operations
-        // Convert directory to object path format (consistent with how files are written)
-        // For local stores with empty base_path, to_object_path returns path as-is.
-        // For remote stores, to_object_path preserves or prepends the catalog base path.
-        let object_dir = self.to_object_path(directory)?;
-        let list_result = self.list_objects(object_dir.as_ref())?;
+        // `list_objects` encodes the prefix itself
+        let list_result = self.list_objects(&self.object_store_path(directory)?)?;
 
         let mut intervals = Vec::new();
 
@@ -420,6 +414,7 @@ fn merge_overlapping(intervals: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
             last.1 = last.1.max(interval.1);
             continue;
         }
+
         merged.push(interval);
     }
 

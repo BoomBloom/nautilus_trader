@@ -40,6 +40,7 @@ from nautilus_trader.backtest import SimulationModule
 from nautilus_trader.backtest import SimulationModuleContext
 from nautilus_trader.common import ImportableActorConfig
 from nautilus_trader.execution import BestPriceFillModel
+from nautilus_trader.execution import MakerTakerFeeModel
 from nautilus_trader.execution import OneTickSlippageFillModel
 from nautilus_trader.execution import StaticLatencyModel
 from nautilus_trader.model import AccountType
@@ -54,11 +55,13 @@ from nautilus_trader.model import BookAction
 from nautilus_trader.model import BookOrder
 from nautilus_trader.model import BookType
 from nautilus_trader.model import Currency
+from nautilus_trader.model import Equity
 from nautilus_trader.model import ExecAlgorithmId
 from nautilus_trader.model import FundingRateUpdate
 from nautilus_trader.model import IndexPriceUpdate
 from nautilus_trader.model import InstrumentClose
 from nautilus_trader.model import InstrumentCloseType
+from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import InstrumentStatus
 from nautilus_trader.model import LeveragedMarginModel
 from nautilus_trader.model import MarketStatusAction
@@ -77,6 +80,7 @@ from nautilus_trader.model import Quantity
 from nautilus_trader.model import QuoteTick
 from nautilus_trader.model import StandardMarginModel
 from nautilus_trader.model import StrategyId
+from nautilus_trader.model import Symbol
 from nautilus_trader.model import TradeId
 from nautilus_trader.model import TradeTick
 from nautilus_trader.model import Venue
@@ -140,6 +144,10 @@ def test_add_venue_runs_python_simulation_module_with_read_only_context() -> Non
         account_type=AccountType.MARGIN,
         starting_balances=[Money.from_str("1_000 USD")],
         base_currency=USD,
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
         modules=[module],
     )
 
@@ -172,6 +180,10 @@ def test_python_simulation_module_exception_propagates_from_run() -> None:
         oms_type=OmsType.NETTING,
         account_type=AccountType.MARGIN,
         starting_balances=[Money.from_str("1_000 USD")],
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
         modules=[FailingSimulationModule()],
     )
 
@@ -197,6 +209,10 @@ def test_add_venue_uses_margin_account_default_leverage() -> None:
         account_type=AccountType.MARGIN,
         starting_balances=[Money.from_str("1_000_000 USD")],
         base_currency=USD,
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
     )
     engine.run()
     account = engine.cache.account_for_venue(venue)
@@ -229,6 +245,10 @@ def test_add_venue_installs_margin_model(
         starting_balances=[Money(1_000_000.0, USD)],
         base_currency=USD,
         default_leverage=Decimal(10),
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
         margin_model=margin_model,
     )
     engine.run()
@@ -258,6 +278,10 @@ def test_add_venue_applies_static_latency_model() -> None:
         account_type=AccountType.MARGIN,
         starting_balances=[Money(1_000_000.0, USD)],
         base_currency=USD,
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
         latency_model=StaticLatencyModel(base_latency_nanos=1_000_000_000),
     )
     engine.add_instrument(instrument)
@@ -274,6 +298,49 @@ def test_add_venue_applies_static_latency_model() -> None:
     engine.run()
 
     assert engine.backtest_end == quotes[-1].ts_event + 1_000_000_000
+    engine.dispose()
+
+
+def _aapl_equity(lot_size: int, ts_init: int) -> Equity:
+    return Equity(
+        instrument_id=InstrumentId.from_str("AAPL.XNAS"),
+        raw_symbol=Symbol("AAPL"),
+        isin="US0378331005",
+        currency=USD,
+        price_precision=2,
+        price_increment=Price.from_str("0.01"),
+        lot_size=Quantity.from_int(lot_size),
+        ts_event=ts_init,
+        ts_init=ts_init,
+    )
+
+
+def test_add_instrument_twice_keeps_the_first_definition() -> None:
+    """
+    Test re-adding an identical instrument is a no-op and a changed one raises.
+    """
+    engine = BacktestEngine(BacktestEngineConfig(bypass_logging=True, run_analysis=False))
+    engine.add_venue(
+        venue=Venue("XNAS"),
+        oms_type=OmsType.NETTING,
+        account_type=AccountType.CASH,
+        starting_balances=[Money(1_000_000.0, USD)],
+        base_currency=USD,
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
+    )
+    instrument = _aapl_equity(lot_size=100, ts_init=0)
+    engine.add_instrument(instrument)
+
+    engine.add_instrument(_aapl_equity(lot_size=100, ts_init=1))
+    with pytest.raises(RuntimeError, match="already registered with a different definition"):
+        engine.add_instrument(_aapl_equity(lot_size=1, ts_init=0))
+
+    cached = engine.cache.instrument(instrument.id)
+    assert cached.lot_size == Quantity.from_int(100)
+    assert cached.ts_init == 0
     engine.dispose()
 
 
@@ -300,9 +367,28 @@ def test_add_venue_rejects_unsupported_models(
             account_type=AccountType.MARGIN,
             starting_balances=[Money(1_000_000.0, USD)],
             **{model_field: object()},
+            fee_model=MakerTakerFeeModel(
+                maker_rate=Decimal(0),
+                taker_rate=Decimal(0),
+            ),
         )
 
     engine.dispose()
+
+
+def test_add_venue_rejects_missing_fee_model() -> None:
+    """
+    Test add venue rejects missing fee model.
+    """
+    engine = BacktestEngine(BacktestEngineConfig(bypass_logging=True))
+    with pytest.raises(ValueError, match="explicit fee_model"):
+        engine.add_venue(
+            venue=Venue("SIM"),
+            oms_type=OmsType.NETTING,
+            account_type=AccountType.MARGIN,
+            base_currency=Currency.from_str("USD"),
+            starting_balances=[Money(1_000_000.0, Currency.from_str("USD"))],
+        )
 
 
 def test_native_grid_market_maker_requotes_from_python_surface() -> None:
@@ -318,6 +404,10 @@ def test_native_grid_market_maker_requotes_from_python_surface() -> None:
         starting_balances=[Money(1_000_000.0, USDT)],
         base_currency=USDT,
         fill_model=BestPriceFillModel(prob_fill_on_limit=1.0, prob_slippage=0.0),
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
         latency_model=StaticLatencyModel(base_latency_nanos=1_000),
     )
     engine.add_instrument(instrument)
@@ -358,6 +448,10 @@ def test_native_composite_market_maker_reacts_to_signal_instrument() -> None:
         starting_balances=[Money(1_000_000.0, USDT)],
         base_currency=USDT,
         fill_model=BestPriceFillModel(prob_fill_on_limit=1.0, prob_slippage=0.0),
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
     )
     engine.add_instrument(traded)
     engine.add_instrument(signal)
@@ -405,6 +499,10 @@ def test_native_ema_cross_trades_whipsaw_quote_data() -> None:
         starting_balances=[Money(1_000_000.0, USDT)],
         base_currency=USDT,
         fill_model=BestPriceFillModel(prob_fill_on_limit=1.0, prob_slippage=0.0),
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
     )
     engine.add_instrument(instrument)
     engine.add_builtin_strategy(
@@ -441,6 +539,10 @@ def test_builtin_book_imbalance_actor_consumes_l2_book_deltas(capfd: object) -> 
         starting_balances=[Money(1_000_000.0, USDT)],
         base_currency=USDT,
         book_type=BookType.L2_MBP,
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
     )
     engine.add_instrument(instrument)
     engine.add_builtin_actor(
@@ -480,6 +582,10 @@ def test_importable_actor_receives_quotes_and_interval_books() -> None:
         starting_balances=[Money(1_000_000.0, USDT)],
         base_currency=USDT,
         book_type=BookType.L2_MBP,
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
     )
     engine.add_instrument(instrument)
     engine.add_actor_from_config(
@@ -758,6 +864,10 @@ def test_importable_strategy_routes_synthetic_bars_through_native_twap() -> None
             Money(10.0, Currency.from_str("BTC")),
             Money(10_000_000.0, USDT),
         ],
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
     )
     engine.add_instrument(instrument)
     engine.add_native_exec_algorithm(
@@ -837,6 +947,10 @@ def test_importable_strategy_routes_orders_through_importable_exec_algorithm() -
         account_type=AccountType.MARGIN,
         starting_balances=[Money(1_000_000.0, USDT)],
         base_currency=USDT,
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
     )
     engine.add_instrument(instrument)
     engine.add_exec_algorithm_from_config(
@@ -893,6 +1007,10 @@ def test_importable_strategy_routes_orders_through_importable_execution_algorith
         account_type=AccountType.MARGIN,
         starting_balances=[Money(1_000_000.0, USDT)],
         base_currency=USDT,
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
     )
     engine.add_instrument(instrument)
     engine.add_exec_algorithm_from_config(
@@ -954,6 +1072,10 @@ def test_execution_algorithm_spawn_reuses_cached_primary_order_state() -> None:
         account_type=AccountType.MARGIN,
         starting_balances=[Money(1_000_000.0, USDT)],
         base_currency=USDT,
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
     )
     engine.add_instrument(instrument)
     engine.add_exec_algorithm_from_config(
@@ -1001,6 +1123,10 @@ def test_execution_algorithm_spawn_rejects_quantity_above_primary_leaves_qty() -
         account_type=AccountType.MARGIN,
         starting_balances=[Money(1_000_000.0, USDT)],
         base_currency=USDT,
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
     )
     engine.add_instrument(instrument)
     engine.add_exec_algorithm_from_config(
@@ -1047,6 +1173,10 @@ def test_run_window_uses_inclusive_bounds_after_clear_data() -> None:
         account_type=AccountType.MARGIN,
         starting_balances=[Money(1_000_000.0, USDT)],
         base_currency=USDT,
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
     )
     engine.add_instrument(instrument)
     quotes = _crypto_quotes(instrument, count=10, mid_start=Decimal("2000.00"))
@@ -1168,6 +1298,10 @@ def test_importable_strategy_runs_from_l2_book_deltas(monkeypatch: pytest.Monkey
         base_currency=USDT,
         book_type=BookType.L2_MBP,
         fill_model=BestPriceFillModel(prob_fill_on_limit=1.0, prob_slippage=0.0),
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
     )
     engine.add_instrument(instrument)
     engine.add_strategy_from_config(
@@ -1206,6 +1340,10 @@ def test_streaming_run_keeps_strategy_state_across_batches() -> None:
         starting_balances=[Money(1_000_000.0, USD)],
         base_currency=USD,
         fill_model=BestPriceFillModel(prob_fill_on_limit=1.0, prob_slippage=0.0),
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
     )
     engine.add_instrument(instrument)
     engine.add_strategy_from_config(
@@ -1275,6 +1413,10 @@ def test_add_actor_with_constructed_instance_consumes_quotes() -> None:
         starting_balances=[Money(1_000_000.0, USDT)],
         base_currency=USDT,
         book_type=BookType.L2_MBP,
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
     )
     engine.add_instrument(instrument)
 
@@ -1296,6 +1438,60 @@ def test_add_actor_with_constructed_instance_consumes_quotes() -> None:
     engine.dispose()
 
 
+@pytest.mark.parametrize(
+    ("taker_rate", "ask_size", "rejected_total"),
+    [
+        (Decimal(0), 250, r"-21\.50"),
+        (Decimal("0.0001"), 2500, r"-24\.00"),
+    ],
+    ids=["slippage", "commission"],
+)
+def test_run_raises_when_fill_cost_exceeds_cash_balance(
+    taker_rate: Decimal,
+    ask_size: int,
+    rejected_total: str,
+) -> None:
+    """
+    Test a fill the cash account cannot pay for fails the run.
+    """
+    engine = BacktestEngine(BacktestEngineConfig(bypass_logging=True, run_analysis=False))
+    instrument = TestInstrumentProvider.aapl_equity()
+    engine.add_venue(
+        venue=Venue("XNAS"),
+        oms_type=OmsType.NETTING,
+        account_type=AccountType.CASH,
+        starting_balances=[Money(250_001.0, USD)],
+        fee_model=MakerTakerFeeModel(maker_rate=taker_rate, taker_rate=taker_rate),
+    )
+    engine.add_instrument(instrument)
+    engine.add_strategy(
+        StreamingWhipsaw(
+            StreamingWhipsawConfig(instrument_id=str(instrument.id), trade_size="2500"),
+        ),
+    )
+    engine.add_data(
+        [
+            QuoteTick(
+                instrument_id=instrument.id,
+                bid_price=Price.from_str("99.99"),
+                ask_price=Price.from_str("100.00"),
+                bid_size=Quantity.from_int(ask_size),
+                ask_size=Quantity.from_int(ask_size),
+                ts_event=0,
+                ts_init=0,
+            ),
+        ],
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=rf"balance would become negative: {rejected_total} USD",
+    ):
+        engine.run()
+
+    engine.dispose()
+
+
 def test_add_strategy_with_constructed_instance_submits_orders() -> None:
     """
     Test add strategy with constructed instance submits orders.
@@ -1309,6 +1505,10 @@ def test_add_strategy_with_constructed_instance_submits_orders() -> None:
         starting_balances=[Money(1_000_000.0, USD)],
         base_currency=USD,
         fill_model=BestPriceFillModel(prob_fill_on_limit=1.0, prob_slippage=0.0),
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
     )
     engine.add_instrument(instrument)
 
@@ -1340,6 +1540,10 @@ def test_add_exec_algorithm_and_strategy_instances_route_orders() -> None:
         account_type=AccountType.MARGIN,
         starting_balances=[Money(1_000_000.0, USDT)],
         base_currency=USDT,
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
     )
     engine.add_instrument(instrument)
 
@@ -1387,6 +1591,10 @@ def test_add_actors_registers_multiple_constructed_instances() -> None:
         starting_balances=[Money(1_000_000.0, USDT)],
         base_currency=USDT,
         book_type=BookType.L2_MBP,
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
     )
     engine.add_instrument(instrument)
 
@@ -1431,6 +1639,10 @@ def _signal_harvest_engine(instrument: object, bar_type: BarType) -> BacktestEng
         starting_balances=[Money(1_000_000.0, USD)],
         base_currency=USD,
         fill_model=OneTickSlippageFillModel(prob_fill_on_limit=1.0, prob_slippage=1.0),
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
     )
     engine.add_instrument(instrument)
     engine.add_strategy_from_config(

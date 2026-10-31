@@ -396,8 +396,11 @@ def make_instrument(bindings: Bindings, symbol: str) -> Any:
         min_price=model.Price.from_str("0.01"),
         margin_init=Decimal("0.01"),
         margin_maint=Decimal("0.005"),
-        maker_fee=Decimal(0),
-        taker_fee=Decimal(0),
+        **(
+            {"maker_fee": Decimal(0), "taker_fee": Decimal(0)}
+            if bindings.generation == "v1"
+            else {}
+        ),
     )
 
 
@@ -1536,7 +1539,7 @@ def run_compare(args: argparse.Namespace) -> None:
             artifact=Path(args.v2_artifact),
             source_root=Path(args.v2_source),
             commit=args.v2_commit,
-            version="2.0.0rc6",
+            version="2.0.0rc9",
             backend="pyo3",
         ),
     }

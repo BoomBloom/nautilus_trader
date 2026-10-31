@@ -16,7 +16,7 @@
 use nautilus_common::config::{ConfigError, ConfigErrorCollector, ConfigResult};
 use nautilus_core::Params;
 use nautilus_model::{
-    enums::{BookType, OrderType, TimeInForce, TrailingOffsetType, TriggerType},
+    enums::{BookType, ContingencyType, OrderType, TimeInForce, TrailingOffsetType, TriggerType},
     identifiers::{ClientId, InstrumentId, StrategyId},
     types::Quantity,
 };
@@ -212,6 +212,12 @@ pub struct ExecTesterConfig {
     /// Clamp computed prices to the instrument's `[min_price, max_price]` before submit.
     #[builder(default = false)]
     pub clamp_to_instrument_price_range: bool,
+    /// OCO or OUO relationship between bracket exit orders.
+    #[builder(default = ContingencyType::Ouo)]
+    pub bracket_contingency_type: ContingencyType,
+    /// Take-profit order type (`LIMIT`, `MARKET_IF_TOUCHED`, or `LIMIT_IF_TOUCHED`).
+    #[builder(default = OrderType::Limit)]
+    pub bracket_tp_order_type: OrderType,
 }
 
 impl<S: exec_tester_config_builder::IsComplete> ExecTesterConfigBuilder<S> {
@@ -219,8 +225,7 @@ impl<S: exec_tester_config_builder::IsComplete> ExecTesterConfigBuilder<S> {
     ///
     /// # Errors
     ///
-    /// Returns a [`ConfigError`] if any field fails validation
-    /// (see [`ExecTesterConfig::validate`]).
+    /// Returns an error if any field fails validation (see [`ExecTesterConfig::validate`]).
     pub fn build(self) -> ConfigResult<ExecTesterConfig> {
         let config = self.build_inner();
         config.validate()?;
@@ -233,8 +238,8 @@ impl ExecTesterConfig {
     ///
     /// # Errors
     ///
-    /// Returns a [`ConfigError`] (a [`ConfigError::Multiple`] when more than one field is
-    /// invalid) if any field fails validation.
+    /// Returns an error if any field fails validation. Multiple validation failures are collected
+    /// into one error.
     pub fn validate(&self) -> ConfigResult<()> {
         let mut errors = ConfigErrorCollector::new();
 
@@ -374,6 +379,8 @@ impl ExecTesterConfig {
             test_modify_rejected: false,
             can_unsubscribe: true,
             clamp_to_instrument_price_range: false,
+            bracket_contingency_type: ContingencyType::Ouo,
+            bracket_tp_order_type: OrderType::Limit,
         }
     }
 }

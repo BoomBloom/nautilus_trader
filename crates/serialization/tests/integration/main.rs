@@ -13,9 +13,6 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-mod test_enums_capnp;
-mod test_identifiers_capnp;
-mod test_instruments_capnp;
-mod test_market_data_capnp;
+#![warn(clippy::clone_on_ref_ptr)]
+
 mod test_market_data_sbe;
-mod test_types_capnp;

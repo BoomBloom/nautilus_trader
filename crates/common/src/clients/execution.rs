@@ -15,8 +15,11 @@
 
 //! Execution client trait definition.
 
+use std::{fmt::Debug, future::Future, pin::Pin};
+
 use anyhow::Context;
 use async_trait::async_trait;
+use indexmap::IndexMap;
 use nautilus_core::{DurationNanos, Params, UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_model::{
     accounts::AccountAny,
@@ -25,6 +28,7 @@ use nautilus_model::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Venue, VenueOrderId,
     },
     instruments::InstrumentAny,
+    orders::OrderAny,
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, MarginBalance, Money, Price, Quantity},
 };
@@ -43,6 +47,56 @@ use crate::messages::execution::{
 pub const DEFAULT_POSITION_RECONCILIATION_TOLERANCE: Decimal =
     Decimal::from_parts(1, 0, 0, false, 8);
 
+/// Owned report collection with a core-thread continuation.
+///
+/// Only `collection` runs on a worker. After the worker terminates, `finish` uses the caller's
+/// core state to complete reports without moving the live client or cache.
+#[must_use]
+pub struct ExecutionReportTask<T> {
+    /// Worker-safe collection, including decoding and report construction.
+    pub collection: Pin<Box<dyn Future<Output = ()> + Send>>,
+    /// Synchronous core-thread finalization after the collection worker is joined.
+    pub finish: Box<dyn FnOnce() -> anyhow::Result<T>>,
+}
+
+impl<T> Debug for ExecutionReportTask<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct(stringify!(ExecutionReportTask))
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T: 'static> ExecutionReportTask<T> {
+    /// Creates an owned collection and a synchronous core-thread continuation.
+    ///
+    /// The collection must not access the live cache. Neither phase may apply execution events.
+    /// The continuation runs only after the worker terminates; canceled collections never run it.
+    ///
+    /// Finalization propagates collection errors without calling the continuation. It also returns
+    /// an error if collection is unfinished or stopped without a result.
+    pub fn new<C, F, M>(collection: F, finish: M) -> Self
+    where
+        C: Send + 'static,
+        F: Future<Output = anyhow::Result<C>> + Send + 'static,
+        M: FnOnce(C) -> anyhow::Result<T> + 'static,
+    {
+        let (sender, mut receiver) = futures::channel::oneshot::channel();
+        Self {
+            collection: Box::pin(async move {
+                let _ = sender.send(collection.await);
+            }),
+            finish: Box::new(move || {
+                let collected = receiver
+                    .try_recv()
+                    .context("report collection stopped without a result")?
+                    .context("report collection has not finished")??;
+                finish(collected)
+            }),
+        }
+    }
+}
+
 /// Defines the interface for an execution client managing order operations.
 ///
 /// # Thread Safety
@@ -58,9 +112,45 @@ pub trait ExecutionClient {
     fn oms_type(&self) -> OmsType;
     fn get_account(&self) -> Option<AccountAny>;
 
+    /// Returns whether unacknowledged orders require venue evidence before local closure.
+    ///
+    /// `LiveNode` registers this requirement with the live execution manager automatically.
+    /// Registered clients retain these orders after recovery exhaustion, even when local timeout
+    /// or missing-order resolution is enabled.
+    fn retain_unresolved_submissions(&self) -> bool {
+        false
+    }
+
+    /// Returns venue order ID histories for startup reconciliation, keyed by client order ID.
+    ///
+    /// Each history covers one proven logical order: at least two IDs, oldest first and current last.
+    ///
+    /// - Reports share a client order ID and exclude cached orders and indexed venue IDs.
+    /// - Previous reports are closed and contribute only fills and ID history.
+    /// - The current report is open, with logical quantity and cumulative fills.
+    /// - Its acceptance time is no later than any fill in the history.
+    ///
+    /// The live execution manager consumes these histories. Defaults to `None`; overrides must not
+    /// change client state.
+    fn venue_order_ids(
+        &self,
+        _mass_status: &ExecutionMassStatus,
+    ) -> Option<IndexMap<ClientOrderId, Vec<VenueOrderId>>> {
+        None
+    }
+
     /// Returns the maximum absolute position difference tolerated during reconciliation.
     fn position_reconciliation_tolerance(&self) -> Decimal {
         DEFAULT_POSITION_RECONCILIATION_TOLERANCE
+    }
+
+    /// Returns whether reconciliation may raise the order quantity so this fill can apply.
+    ///
+    /// The default is `false`, so an overfill stays rejected when `allow_overfills` is disabled.
+    /// An override must not change client state. The engine raises the quantity to the order's
+    /// filled quantity plus this fill, then applies the fill unchanged.
+    fn allows_reconciliation_overfill(&self, _order: &OrderAny, _report: &FillReport) -> bool {
+        false
     }
 
     /// Returns whether this client can execute orders for the given instrument venue.
@@ -76,6 +166,14 @@ pub trait ExecutionClient {
     /// given instrument, so that an absent report is evidence the position is flat.
     fn provides_bulk_position_coverage(&self, _instrument_id: InstrumentId) -> bool {
         true
+    }
+
+    /// Returns whether this client's venue settles expiring contracts itself, such as a
+    /// simulated venue that closes positions with expiration fills.
+    ///
+    /// The execution engine does not apply `InstrumentClose` settlement for such a venue.
+    fn settles_contract_expirations(&self) -> bool {
+        false
     }
 
     /// Generates and publishes the account state event.
@@ -163,7 +261,7 @@ pub trait ExecutionClient {
     ///
     /// Returns an error if submission fails.
     fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(())
     }
 
@@ -173,7 +271,7 @@ pub trait ExecutionClient {
     ///
     /// Returns an error if submission fails.
     fn submit_order_list(&self, cmd: SubmitOrderList) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(())
     }
 
@@ -183,7 +281,7 @@ pub trait ExecutionClient {
     ///
     /// Returns an error if modification fails.
     fn modify_order(&self, cmd: ModifyOrder) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(())
     }
 
@@ -208,7 +306,7 @@ pub trait ExecutionClient {
     ///
     /// Returns an error if cancellation fails.
     fn cancel_order(&self, cmd: CancelOrder) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(())
     }
 
@@ -218,7 +316,7 @@ pub trait ExecutionClient {
     ///
     /// Returns an error if cancellation fails.
     fn cancel_all_orders(&self, cmd: CancelAllOrders) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(())
     }
 
@@ -228,7 +326,7 @@ pub trait ExecutionClient {
     ///
     /// Returns an error if batch cancellation fails.
     fn batch_cancel_orders(&self, cmd: BatchCancelOrders) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(())
     }
 
@@ -238,7 +336,7 @@ pub trait ExecutionClient {
     ///
     /// Returns an error if the query fails.
     fn query_account(&self, cmd: QueryAccount) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(())
     }
 
@@ -248,8 +346,19 @@ pub trait ExecutionClient {
     ///
     /// Returns an error if the query fails.
     fn query_order(&self, cmd: QueryOrder) -> anyhow::Result<()> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(())
+    }
+
+    /// Prepares worker-safe single-order collection, or uses inline collection.
+    ///
+    /// Preparation and the task's continuation run synchronously on the core thread.
+    /// Return `None` when collection is not yet worker-safe.
+    fn generate_order_status_report_task(
+        &self,
+        _cmd: &GenerateOrderStatusReport,
+    ) -> Option<ExecutionReportTask<Option<OrderStatusReport>>> {
+        None
     }
 
     /// Generates a single order status report.
@@ -261,8 +370,16 @@ pub trait ExecutionClient {
         &self,
         cmd: &GenerateOrderStatusReport,
     ) -> anyhow::Result<Option<OrderStatusReport>> {
-        log_not_implemented(cmd);
+        log_not_implemented(self.client_id(), cmd);
         Ok(None)
+    }
+
+    /// Prepares worker-safe bulk order collection, or uses inline collection.
+    fn generate_order_status_reports_task(
+        &self,
+        _cmd: &GenerateOrderStatusReports,
+    ) -> Option<ExecutionReportTask<Vec<OrderStatusReport>>> {
+        None
     }
 
     /// Generates multiple order status reports.
@@ -274,8 +391,16 @@ pub trait ExecutionClient {
         &self,
         cmd: &GenerateOrderStatusReports,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
-        log_not_implemented(cmd);
+        log_not_implemented(self.client_id(), cmd);
         Ok(Vec::new())
+    }
+
+    /// Prepares worker-safe fill collection, or uses inline collection.
+    fn generate_fill_reports_task(
+        &self,
+        _cmd: &GenerateFillReports,
+    ) -> Option<ExecutionReportTask<Vec<FillReport>>> {
+        None
     }
 
     /// Generates fill reports based on execution results.
@@ -287,8 +412,16 @@ pub trait ExecutionClient {
         &self,
         cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
-        log_not_implemented(&cmd);
+        log_not_implemented(self.client_id(), &cmd);
         Ok(Vec::new())
+    }
+
+    /// Prepares worker-safe position collection, or uses inline collection.
+    fn generate_position_status_reports_task(
+        &self,
+        _cmd: &GeneratePositionStatusReports,
+    ) -> Option<ExecutionReportTask<Vec<PositionStatusReport>>> {
+        None
     }
 
     /// Generates position status reports.
@@ -300,7 +433,7 @@ pub trait ExecutionClient {
         &self,
         cmd: &GeneratePositionStatusReports,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
-        log_not_implemented(cmd);
+        log_not_implemented(self.client_id(), cmd);
         Ok(Vec::new())
     }
 
@@ -444,7 +577,10 @@ pub async fn generate_mass_status<C: ExecutionClient + ?Sized>(
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
 
     use nautilus_core::UUID4;
     use nautilus_model::{
@@ -457,6 +593,105 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    fn report_task_rejects_unfinished_collection() {
+        let finalized = Rc::new(Cell::new(0));
+        let finalized_for_task = Rc::clone(&finalized);
+
+        let task = ExecutionReportTask::new(async { Ok(17) }, move |value| {
+            finalized_for_task.set(value);
+            Ok(value)
+        });
+
+        let error = (task.finish)().unwrap_err();
+
+        assert_eq!(error.to_string(), "report collection has not finished");
+        assert_eq!(finalized.get(), 0);
+    }
+
+    #[rstest]
+    fn report_task_propagates_collection_error_without_finalizing() {
+        let finalized = Rc::new(Cell::new(0));
+        let finalized_for_task = Rc::clone(&finalized);
+
+        let task = ExecutionReportTask::new(
+            async { Err::<usize, _>(anyhow::anyhow!("report endpoint unavailable")) },
+            move |value| {
+                finalized_for_task.set(value);
+                Ok(value)
+            },
+        );
+
+        futures::executor::block_on(task.collection);
+
+        let error = (task.finish)().unwrap_err();
+
+        assert_eq!(error.to_string(), "report endpoint unavailable");
+        assert_eq!(finalized.get(), 0);
+    }
+
+    #[rstest]
+    #[case::unpolled(false)]
+    #[case::pending(true)]
+    fn report_task_rejects_dropped_collection(#[case] poll_collection: bool) {
+        let finalized = Rc::new(Cell::new(0));
+        let finalized_for_task = Rc::clone(&finalized);
+        let mut task = ExecutionReportTask::new(std::future::pending(), move |value: usize| {
+            finalized_for_task.set(value);
+            Ok(value)
+        });
+
+        if poll_collection {
+            let mut context = std::task::Context::from_waker(futures::task::noop_waker_ref());
+            assert!(task.collection.as_mut().poll(&mut context).is_pending());
+        }
+
+        drop(task.collection);
+
+        let error = (task.finish)().unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "report collection stopped without a result"
+        );
+        assert_eq!(finalized.get(), 0);
+    }
+
+    #[rstest]
+    fn report_task_finalizes_with_current_core_state() {
+        let current = Rc::new(Cell::new(11));
+        let current_for_task = Rc::clone(&current);
+
+        let task = ExecutionReportTask::new(async { Ok(13) }, move |value| {
+            Ok(value + current_for_task.get())
+        });
+
+        futures::executor::block_on(task.collection);
+        current.set(29);
+
+        let result = (task.finish)().unwrap();
+
+        assert_eq!(result, 42);
+    }
+
+    #[rstest]
+    fn report_task_propagates_continuation_error() {
+        let finalized = Rc::new(Cell::new(0));
+        let finalized_for_task = Rc::clone(&finalized);
+
+        let task = ExecutionReportTask::new(async { Ok(23) }, move |value| {
+            finalized_for_task.set(value);
+            Err::<usize, _>(anyhow::anyhow!("report finalization failed"))
+        });
+
+        futures::executor::block_on(task.collection);
+
+        let error = (task.finish)().unwrap_err();
+
+        assert_eq!(error.to_string(), "report finalization failed");
+        assert_eq!(finalized.get(), 23);
+    }
 
     struct RecordingExecutionClient {
         modified_order_ids: Rc<RefCell<Vec<ClientOrderId>>>,

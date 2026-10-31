@@ -51,6 +51,12 @@
 //! promotion, advancing the next intent's old leg to the promoted replacement;
 //! a rejected front reparents the next intent to the same still-live leg.
 //!
+//! A `CANCELED` for the bound leg while an intent targets that leg may instead
+//! come from a user or venue cancel, which makes the modify fail. Dispatch holds
+//! that cancel on the chain: a promotion drops it as the modify's own cancel
+//! leg, and clearing the last intent on its leg releases it to the WebSocket
+//! consumer loop, which applies it as `OrderCanceled`.
+//!
 //! A fill carrying the replacement `venue_order_id` during an in-flight modify
 //! promotes the binding directly (the same `OrderUpdated` path as the
 //! replacement `ACCEPTED`), so a dropped `ACCEPTED` does not strand the fill.
@@ -69,6 +75,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+use ahash::AHashMap;
 use dashmap::{DashMap, DashSet};
 use nautilus_common::cache::fifo::FifoCache;
 use nautilus_core::{UUID4, UnixNanos};
@@ -80,6 +87,7 @@ use nautilus_model::{
         OrderTriggered, OrderUpdated,
     },
     identifiers::{AccountId, ClientOrderId, TradeId, VenueOrderId},
+    orders::LIMIT_ORDER_TYPES,
     reports::{FillReport, OrderStatusReport},
     types::{Price, Quantity},
 };
@@ -118,15 +126,50 @@ pub struct ModifyIntent {
     pub sent_request: Option<HyperliquidExchangePlaceOrderRequest>,
 }
 
+/// A corrective reduce queued for the WebSocket consumer loop to post.
+///
+/// The reduce registers its own modify intent, so a failed post clears only
+/// that intent and leaves other modifies of the order queued.
+#[derive(Debug, Clone)]
+pub struct CorrectiveReduce {
+    /// Venue order id of the oversized replacement the reduce modifies.
+    pub oid: u64,
+    /// Generation of the modify intent the reduce registered.
+    pub generation: u64,
+    /// Reduced request to send.
+    pub request: HyperliquidExchangePlaceOrderRequest,
+}
+
 /// Bounded FIFO chain of in-flight modify intents for one order.
 ///
 /// The venue processes chained modifies in submission order, so the front
 /// (oldest) intent is the next to promote; on promotion the next intent's old
-/// leg advances to the replacement just accepted.
+/// leg advances to the replacement just accepted. `held_cancel` keeps a
+/// cancel of a targeted leg until the chain shows whether a modify caused it.
 #[derive(Debug, Default)]
 struct ModifyChain {
     intents: VecDeque<ModifyIntent>,
     next_generation: u64,
+    held_cancel: Option<OrderStatusReport>,
+}
+
+impl ModifyChain {
+    fn targets(&self, venue_order_id: VenueOrderId) -> bool {
+        self.intents
+            .iter()
+            .any(|intent| intent.old_venue_order_id == Some(venue_order_id))
+    }
+
+    // Once no queued modify can cancel-replace the leg, its cancel came from elsewhere
+    fn release_held_cancel(&mut self) -> Option<OrderStatusReport> {
+        let venue_order_id = self.held_cancel.as_ref()?.venue_order_id;
+
+        if self.targets(venue_order_id) {
+            return None;
+        }
+
+        self.held_cancel.take()
+    }
 }
 
 /// Per-client dispatch state shared between order submission and the
@@ -135,9 +178,13 @@ struct ModifyChain {
 /// Tracks which orders were submitted through this client (so we can route
 /// venue events to typed [`OrderEventAny`] emissions for tracked orders and
 /// fall back to reports for external orders), provides cross-stream dedup
-/// for `OrderAccepted` and `OrderFilled` emissions, and carries the
-/// GH-3827 cancel-replace state (`cached_venue_order_ids` and
-/// `pending_modify_keys`).
+/// for `OrderAccepted`, `OrderTriggered`, and `OrderFilled` emissions, and
+/// carries the GH-3827 cancel-replace state (`cached_venue_order_ids` and
+/// `pending_modify_keys`). Cancels released from a modify chain queue in
+/// `released_cancels` until the WebSocket consumer loop applies them. A rejection
+/// with undispatched fills waits for them, then releases the unfilled remainder
+/// through the same cancel queue. Fill totals are retained per venue order ID so
+/// fills on an earlier leg cannot satisfy a later leg's reported filled quantity.
 #[derive(Debug)]
 pub struct WsDispatchState {
     /// Tracked orders keyed by full Nautilus [`ClientOrderId`].
@@ -151,6 +198,7 @@ pub struct WsDispatchState {
     pub order_contexts: DashMap<ClientOrderId, OrderContext>,
     /// Client order IDs for which an `OrderAccepted` event has been emitted.
     pub emitted_accepted: DashSet<ClientOrderId>,
+    emitted_triggered: DashSet<ClientOrderId>,
     /// Tracked submissions whose POST response has not resolved yet.
     pending_submissions: DashSet<ClientOrderId>,
     /// Submission-time rejections held until the POST path can preserve its
@@ -166,9 +214,9 @@ pub struct WsDispatchState {
     /// Bounded FIFO dedup to bound memory while keeping recent trade ids
     /// deduped across reconnects.
     emitted_trades: Mutex<FifoCache<TradeId, DEDUP_CAPACITY>>,
-    /// Raw Hyperliquid CLOIDs that reached a terminal state through the post
-    /// response path before the matching `orderUpdates` event arrived.
+    /// Raw Hyperliquid CLOIDs whose terminal state has already been dispatched.
     terminal_cloids: Mutex<FifoCache<Ustr, DEDUP_CAPACITY>>,
+    closed_venue_order_ids: Mutex<FifoCache<VenueOrderId, DEDUP_CAPACITY>>,
     /// Last venue order id observed for a tracked client order id.
     ///
     /// Populated on the first `OrderAccepted` and refreshed on every
@@ -196,9 +244,13 @@ pub struct WsDispatchState {
     /// Cumulative filled quantity per tracked order. Compared against
     /// `OrderContext::quantity` to decide when to clean up tracked state.
     pub order_filled_qty: DashMap<ClientOrderId, Quantity>,
-    /// Corrective reduce queued by the cancel-replace promotion: client order
-    /// id to (new venue order id, reduced request). Drained by the WS loop.
-    pub pending_corrective: DashMap<ClientOrderId, (u64, HyperliquidExchangePlaceOrderRequest)>,
+    order_filled_qty_by_venue: Mutex<AHashMap<ClientOrderId, AHashMap<VenueOrderId, Quantity>>>,
+    pending_rejections: Mutex<AHashMap<ClientOrderId, OrderStatusReport>>,
+    /// Corrective reduce queued by the cancel-replace promotion, keyed by
+    /// client order id. Drained by the WS loop.
+    pub pending_corrective: DashMap<ClientOrderId, CorrectiveReduce>,
+    released_cancels: Mutex<Vec<OrderStatusReport>>,
+    released_cancel_notify: tokio::sync::Notify,
     clearing: AtomicBool,
 }
 
@@ -207,16 +259,22 @@ impl Default for WsDispatchState {
         Self {
             order_contexts: DashMap::new(),
             emitted_accepted: DashSet::default(),
+            emitted_triggered: DashSet::default(),
             pending_submissions: DashSet::default(),
             pending_submission_rejections: DashMap::new(),
             filled_orders: DashSet::default(),
             emitted_trades: Mutex::new(FifoCache::new()),
             terminal_cloids: Mutex::new(FifoCache::new()),
+            closed_venue_order_ids: Mutex::new(FifoCache::new()),
             cached_venue_order_ids: DashMap::new(),
             pending_modify_chains: DashMap::new(),
             buffered_fills: DashMap::new(),
             order_filled_qty: DashMap::new(),
+            order_filled_qty_by_venue: Mutex::new(AHashMap::new()),
+            pending_rejections: Mutex::new(AHashMap::new()),
             pending_corrective: DashMap::new(),
+            released_cancels: Mutex::new(Vec::new()),
+            released_cancel_notify: tokio::sync::Notify::new(),
             clearing: AtomicBool::new(false),
         }
     }
@@ -254,13 +312,16 @@ impl WsDispatchState {
     }
 
     /// Holds a submission-time rejection until the POST response resolves.
+    /// A replay for the same venue order ID cannot reduce its reported filled quantity.
     pub fn buffer_submission_rejection(
         &self,
         client_order_id: ClientOrderId,
         report: OrderStatusReport,
     ) {
         self.pending_submission_rejections
-            .insert(client_order_id, report);
+            .entry(client_order_id)
+            .and_modify(|pending| retain_rejection_report(pending, &report))
+            .or_insert(report);
     }
 
     /// Resolves submission tracking and returns any early rejection report.
@@ -295,6 +356,12 @@ impl WsDispatchState {
         self.emitted_accepted.insert(cid);
     }
 
+    // Returns false when the order's `OrderTriggered` was already emitted
+    fn insert_triggered(&self, cid: ClientOrderId) -> bool {
+        self.evict_if_full(&self.emitted_triggered);
+        self.emitted_triggered.insert(cid)
+    }
+
     /// Marks an order as having reached a terminal state.
     ///
     /// Returns `true` when this call claimed the terminal state, and `false`
@@ -313,19 +380,21 @@ impl WsDispatchState {
         !set.insert(trade_id)
     }
 
+    #[must_use]
+    pub(crate) fn trade_emitted(&self, trade_id: &TradeId) -> bool {
+        self.emitted_trades.lock().contains(trade_id)
+    }
+
     /// Records a terminal raw Hyperliquid CLOID.
     ///
-    /// Used when the post response rejects an order before the WebSocket
-    /// `orderUpdates` message. The normal CLOID mapping can be removed while a
-    /// late unresolved order update still gets suppressed instead of forwarded
-    /// as an external report.
+    /// Recording it lets the normal CLOID mapping be removed while a late
+    /// unresolved order update is suppressed instead of forwarded as an external report.
     pub fn insert_terminal_cloid(&self, cloid: Ustr) {
         let mut set = self.terminal_cloids.lock();
         let _ = set.insert(cloid);
     }
 
-    /// Returns whether a raw Hyperliquid CLOID reached a terminal state through
-    /// the post response path.
+    /// Returns whether a raw Hyperliquid CLOID already reached a terminal state.
     #[must_use]
     pub fn terminal_cloid_seen(&self, cloid: &Ustr) -> bool {
         let set = self.terminal_cloids.lock();
@@ -397,7 +466,8 @@ impl WsDispatchState {
     /// its old leg: a rejected modify does not cancel-replace, so the resting
     /// leg it targeted is still live and the next modify cancel-replaces the
     /// same one. A non-front removal needs no reparenting; the front's
-    /// promotion (or its own removal) advances the chain.
+    /// promotion (or its own removal) advances the chain. A held cancel whose
+    /// leg no remaining intent targets is released to the WebSocket consumer loop.
     pub fn clear_modify_generation(&self, client_order_id: &ClientOrderId, generation: u64) {
         let Some(mut chain) = self.pending_modify_chains.get_mut(client_order_id) else {
             return;
@@ -416,11 +486,17 @@ impl WsDispatchState {
         {
             new_front.old_venue_order_id = Some(old);
         }
+
+        let released = chain.release_held_cancel();
         drop(chain);
         // Remove only if still empty: a concurrent mark for the same order may
         // queue a new intent between the drop above and this remove
         self.pending_modify_chains
             .remove_if(client_order_id, |_, chain| chain.intents.is_empty());
+
+        if let Some(report) = released {
+            self.release_cancel(client_order_id, report);
+        }
     }
 
     /// Stashes the exact venue request sent onto the most recently queued
@@ -456,9 +532,10 @@ impl WsDispatchState {
     ///
     /// Advances the next queued intent's old leg to `new_venue_order_id`: its
     /// cancel-replace targets the replacement just promoted, not the leg it was
-    /// queued against. Returns the claimed intent, or `None` when no intent is
-    /// queued (an external modify with no local marker). Drops the chain entry
-    /// when it empties.
+    /// queued against. Drops a held cancel, which the promotion shows was the
+    /// cancel leg of a modify. Returns the claimed intent, or `None` when no
+    /// intent is queued (an external modify with no local marker). Drops the
+    /// chain entry when it empties.
     pub fn claim_front_modify(
         &self,
         client_order_id: &ClientOrderId,
@@ -466,6 +543,7 @@ impl WsDispatchState {
     ) -> Option<ModifyIntent> {
         let mut chain = self.pending_modify_chains.get_mut(client_order_id)?;
         let claimed = chain.intents.pop_front();
+        chain.held_cancel = None;
         if let Some(next) = chain.intents.front_mut() {
             next.old_venue_order_id = Some(new_venue_order_id);
         }
@@ -477,23 +555,18 @@ impl WsDispatchState {
         claimed
     }
 
+    pub(crate) fn record_closed_venue_order_id(&self, venue_order_id: VenueOrderId) {
+        self.closed_venue_order_ids.lock().add(venue_order_id);
+    }
+
     /// Queues a corrective reduce for the WebSocket consumer loop to post.
-    pub fn queue_corrective(
-        &self,
-        client_order_id: ClientOrderId,
-        oid: u64,
-        request: HyperliquidExchangePlaceOrderRequest,
-    ) {
-        self.pending_corrective
-            .insert(client_order_id, (oid, request));
+    pub fn queue_corrective(&self, client_order_id: ClientOrderId, corrective: CorrectiveReduce) {
+        self.pending_corrective.insert(client_order_id, corrective);
     }
 
     /// Removes and returns a queued corrective reduce, if any.
     #[must_use]
-    pub fn take_corrective(
-        &self,
-        client_order_id: &ClientOrderId,
-    ) -> Option<(u64, HyperliquidExchangePlaceOrderRequest)> {
+    pub fn take_corrective(&self, client_order_id: &ClientOrderId) -> Option<CorrectiveReduce> {
         self.pending_corrective
             .remove(client_order_id)
             .map(|(_, v)| v)
@@ -527,12 +600,50 @@ impl WsDispatchState {
     ) -> bool {
         self.pending_modify_chains
             .get(client_order_id)
-            .is_some_and(|chain| {
-                chain
-                    .intents
-                    .iter()
-                    .any(|i| i.old_venue_order_id == Some(venue_order_id))
-            })
+            .is_some_and(|chain| chain.targets(venue_order_id))
+    }
+
+    // A cancel of a leg a queued modify targets is either that modify's cancel leg or a cancel
+    // from elsewhere that fails the modify, so the chain keeps it until it can tell them apart.
+    // Checks and holds under one lock, so a modify cleared concurrently cannot drop the cancel
+    pub(crate) fn hold_cancel(
+        &self,
+        client_order_id: &ClientOrderId,
+        report: &OrderStatusReport,
+    ) -> bool {
+        let Some(mut chain) = self.pending_modify_chains.get_mut(client_order_id) else {
+            return false;
+        };
+
+        if !chain.targets(report.venue_order_id) {
+            return false;
+        }
+
+        chain.held_cancel = Some(report.clone());
+        true
+    }
+
+    fn release_cancel(&self, client_order_id: &ClientOrderId, report: OrderStatusReport) {
+        log::debug!(
+            "Releasing held terminal report for {} on {client_order_id}: status={:?}",
+            report.venue_order_id,
+            report.order_status,
+        );
+        self.released_cancels.lock().push(report);
+        self.released_cancel_notify.notify_one();
+    }
+
+    // Cancel safe: released cancels stay queued until a call returns them
+    pub(crate) async fn recv_released_cancels(&self) -> Vec<OrderStatusReport> {
+        loop {
+            let released = std::mem::take(&mut *self.released_cancels.lock());
+
+            if !released.is_empty() {
+                return released;
+            }
+
+            self.released_cancel_notify.notified().await;
+        }
     }
 
     /// Returns the front intent's recorded target absolute total qty, if any.
@@ -586,6 +697,7 @@ impl WsDispatchState {
     pub fn cleanup_terminal(&self, client_order_id: &ClientOrderId) {
         self.order_contexts.remove(client_order_id);
         self.emitted_accepted.remove(client_order_id);
+        self.emitted_triggered.remove(client_order_id);
         self.pending_submissions.remove(client_order_id);
         self.pending_submission_rejections.remove(client_order_id);
         self.cached_venue_order_ids.remove(client_order_id);
@@ -593,6 +705,10 @@ impl WsDispatchState {
         self.pending_corrective.remove(client_order_id);
         self.buffered_fills.remove(client_order_id);
         self.order_filled_qty.remove(client_order_id);
+        self.order_filled_qty_by_venue
+            .lock()
+            .remove(client_order_id);
+        self.pending_rejections.lock().remove(client_order_id);
     }
 
     fn evict_if_full(&self, set: &DashSet<ClientOrderId>) {
@@ -721,11 +837,11 @@ pub fn dispatch_order_fill(
     };
 
     if state.filled_orders.contains(&client_order_id) {
-        log::debug!(
-            "Skipping stale fill for filled order: cid={client_order_id}, trade_id={}",
-            report.trade_id,
-        );
-        return DispatchOutcome::Skip;
+        return if state.check_and_insert_trade(report.trade_id) {
+            DispatchOutcome::Skip
+        } else {
+            DispatchOutcome::External
+        };
     }
 
     let Some(mut context) = state.lookup_context(&client_order_id) else {
@@ -737,9 +853,11 @@ pub fn dispatch_order_fill(
 
     // Promote the binding from the fill so a dropped replacement ACCEPTED cannot
     // strand it (see module docs).
+    // An older leg's fill must not move the binding back to that leg
     if state.has_pending_modify(&client_order_id)
         && let Some(cached_voi) = state.cached_venue_order_id(&client_order_id)
         && report.venue_order_id != cached_voi
+        && venue_oid(report.venue_order_id) >= venue_oid(cached_voi)
     {
         let target = state.pending_modify_target_qty(&client_order_id);
         let sent_request = state.modify_request(&client_order_id);
@@ -772,9 +890,7 @@ pub fn dispatch_order_fill(
             ts_init,
         );
         // Re-read the context advanced by the promotion (quantity and price)
-        if let Some(updated) = state.lookup_context(&client_order_id) {
-            context = updated;
-        }
+        context = state.lookup_context(&client_order_id).unwrap_or(context);
 
         if let (Some(target), Some(sent_request)) = (target, sent_request) {
             promoted_corrective = Some((target, sent_request));
@@ -835,6 +951,14 @@ pub fn dispatch_order_fill(
     emitter.send_order_event(OrderEventAny::Filled(filled));
 
     state.record_filled_qty(client_order_id, cumulative);
+    {
+        let mut orders = state.order_filled_qty_by_venue.lock();
+        let fills = orders.entry(client_order_id).or_default();
+        let quantity = fills
+            .entry(report.venue_order_id)
+            .or_insert_with(|| Quantity::zero(report.last_qty.precision));
+        *quantity = *quantity + report.last_qty;
+    }
 
     // Cumulative now includes this fill, so the reduce sizes against the true remaining
     if let Some((target, sent_request)) = promoted_corrective {
@@ -849,9 +973,30 @@ pub fn dispatch_order_fill(
 
     if is_terminal_fill {
         state.cleanup_terminal(&client_order_id);
+        return DispatchOutcome::Tracked;
     }
 
+    release_rejection_after_fill(client_order_id, state);
     DispatchOutcome::Tracked
+}
+
+fn release_rejection_after_fill(client_order_id: ClientOrderId, state: &WsDispatchState) {
+    let mut pending = state.pending_rejections.lock();
+
+    let Some(rejection) = pending.get(&client_order_id) else {
+        return;
+    };
+
+    if filled_qty_for_venue(state, client_order_id, rejection.venue_order_id) < rejection.filled_qty
+    {
+        return;
+    }
+
+    let mut canceled = rejection.clone();
+    pending.remove(&client_order_id);
+    drop(pending);
+    canceled.order_status = OrderStatus::Canceled;
+    state.release_cancel(&client_order_id, canceled);
 }
 
 fn handle_accepted(
@@ -873,6 +1018,14 @@ fn handle_accepted(
     if let Some(cached_voi) = state.cached_venue_order_id(&client_order_id)
         && cached_voi != venue_order_id
     {
+        // A replayed accept for an older leg must not restore a superseded binding
+        if venue_oid(venue_order_id) < venue_oid(cached_voi) {
+            log::debug!(
+                "Skipping ACCEPTED for superseded leg {venue_order_id} on {client_order_id}"
+            );
+            return DispatchOutcome::Skip;
+        }
+
         let price = report.price.or(context.price);
         let Some(price) = price else {
             log::warn!(
@@ -980,7 +1133,9 @@ fn promote_cancel_replace(
         false,
         Some(venue_order_id),
         Some(account_id),
-        Some(price),
+        LIMIT_ORDER_TYPES
+            .contains(&context.identity.order_type)
+            .then_some(price),
         trigger_price,
         None,
         false,
@@ -1072,6 +1227,15 @@ fn maybe_queue_corrective_reduce(
     target: Quantity,
     sent_request: HyperliquidExchangePlaceOrderRequest,
 ) {
+    // Recovery opens closed legs before replaying their fills, those legs cannot be reduced
+    if state
+        .closed_venue_order_ids
+        .lock()
+        .contains(&venue_order_id)
+    {
+        return;
+    }
+
     let Ok(new_oid) = venue_order_id.as_str().parse::<u64>() else {
         return;
     };
@@ -1090,9 +1254,16 @@ fn maybe_queue_corrective_reduce(
         let mut corrective = sent_request;
         corrective.size = remaining;
 
-        state.mark_pending_modify(client_order_id, venue_order_id, target);
+        let generation = state.mark_pending_modify(client_order_id, venue_order_id, target);
         state.stash_modify_request(client_order_id, corrective.clone());
-        state.queue_corrective(client_order_id, new_oid, corrective);
+        state.queue_corrective(
+            client_order_id,
+            CorrectiveReduce {
+                oid: new_oid,
+                generation,
+                request: corrective,
+            },
+        );
 
         log::warn!(
             "Cancel-replace left {client_order_id} oversized on {venue_order_id} \
@@ -1118,6 +1289,12 @@ fn handle_triggered(
             context.identity.order_type,
         );
         return DispatchOutcome::Tracked;
+    }
+
+    // A recovery read replays a trigger the stream or an earlier read already applied
+    if !state.insert_triggered(client_order_id) {
+        log::debug!("Skipping repeated TRIGGERED for {client_order_id}");
+        return DispatchOutcome::Skip;
     }
 
     ensure_accepted_emitted(
@@ -1157,26 +1334,54 @@ fn handle_canceled(
 ) -> DispatchOutcome {
     let venue_order_id = report.venue_order_id;
 
-    // Stale cancel suppression: if the cached venue_order_id has already
-    // been advanced by a cancel-replace promotion, this CANCELED refers to
-    // the old leg and has already been handled as OrderUpdated. See GH-3827.
     if let Some(cached_voi) = state.cached_venue_order_id(&client_order_id)
         && cached_voi != venue_order_id
     {
-        log::debug!(
-            "Skipping stale CANCELED for {venue_order_id} (cached {cached_voi}) on {client_order_id}",
+        if !state.has_pending_modify(&client_order_id)
+            || venue_oid(venue_order_id) <= venue_oid(cached_voi)
+        {
+            log::debug!(
+                "Skipping stale CANCELED for {venue_order_id} (cached {cached_voi}) on {client_order_id}",
+            );
+            return DispatchOutcome::Skip;
+        }
+
+        let Some(price) = report.price.or(context.price) else {
+            log::warn!(
+                "Cannot promote canceled replacement for {client_order_id}: no report or cached price",
+            );
+            return DispatchOutcome::Skip;
+        };
+
+        let quantity = state
+            .pending_modify_target_qty(&client_order_id)
+            .unwrap_or(report.quantity);
+
+        // The replacement can close before its acceptance arrives, promote without queuing
+        // a corrective reduce against the already closed leg.
+        promote_cancel_replace(
+            client_order_id,
+            context,
+            state,
+            emitter,
+            venue_order_id,
+            report.account_id,
+            price,
+            quantity,
+            report.trigger_price,
+            report.ts_last,
+            ts_init,
         );
-        return DispatchOutcome::Skip;
     }
 
     // Cancel-before-accept race: an in-flight modify may deliver
     // CANCELED(old_voi) before the replacement ACCEPTED(new_voi). Any queued
     // intent whose old leg matches (marked before the HTTP call, cleared on
-    // failure) suppresses that cancel so the later ACCEPTED routes through
-    // OrderUpdated. See GH-3827.
-    if state.pending_modify_contains_old(&client_order_id, venue_order_id) {
+    // failure) holds that cancel so the later ACCEPTED routes through
+    // OrderUpdated, and a failed modify releases it. See GH-3827.
+    if state.hold_cancel(&client_order_id, report) {
         log::debug!(
-            "Skipping cancel-before-accept leg for {client_order_id}: venue_order_id={venue_order_id}",
+            "Holding cancel-before-accept leg for {client_order_id}: venue_order_id={venue_order_id}",
         );
         return DispatchOutcome::Skip;
     }
@@ -1268,6 +1473,41 @@ fn handle_rejected(
         return DispatchOutcome::Skip;
     }
 
+    // A rejected replacement never became the bound order. Its original leg's
+    // cancellation closes the order once the failed modify releases any held cancel.
+    if let Some(bound) = state.cached_venue_order_id(&client_order_id)
+        && bound != report.venue_order_id
+    {
+        return DispatchOutcome::Skip;
+    }
+
+    {
+        // Check and park atomically so the final fill cannot miss the pending rejection
+        let mut pending = state.pending_rejections.lock();
+        if !report.filled_qty.is_zero()
+            && filled_qty_for_venue(state, client_order_id, report.venue_order_id)
+                < report.filled_qty
+        {
+            pending
+                .entry(client_order_id)
+                .and_modify(|pending| retain_rejection_report(pending, report))
+                .or_insert_with(|| report.clone());
+            return DispatchOutcome::Skip;
+        }
+
+        if pending.contains_key(&client_order_id) {
+            return DispatchOutcome::Skip;
+        }
+    }
+
+    if !report.filled_qty.is_zero()
+        || state
+            .previous_filled_qty(&client_order_id)
+            .is_some_and(|qty| !qty.is_zero())
+    {
+        return handle_canceled(report, client_order_id, context, state, emitter, ts_init);
+    }
+
     if !claim_terminal_order(client_order_id, state, report.order_status) {
         return DispatchOutcome::Skip;
     }
@@ -1292,6 +1532,25 @@ fn handle_rejected(
     emitter.send_order_event(OrderEventAny::Rejected(rejected));
     state.cleanup_terminal(&client_order_id);
     DispatchOutcome::Tracked
+}
+
+fn retain_rejection_report(pending: &mut OrderStatusReport, report: &OrderStatusReport) {
+    if report.venue_order_id != pending.venue_order_id || report.filled_qty >= pending.filled_qty {
+        *pending = report.clone();
+    }
+}
+
+fn filled_qty_for_venue(
+    state: &WsDispatchState,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+) -> Quantity {
+    state
+        .order_filled_qty_by_venue
+        .lock()
+        .get(&client_order_id)
+        .and_then(|fills| fills.get(&venue_order_id).copied())
+        .unwrap_or_else(|| Quantity::zero(0))
 }
 
 fn claim_terminal_order(
@@ -1360,12 +1619,23 @@ fn ensure_accepted_emitted(
     emitter.send_order_event(OrderEventAny::Accepted(accepted));
 }
 
+// Hyperliquid assigns venue order IDs in increasing order, so a higher one is a newer leg
+pub(crate) fn venue_oid(venue_order_id: VenueOrderId) -> u64 {
+    venue_order_id.as_str().parse().unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
+    use std::{sync::Arc, time::Duration};
+
+    use futures_util::FutureExt;
+    use nautilus_common::{messages::ExecutionEvent, testing::wait_until};
+    use nautilus_core::time::get_atomic_clock_realtime;
     use nautilus_live::execution::context::OrderIdentity;
     use nautilus_model::{
-        enums::{OrderSide, TimeInForce},
-        identifiers::{ClientOrderId, InstrumentId, StrategyId, TradeId},
+        enums::{AccountType, LiquiditySide, OrderSide, TimeInForce},
+        identifiers::{ClientOrderId, InstrumentId, StrategyId, TradeId, TraderId},
+        types::Money,
     };
     use rstest::rstest;
     use rust_decimal::Decimal;
@@ -1393,6 +1663,111 @@ mod tests {
             is_reduce_only: false,
             is_quote_quantity: false,
         }
+    }
+
+    #[rstest]
+    fn test_rejection_registers_atomically_with_fill_completion() {
+        let state = Arc::new(WsDispatchState::new());
+        let (emitter, mut rx) = test_emitter();
+        let cid = ClientOrderId::new("O-REJECTION-RACE");
+        let context = make_context(cid);
+        state.register_context(context);
+
+        let first = FillReport::new(
+            AccountId::new("HYPERLIQUID-001"),
+            context.identity.instrument_id,
+            VenueOrderId::new("100"),
+            TradeId::new("T-RACE-1"),
+            OrderSide::Buy,
+            Quantity::from("0.00003"),
+            Price::from("56730.0"),
+            Money::from("0.17 USD"),
+            LiquiditySide::Taker,
+            Some(cid),
+            None,
+            UnixNanos::default(),
+            UnixNanos::default(),
+            None,
+        );
+        dispatch_order_fill(&first, &state, &emitter, UnixNanos::default());
+
+        let rejection = OrderStatusReport::new(
+            first.account_id,
+            first.instrument_id,
+            Some(cid),
+            first.venue_order_id,
+            OrderSide::Buy.into(),
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            OrderStatus::Rejected,
+            context.quantity,
+            Quantity::from("0.00005"),
+            UnixNanos::default(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+            None,
+        );
+        let fills = state.order_filled_qty_by_venue.lock();
+        let reject_state = state.clone();
+        let reject_emitter = emitter.clone();
+
+        let rejected = std::thread::spawn(move || {
+            dispatch_order_event(
+                &rejection,
+                &reject_state,
+                &reject_emitter,
+                UnixNanos::default(),
+            )
+        });
+
+        let timeout = Duration::from_secs(5);
+        wait_until(|| state.pending_rejections.is_locked(), timeout);
+        let mut last = first;
+        last.trade_id = TradeId::new("T-RACE-2");
+        last.last_qty = Quantity::from("0.00002");
+        last.commission = Money::from("0.29 USD");
+        let fill_state = state.clone();
+        let fill_emitter = emitter.clone();
+        let filled = std::thread::spawn(move || {
+            dispatch_order_fill(&last, &fill_state, &fill_emitter, UnixNanos::default())
+        });
+
+        wait_until(
+            || state.previous_filled_qty(&cid) == Some(Quantity::from("0.00005")),
+            timeout,
+        );
+        drop(fills);
+        rejected.join().unwrap();
+        assert_eq!(filled.join().unwrap(), DispatchOutcome::Tracked);
+
+        if let Some(released) = state.recv_released_cancels().now_or_never() {
+            assert_eq!(released.len(), 1);
+            dispatch_order_event(&released[0], &state, &emitter, UnixNanos::default());
+        }
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        let [
+            ExecutionEvent::Order(OrderEventAny::Accepted(_)),
+            ExecutionEvent::Order(OrderEventAny::Filled(first)),
+            ExecutionEvent::Order(OrderEventAny::Filled(last)),
+            ExecutionEvent::Order(OrderEventAny::Canceled(_)),
+        ] = events.as_slice()
+        else {
+            panic!("expected two fills followed by cancellation: {events:?}");
+        };
+
+        assert_eq!(first.trade_id, TradeId::new("T-RACE-1"));
+        assert_eq!(first.last_qty, Quantity::from("0.00003"));
+        assert_eq!(first.commission, Some(Money::from("0.17 USD")));
+        assert_eq!(last.trade_id, TradeId::new("T-RACE-2"));
+        assert_eq!(last.last_qty, Quantity::from("0.00002"));
+        assert_eq!(last.commission, Some(Money::from("0.29 USD")));
+        assert_eq!(state.lookup_context(&cid), None);
+        assert!(state.filled_orders.contains(&cid));
     }
 
     #[rstest]
@@ -1506,7 +1881,15 @@ mod tests {
         let request = sample_request(Decimal::from(1));
         state.mark_pending_modify(cid, VenueOrderId::new("v-1"), Quantity::from("1"));
         state.stash_modify_request(cid, request.clone());
-        state.queue_corrective(cid, 1, request);
+        state.queue_corrective(
+            cid,
+            CorrectiveReduce {
+                oid: 1,
+                generation: 0,
+                request,
+            },
+        );
+
         assert!(state.modify_request(&cid).is_some());
 
         state.cleanup_terminal(&cid);
@@ -1683,5 +2066,200 @@ mod tests {
             state.modify_request(&cid).map(|r| r.size),
             Some(Decimal::from(2)),
         );
+    }
+
+    fn canceled_report(client_order_id: ClientOrderId, venue_order_id: &str) -> OrderStatusReport {
+        OrderStatusReport::new(
+            AccountId::from("HYPERLIQUID-001"),
+            InstrumentId::from("BTC-USD-PERP.HYPERLIQUID"),
+            Some(client_order_id),
+            VenueOrderId::new(venue_order_id),
+            Some(OrderSide::Buy),
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            OrderStatus::Canceled,
+            Quantity::from("0.0001"),
+            Quantity::from("0"),
+            UnixNanos::default(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+            Some(UUID4::new()),
+        )
+    }
+
+    fn released_cancels(state: &WsDispatchState) -> Vec<OrderStatusReport> {
+        state
+            .recv_released_cancels()
+            .now_or_never()
+            .unwrap_or_default()
+    }
+
+    fn test_emitter() -> (
+        ExecutionEventEmitter,
+        tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    ) {
+        let mut emitter = ExecutionEventEmitter::new(
+            get_atomic_clock_realtime(),
+            TraderId::from("TESTER-001"),
+            AccountId::from("HYPERLIQUID-001"),
+            AccountType::Margin,
+            None,
+        );
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        emitter.set_sender(tx);
+        (emitter, rx)
+    }
+
+    #[rstest]
+    #[case::bound_leg(Some("v-0"), true)]
+    #[case::unbound_leg(None, true)]
+    #[case::superseded_leg(Some("v-1"), false)]
+    fn test_canceled_for_modified_leg_is_held_unless_superseded(
+        #[case] bound_venue_order_id: Option<&str>,
+        #[case] expected_held: bool,
+    ) {
+        let (emitter, mut rx) = test_emitter();
+        let state = WsDispatchState::new();
+        let cid = ClientOrderId::new("O-107");
+        state.register_context(make_context(cid));
+
+        if let Some(voi) = bound_venue_order_id {
+            state.record_venue_order_id(cid, VenueOrderId::new(voi));
+        }
+
+        let generation =
+            state.mark_pending_modify(cid, VenueOrderId::new("v-0"), Quantity::from("0.0001"));
+        let canceled = canceled_report(cid, "v-0");
+
+        let outcome = dispatch_order_event(&canceled, &state, &emitter, UnixNanos::default());
+        state.clear_modify_generation(&cid, generation);
+
+        assert_eq!(outcome, DispatchOutcome::Skip);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            released_cancels(&state),
+            expected_held
+                .then_some(canceled)
+                .into_iter()
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[rstest]
+    fn test_held_cancel_releases_when_last_modify_of_its_leg_fails() {
+        let state = WsDispatchState::new();
+        let cid = ClientOrderId::new("O-108");
+        let leg = VenueOrderId::new("v-0");
+        state.record_venue_order_id(cid, leg);
+        let g0 = state.mark_pending_modify(cid, leg, Quantity::from("0.00020"));
+        let g1 = state.mark_pending_modify(cid, leg, Quantity::from("0.00030"));
+        let canceled = canceled_report(cid, "v-0");
+
+        let held = state.hold_cancel(&cid, &canceled);
+        state.clear_modify_generation(&cid, g0);
+        let released_while_targeted = released_cancels(&state);
+        state.clear_modify_generation(&cid, g1);
+
+        assert!(held);
+        assert_eq!(released_while_targeted, vec![]);
+        assert_eq!(released_cancels(&state), vec![canceled]);
+        assert!(!state.has_pending_modify(&cid));
+    }
+
+    #[rstest]
+    #[case::response_cancel_reject(["response", "cancel", "reject"])]
+    #[case::response_reject_cancel(["response", "reject", "cancel"])]
+    #[case::cancel_response_reject(["cancel", "response", "reject"])]
+    #[case::cancel_reject_response(["cancel", "reject", "response"])]
+    #[case::reject_response_cancel(["reject", "response", "cancel"])]
+    #[case::reject_cancel_response(["reject", "cancel", "response"])]
+    fn test_failed_modify_closes_original_once(
+        #[case] sequence: [&str; 3],
+        #[values(false, true)] filled: bool,
+    ) {
+        let (emitter, mut rx) = test_emitter();
+        let state = WsDispatchState::new();
+        let cid = ClientOrderId::new("O-MODIFY-REJECT");
+        let original = VenueOrderId::new("100");
+        state.register_context(make_context(cid));
+        state.record_venue_order_id(cid, original);
+        state.insert_accepted(cid);
+        if filled {
+            state.record_filled_qty(cid, Quantity::from("0.00004"));
+        }
+
+        let generation = state.mark_pending_modify(cid, original, Quantity::from("0.0001"));
+        let mut canceled = canceled_report(cid, "100");
+        canceled.ts_last = UnixNanos::from(100);
+        let mut rejected = canceled_report(cid, "101");
+        rejected.order_status = OrderStatus::Rejected;
+        rejected.ts_last = UnixNanos::from(200);
+
+        for action in sequence {
+            match action {
+                "response" => state.clear_modify_generation(&cid, generation),
+                "cancel" => {
+                    dispatch_order_event(&canceled, &state, &emitter, UnixNanos::default());
+                }
+                "reject" => {
+                    dispatch_order_event(&rejected, &state, &emitter, UnixNanos::default());
+                }
+                _ => unreachable!(),
+            }
+
+            for report in released_cancels(&state) {
+                dispatch_order_event(&report, &state, &emitter, UnixNanos::default());
+            }
+        }
+
+        let canceled_replay =
+            dispatch_order_event(&canceled, &state, &emitter, UnixNanos::default());
+        let rejected_replay =
+            dispatch_order_event(&rejected, &state, &emitter, UnixNanos::default());
+        let event = rx.try_recv().unwrap();
+
+        let ExecutionEvent::Order(OrderEventAny::Canceled(event)) = event else {
+            panic!("expected OrderCanceled, received {event:?}");
+        };
+
+        assert_eq!(event.trader_id, emitter.trader_id());
+        assert_eq!(event.strategy_id, StrategyId::from("S-001"));
+        assert_eq!(
+            event.instrument_id,
+            InstrumentId::from("BTC-USD-PERP.HYPERLIQUID")
+        );
+        assert_eq!(event.client_order_id, cid);
+        assert_eq!(event.venue_order_id, Some(original));
+        assert_eq!(event.account_id, Some(canceled.account_id));
+        assert_eq!(event.ts_event, canceled.ts_last);
+        assert_eq!(event.ts_init, UnixNanos::default());
+        assert!(!event.reconciliation);
+        assert_eq!(event.reason, None);
+        assert_eq!(event.causation_id, None);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(canceled_replay, DispatchOutcome::Skip);
+        assert_eq!(rejected_replay, DispatchOutcome::Skip);
+        assert!(state.lookup_context(&cid).is_none());
+        assert!(!state.has_pending_modify(&cid));
+    }
+
+    #[rstest]
+    fn test_promotion_drops_held_cancel() {
+        let state = WsDispatchState::new();
+        let cid = ClientOrderId::new("O-109");
+        state.record_venue_order_id(cid, VenueOrderId::new("v-0"));
+        state.mark_pending_modify(cid, VenueOrderId::new("v-0"), Quantity::from("0.00020"));
+        let g1 =
+            state.mark_pending_modify(cid, VenueOrderId::new("v-0"), Quantity::from("0.00030"));
+
+        // The replacement shows the cancel was the first modify's cancel leg, so the second
+        // modify failing later must not apply it
+        let held = state.hold_cancel(&cid, &canceled_report(cid, "v-0"));
+        state.claim_front_modify(&cid, VenueOrderId::new("v-1"));
+        state.clear_modify_generation(&cid, g1);
+
+        assert!(held);
+        assert_eq!(released_cancels(&state), vec![]);
+        assert!(!state.has_pending_modify(&cid));
     }
 }

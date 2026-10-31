@@ -32,27 +32,39 @@ use nautilus_bybit::{
             BybitAccountType, BybitBboSideType, BybitEnvironment, BybitMarginMode,
             BybitOrderSmpType, BybitOrderType, BybitPositionIdx, BybitProductType,
             BybitRepayStatus, BybitTpSlMode, BybitTriggerType, BybitUnifiedMarginStatus,
+            BybitWithdrawAccountType, BybitWithdrawFeeType, BybitWithdrawForceChain,
+            BybitWithdrawStatus, BybitWithdrawType,
         },
+        parse::parse_linear_instrument,
         urls::bybit_http_base_url,
     },
     http::{
         client::{BybitHttpClient, BybitRawHttpClient},
+        error::BybitHttpError,
+        models::BybitInstrumentLinearResponse,
         query::{
             BybitFeeRateParams, BybitInstrumentsInfoParamsBuilder, BybitNativeTpSlParams,
-            BybitPositionListParamsBuilder, BybitWalletBalanceParams,
+            BybitPositionListParamsBuilder, BybitWalletBalanceParams, BybitWithdrawParamsBuilder,
+            BybitWithdrawalRecordsParamsBuilder,
         },
     },
 };
 use nautilus_common::{cache::InstrumentLookupError, testing::wait_until_async};
+use nautilus_core::{UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_model::{
     data::BarType,
-    enums::{OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce, TriggerType},
-    identifiers::{AccountId, ClientOrderId, InstrumentId, Symbol},
+    enums::{
+        AvgPxReconciliation, LiquiditySide, OrderSide, OrderStatus, OrderType, PositionSide,
+        TimeInForce, TriggerType,
+    },
+    identifiers::{AccountId, ClientOrderId, InstrumentId, Symbol, TradeId, VenueOrderId},
     instruments::{CurrencyPair, InstrumentAny},
-    types::{Currency, Price, Quantity},
+    reports::FillReport,
+    types::{Currency, Money, Price, Quantity},
 };
 use nautilus_network::http::HttpClient;
 use rstest::rstest;
+use rust_decimal_macros::dec;
 use serde_json::{Value, json};
 
 type SettleCoinQueries = Arc<tokio::sync::Mutex<Vec<(String, Option<String>)>>>;
@@ -92,11 +104,13 @@ struct CapturedOrder {
 #[derive(Clone)]
 struct TestServerState {
     request_count: Arc<tokio::sync::Mutex<usize>>,
+    execution_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     wallet_balance_requests: Arc<tokio::sync::Mutex<usize>>,
     // (endpoint, settle_coin)
     settle_coin_queries: SettleCoinQueries,
     realtime_requests: Arc<tokio::sync::Mutex<usize>>,
     history_requests: Arc<tokio::sync::Mutex<usize>>,
+    position_queries: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>>,
     order_submissions: Arc<tokio::sync::Mutex<Vec<CapturedOrder>>>,
     batch_cancel_requests: Arc<tokio::sync::Mutex<Vec<Value>>>,
 }
@@ -105,10 +119,12 @@ impl Default for TestServerState {
     fn default() -> Self {
         Self {
             request_count: Arc::new(tokio::sync::Mutex::new(0)),
+            execution_response: Arc::default(),
             wallet_balance_requests: Arc::new(tokio::sync::Mutex::new(0)),
             settle_coin_queries: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             realtime_requests: Arc::new(tokio::sync::Mutex::new(0)),
             history_requests: Arc::new(tokio::sync::Mutex::new(0)),
+            position_queries: Arc::default(),
             order_submissions: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             batch_cancel_requests: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }
@@ -222,7 +238,14 @@ async fn handle_get_trades(query: Query<HashMap<String, String>>) -> impl IntoRe
 }
 
 #[allow(dead_code)]
-async fn handle_get_executions(Query(query): Query<HashMap<String, String>>) -> impl IntoResponse {
+async fn handle_get_executions(
+    State(state): State<TestServerState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    if let Some(response) = state.execution_response.lock().await.as_ref() {
+        return Json(response.clone());
+    }
+
     let mut executions = load_test_data("http_get_executions_funding.json");
     let (index, next_cursor) = if query.contains_key("cursor") {
         (0, "")
@@ -1271,6 +1294,155 @@ async fn test_request_fill_reports_excludes_funding_executions() {
         .collect();
 
     assert_eq!(trade_ids, vec!["bf13bd10-fe15-4ad4-a6bf-c388e3104f75"]);
+}
+
+#[rstest]
+#[case::first(0)]
+#[case::last(1)]
+#[tokio::test]
+async fn test_request_fill_reports_commission_failure_and_recovery(#[case] invalid_index: usize) {
+    let (addr, state) = start_test_server().await.unwrap();
+    let client = BybitHttpClient::with_credentials(
+        "test_api_key".to_string(),
+        "test_api_secret".to_string(),
+        Some(format!("http://{addr}")),
+        60,
+        0,
+        1000,
+        10_000,
+        5_000,
+        None,
+    )
+    .unwrap();
+    let instruments = client
+        .request_instruments(BybitProductType::Linear, None, None)
+        .await
+        .unwrap();
+
+    for instrument in instruments {
+        client.cache_instrument(instrument);
+    }
+
+    let mut response = load_test_data("http_get_executions.json");
+    response["result"]["nextPageCursor"] = json!("");
+    response["result"]["list"][invalid_index]["execFee"] = json!("9999999999999999999999999999");
+    *state.execution_response.lock().await = Some(response.clone());
+    let account_id = AccountId::from("BYBIT-UNIFIED");
+
+    let e = client
+        .request_fill_reports(account_id, BybitProductType::Linear, None, None, None, None)
+        .await
+        .unwrap_err();
+    assert!(
+        e.to_string()
+            .contains("Failed to create commission from execFee=")
+    );
+
+    response["result"]["list"][invalid_index]["execFee"] = json!("0.01234567");
+    *state.execution_response.lock().await = Some(response);
+    let reports = client
+        .request_fill_reports(account_id, BybitProductType::Linear, None, None, None, None)
+        .await
+        .unwrap();
+
+    assert_eq!(reports.len(), 2);
+    let mut fees = [dec!(0.0150), dec!(0.9000)];
+    fees[invalid_index] = dec!(0.01234567);
+    let expected = vec![
+        FillReport::new(
+            account_id,
+            InstrumentId::from("BTCUSDT-LINEAR.BYBIT"),
+            VenueOrderId::from("8c065341-7b52-4ca9-ac2c-37e31ac55c94"),
+            TradeId::from("e0cbe81d-0f18-5866-9415-cf319b5dab3b"),
+            OrderSide::Buy,
+            Quantity::from("0.100"),
+            Price::from("50000.0"),
+            Money::from_decimal(fees[0], Currency::USDT()).unwrap(),
+            LiquiditySide::Maker,
+            Some(ClientOrderId::from("test-order-001")),
+            None,
+            UnixNanos::from(1_672_282_722_429_000_000),
+            reports[0].ts_init,
+            Some(reports[0].report_id),
+        ),
+        FillReport::new(
+            account_id,
+            InstrumentId::from("ETHUSDT-LINEAR.BYBIT"),
+            VenueOrderId::from("7b954230-6a41-3ba8-bc20-26d20ab44b83"),
+            TradeId::from("f1dce92e-1g29-6977-a526-dg420c6ecb4c"),
+            OrderSide::Sell,
+            Quantity::from("0.50"),
+            Price::from("3000.00"),
+            Money::from_decimal(fees[1], Currency::USDT()).unwrap(),
+            LiquiditySide::Taker,
+            Some(ClientOrderId::from("test-order-002")),
+            None,
+            UnixNanos::from(1_672_282_822_529_000_000),
+            reports[1].ts_init,
+            Some(reports[1].report_id),
+        ),
+    ];
+
+    assert_eq!(reports, expected);
+}
+
+#[rstest]
+#[case::empty("empty")]
+#[case::funding("funding")]
+#[case::uncached("uncached")]
+#[tokio::test]
+async fn test_request_fill_reports_excluded_commission_failure(#[case] scenario: &str) {
+    let (addr, state) = start_test_server().await.unwrap();
+    let client = BybitHttpClient::with_credentials(
+        "test_api_key".to_string(),
+        "test_api_secret".to_string(),
+        Some(format!("http://{addr}")),
+        60,
+        0,
+        1000,
+        10_000,
+        5_000,
+        None,
+    )
+    .unwrap();
+    let instruments = client
+        .request_instruments(BybitProductType::Linear, None, None)
+        .await
+        .unwrap();
+
+    for instrument in instruments {
+        client.cache_instrument(instrument);
+    }
+
+    let mut response = load_test_data("http_get_executions.json");
+    response["result"]["nextPageCursor"] = json!("");
+    response["result"]["list"]
+        .as_array_mut()
+        .unwrap()
+        .truncate(1);
+    response["result"]["list"][0]["execFee"] = json!("9999999999999999999999999999");
+    match scenario {
+        "empty" => response["result"]["list"] = json!([]),
+        "funding" => response["result"]["list"][0]["execType"] = json!("Funding"),
+        "uncached" => response["result"]["list"][0]["symbol"] = json!("UNLOADEDUSDT"),
+        _ => unreachable!(),
+    }
+
+    *state.execution_response.lock().await = Some(response);
+
+    let reports = client
+        .request_fill_reports(
+            AccountId::from("BYBIT-UNIFIED"),
+            BybitProductType::Linear,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(reports, vec![]);
 }
 
 #[rstest]
@@ -3253,8 +3425,12 @@ async fn test_submit_order_stop_market_with_trigger_price() {
 }
 
 #[rstest]
+#[case(TimeInForce::Gtc)]
+#[case(TimeInForce::Gtd)]
 #[tokio::test]
-async fn test_submit_order_stop_limit_with_trigger_price_and_limit_price() {
+async fn test_submit_order_stop_limit_with_trigger_price_and_limit_price(
+    #[case] time_in_force: TimeInForce,
+) {
     let (addr, state) = start_order_capture_test_server().await.unwrap();
     let base_url = format!("http://{addr}");
 
@@ -3296,7 +3472,7 @@ async fn test_submit_order_stop_limit_with_trigger_price_and_limit_price() {
             OrderSide::Sell,
             OrderType::StopLimit,
             quantity,
-            Some(TimeInForce::Gtc),
+            Some(time_in_force),
             Some(limit_price),
             Some(trigger_price),
             None,  // post_only
@@ -5098,4 +5274,672 @@ async fn test_fetch_all_sub_api_keys_walks_cursor() {
         log[1].contains("cursor=keys-2"),
         "second page must carry cursor: {log:?}"
     );
+}
+
+// -------------------------------------------------------------------------------------------------
+// Withdrawal endpoints (/v5/asset/withdraw/*) tests
+// -------------------------------------------------------------------------------------------------
+
+#[derive(Clone, Default)]
+struct WithdrawServerState {
+    bodies: Arc<tokio::sync::Mutex<Vec<Value>>>,
+    failures_remaining: Arc<tokio::sync::Mutex<usize>>,
+    record_queries: Arc<tokio::sync::Mutex<Vec<String>>>,
+    exhaust_quota: Arc<tokio::sync::Mutex<bool>>,
+    repeat_cursor: Arc<tokio::sync::Mutex<bool>>,
+}
+
+async fn handle_withdraw_create(
+    State(state): State<WithdrawServerState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Some(r) = require_bybit_auth(&headers) {
+        return r;
+    }
+    state
+        .bodies
+        .lock()
+        .await
+        .push(serde_json::from_slice(&body).unwrap());
+
+    let mut failures = state.failures_remaining.lock().await;
+    if *failures > 0 {
+        *failures -= 1;
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    let mut response = Json(json!({
+        "retCode": 0,
+        "retMsg": "success",
+        "result": {"id": "10195"},
+        "retExtInfo": {},
+        "time": 1672196571239i64
+    }))
+    .into_response();
+
+    if *state.exhaust_quota.lock().await {
+        let reset_ms = Timestamp::now().as_millisecond() + 60_000;
+        let headers = response.headers_mut();
+        headers.insert("X-Bapi-Limit", "5".parse().unwrap());
+        headers.insert("X-Bapi-Limit-Status", "0".parse().unwrap());
+        headers.insert(
+            "X-Bapi-Limit-Reset-Timestamp",
+            reset_ms.to_string().parse().unwrap(),
+        );
+    }
+
+    response
+}
+
+async fn handle_withdraw_query_record(
+    State(state): State<WithdrawServerState>,
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if let Some(r) = require_bybit_auth(&headers) {
+        return r;
+    }
+    let query = uri.query().unwrap_or_default().to_string();
+    state.record_queries.lock().await.push(query.clone());
+
+    if !query.contains("cursor=") || *state.repeat_cursor.lock().await {
+        return Json(load_test_data("http_get_withdraw_query_record.json")).into_response();
+    }
+
+    Json(json!({
+        "retCode": 0,
+        "retMsg": "success",
+        "result": {
+            "rows": [{
+                "coin": "BTC", "chain": "BTC", "amount": "0.5", "txID": "",
+                "status": "Pending", "toAddress": "bc1qexample", "tag": "",
+                "withdrawFee": "0.0001", "createTime": "1742700000000",
+                "updateTime": "1742700000000", "withdrawId": "131500000",
+                "withdrawType": 0
+            }],
+            "nextPageCursor": ""
+        },
+        "retExtInfo": {},
+        "time": 1750777316807i64
+    }))
+    .into_response()
+}
+
+async fn start_withdraw_server(failures: usize) -> (SocketAddr, WithdrawServerState) {
+    let state = WithdrawServerState::default();
+    *state.failures_remaining.lock().await = failures;
+
+    let router = Router::new()
+        .route("/v5/market/time", get(handle_get_server_time))
+        .route("/v5/asset/withdraw/create", post(handle_withdraw_create))
+        .route(
+            "/v5/asset/withdraw/query-record",
+            get(handle_withdraw_query_record),
+        )
+        .with_state(state.clone());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    wait_for_server(addr, "/v5/market/time").await;
+    (addr, state)
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_withdraw_sends_required_fields() {
+    let (addr, state) = start_withdraw_server(0).await;
+    let client = user_raw_test_client(format!("http://{addr}"));
+
+    let params = BybitWithdrawParamsBuilder::default()
+        .coin("USDT".to_string())
+        .address("0x99ced129603abc771c0dabe935c326ff6c86645d".to_string())
+        .amount("24.5".to_string())
+        .timestamp(1_700_000_000_000)
+        .account_type(BybitWithdrawAccountType::Fund)
+        .build()
+        .unwrap();
+    let response = client.withdraw(&params).await.unwrap();
+
+    assert_eq!(response.result.id, "10195");
+
+    let bodies = state.bodies.lock().await.clone();
+    assert_eq!(bodies.len(), 1);
+    let body = bodies[0].as_object().unwrap();
+    assert_eq!(body["coin"], "USDT");
+    assert_eq!(
+        body["address"],
+        "0x99ced129603abc771c0dabe935c326ff6c86645d"
+    );
+    assert_eq!(body["amount"], "24.5");
+    assert_eq!(body["accountType"], "FUND");
+    assert_eq!(body["timestamp"], 1_700_000_000_000_i64);
+
+    for key in [
+        "chain",
+        "tag",
+        "feeType",
+        "forceChain",
+        "requestId",
+        "questionnaire",
+    ] {
+        assert!(!body.contains_key(key), "unexpected {key} in {body:?}");
+    }
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_withdraw_sends_optional_fields() {
+    let (addr, state) = start_withdraw_server(0).await;
+    let client = user_raw_test_client(format!("http://{addr}"));
+
+    let params = BybitWithdrawParamsBuilder::default()
+        .coin("XRP".to_string())
+        .chain("XRP".to_string())
+        .address("rExampleAddress".to_string())
+        .tag("123456".to_string())
+        .amount("10".to_string())
+        .timestamp(1_700_000_000_000)
+        .account_type(BybitWithdrawAccountType::All)
+        .fee_type(BybitWithdrawFeeType::Gross)
+        .force_chain(BybitWithdrawForceChain::OnChain)
+        .request_id("persisted123".to_string())
+        .questionnaire("{}".to_string())
+        .build()
+        .unwrap();
+    client.withdraw(&params).await.unwrap();
+
+    let bodies = state.bodies.lock().await.clone();
+    let body = &bodies[0];
+    assert_eq!(body["chain"], "XRP");
+    assert_eq!(body["tag"], "123456");
+    assert_eq!(body["accountType"], "FUND,UTA,EARN");
+    assert_eq!(body["feeType"], 1);
+    assert_eq!(body["forceChain"], 1);
+    assert_eq!(body["requestId"], "persisted123");
+    assert_eq!(body["questionnaire"], "{}");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_withdraw_retry_resends_same_request_id() {
+    let (addr, state) = start_withdraw_server(1).await;
+    let client = BybitRawHttpClient::with_credentials(
+        "test_api_key".to_string(),
+        "test_api_secret".to_string(),
+        Some(format!("http://{addr}")),
+        60,
+        1,
+        1,
+        1,
+        5_000,
+        None,
+    )
+    .unwrap();
+
+    let params = BybitWithdrawParamsBuilder::default()
+        .coin("USDT".to_string())
+        .chain("ETH".to_string())
+        .address("0x99ced129603abc771c0dabe935c326ff6c86645d".to_string())
+        .amount("24".to_string())
+        .timestamp(1_700_000_000_000)
+        .account_type(BybitWithdrawAccountType::Fund)
+        .request_id("retry123".to_string())
+        .build()
+        .unwrap();
+    let response = client.withdraw(&params).await.unwrap();
+
+    assert_eq!(response.result.id, "10195");
+
+    let bodies = state.bodies.lock().await.clone();
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(bodies[0], bodies[1]);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_withdraw_without_request_id_does_not_retry() {
+    let (addr, state) = start_withdraw_server(1).await;
+    let client = BybitRawHttpClient::with_credentials(
+        "test_api_key".to_string(),
+        "test_api_secret".to_string(),
+        Some(format!("http://{addr}")),
+        60,
+        1,
+        1,
+        1,
+        5_000,
+        None,
+    )
+    .unwrap();
+
+    let params = BybitWithdrawParamsBuilder::default()
+        .coin("USDT".to_string())
+        .chain("ETH".to_string())
+        .address("0x99ced129603abc771c0dabe935c326ff6c86645d".to_string())
+        .amount("24".to_string())
+        .timestamp(1_700_000_000_000)
+        .account_type(BybitWithdrawAccountType::Fund)
+        .build()
+        .unwrap();
+    let result = client.withdraw(&params).await;
+
+    assert!(result.is_err());
+    assert_eq!(state.bodies.lock().await.len(), 1);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_withdraw_without_request_id_cancels_while_waiting_for_quota() {
+    let (addr, state) = start_withdraw_server(0).await;
+    *state.exhaust_quota.lock().await = true;
+    let client = Arc::new(user_raw_test_client(format!("http://{addr}")));
+
+    let params = BybitWithdrawParamsBuilder::default()
+        .coin("USDT".to_string())
+        .chain("ETH".to_string())
+        .address("0x99ced129603abc771c0dabe935c326ff6c86645d".to_string())
+        .amount("24".to_string())
+        .timestamp(1_700_000_000_000)
+        .account_type(BybitWithdrawAccountType::Fund)
+        .build()
+        .unwrap();
+
+    // First response reports the quota exhausted for 60s
+    client.withdraw(&params).await.unwrap();
+
+    let handle = tokio::spawn({
+        let client = Arc::clone(&client);
+        let params = params.clone();
+        async move { client.withdraw(&params).await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    client.cancel_all_requests();
+
+    let result = tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("withdraw did not observe cancellation")
+        .unwrap();
+
+    assert!(matches!(result, Err(BybitHttpError::Canceled(_))));
+    assert_eq!(state.bodies.lock().await.len(), 1);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_get_withdrawal_records_rejects_repeated_cursor() {
+    let (addr, state) = start_withdraw_server(0).await;
+    *state.repeat_cursor.lock().await = true;
+    let client = user_raw_test_client(format!("http://{addr}"));
+
+    let params = BybitWithdrawalRecordsParamsBuilder::default()
+        .withdraw_type(BybitWithdrawType::All)
+        .limit(2)
+        .build()
+        .unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.fetch_all_withdrawal_records(&params),
+    )
+    .await
+    .expect("pagination did not stop on a repeated cursor");
+
+    let err = result.unwrap_err();
+    assert!(err.to_string().contains("did not advance"), "{err}");
+    assert_eq!(state.record_queries.lock().await.len(), 2);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_get_withdrawal_records_walks_cursor() {
+    let (addr, state) = start_withdraw_server(0).await;
+    let client = user_raw_test_client(format!("http://{addr}"));
+
+    let params = BybitWithdrawalRecordsParamsBuilder::default()
+        .withdraw_type(BybitWithdrawType::All)
+        .limit(2)
+        .build()
+        .unwrap();
+    let records = client.fetch_all_withdrawal_records(&params).await.unwrap();
+
+    assert_eq!(records.len(), 3);
+
+    assert_eq!(records[0].withdraw_id, "131629076");
+    assert_eq!(
+        records[0].tx_id,
+        "0x3d7bddb797f0e86420c982c0723653b8b728fd0ec9953b6b354445848d83a185"
+    );
+    assert_eq!(records[0].amount, dec!(41.43008));
+    assert_eq!(records[0].withdraw_fee, dec!(5));
+    assert_eq!(records[0].status, BybitWithdrawStatus::Success);
+    assert_eq!(records[0].withdraw_type, BybitWithdrawType::OnChain);
+
+    assert_eq!(records[1].tx_id, "");
+    assert_eq!(records[1].status, BybitWithdrawStatus::CancelByUser);
+    assert_eq!(records[1].withdraw_type, BybitWithdrawType::Internal);
+
+    assert_eq!(records[2].withdraw_id, "131500000");
+    assert_eq!(records[2].status, BybitWithdrawStatus::Pending);
+
+    let log = state.record_queries.lock().await.clone();
+    assert_eq!(log.len(), 2, "expected exactly two page requests: {log:?}");
+    for query in &log {
+        assert!(query.contains("withdrawType=2"), "filter lost: {log:?}");
+        assert!(query.contains("limit=2"), "limit lost: {log:?}");
+    }
+    assert!(
+        !log[0].contains("cursor="),
+        "first page must not carry a cursor: {log:?}"
+    );
+    assert!(
+        log[1].contains("cursor=eyJtaW5JRCI6MTMxNjAzNDU4LCJtYXhJRCI6MTMxNjI5MDc2fQ"),
+        "second page must carry cursor: {log:?}"
+    );
+}
+
+#[rstest]
+#[case(false, "cache", "Instrument ETHUSDT-LINEAR not found in cache")]
+#[case(true, "cache", "Instrument ETHUSDT-LINEAR not found in cache")]
+#[case(false, "size", "position.size")]
+#[case(true, "size", "position.size")]
+#[case(false, "avgPrice", "Invalid decimal")]
+#[case(true, "avgPrice", "Invalid decimal")]
+#[case(false, "updatedTime", "position.updatedTime")]
+#[case(true, "updatedTime", "position.updatedTime")]
+#[case(false, "symbol", "Position symbol is empty")]
+#[case(true, "symbol", "Position symbol is empty")]
+#[tokio::test]
+async fn test_position_reports_reject_incomplete_rows(
+    #[case] scoped: bool,
+    #[case] failure: &'static str,
+    #[case] expected_error: &'static str,
+) {
+    let mut positions = load_test_data("http_get_positions.json");
+    positions["result"]["list"]
+        .as_array_mut()
+        .unwrap()
+        .truncate(2);
+
+    if failure != "cache" {
+        positions["result"]["list"][1][failure] =
+            json!(if failure == "symbol" { "" } else { "invalid" });
+    }
+
+    let (addr, state) = start_position_report_server(positions, false).await;
+    let client = user_test_client(format!("http://{addr}"));
+    let instruments: BybitInstrumentLinearResponse =
+        serde_json::from_value(load_test_data("http_get_instruments_linear.json")).unwrap();
+
+    for definition in instruments.result.list {
+        if failure != "cache" || definition.symbol == "BTCUSDT" {
+            let instrument = parse_linear_instrument(&definition, 0.into(), 0.into()).unwrap();
+            client.cache_instrument(instrument);
+        }
+    }
+
+    let result = client
+        .request_position_status_reports(
+            AccountId::new("BYBIT-UNIFIED"),
+            BybitProductType::Linear,
+            scoped.then_some(InstrumentId::from("ETHUSDT-LINEAR.BYBIT")),
+        )
+        .await;
+    let error =
+        result.expect_err("a held position row must not be omitted from successful reports");
+    assert!(
+        format!("{error:#}").contains(expected_error),
+        "unexpected error: {error:#}"
+    );
+
+    if failure == "symbol" {
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Position symbol is empty, category=Linear, symbol={:?}, settle_coin={:?}",
+                scoped.then_some("ETHUSDT"),
+                (!scoped).then_some("USDT"),
+            )
+        );
+    } else if failure != "cache" {
+        assert_eq!(
+            error.to_string(),
+            "failed to parse position report for ETHUSDT-LINEAR"
+        );
+    }
+
+    let queries = state.position_queries.lock().await;
+    assert_eq!(queries.len(), 1);
+    assert_eq!(
+        queries[0].get("category").map(String::as_str),
+        Some("linear")
+    );
+    assert_eq!(
+        queries[0].get("symbol").map(String::as_str),
+        scoped.then_some("ETHUSDT")
+    );
+    assert_eq!(
+        queries[0].get("settleCoin").map(String::as_str),
+        (!scoped).then_some("USDT")
+    );
+}
+
+#[rstest]
+#[case(false, false)]
+#[case(true, false)]
+#[case(true, true)]
+#[tokio::test]
+async fn test_position_reports_preserve_held_and_flat_rows(
+    #[case] scoped: bool,
+    #[case] flat: bool,
+) {
+    let mut positions = load_test_data("http_get_positions.json");
+    positions["result"]["list"]
+        .as_array_mut()
+        .unwrap()
+        .truncate(2);
+
+    if flat {
+        positions["result"]["list"][1]["side"] = json!("");
+        positions["result"]["list"][1]["size"] = json!("0");
+        positions["result"]["list"][1]["avgPrice"] = json!("0");
+    }
+
+    let (addr, state) = start_position_report_server(positions, false).await;
+    let client = user_test_client(format!("http://{addr}"));
+    client
+        .request_instruments(BybitProductType::Linear, None, None)
+        .await
+        .unwrap();
+    let account_id = AccountId::new("BYBIT-UNIFIED");
+    let ts_before = get_atomic_clock_realtime().get_time_ns();
+    let reports = client
+        .request_position_status_reports(
+            account_id,
+            BybitProductType::Linear,
+            scoped.then_some(InstrumentId::from("ETHUSDT-LINEAR.BYBIT")),
+        )
+        .await
+        .unwrap();
+
+    let ts_after = get_atomic_clock_realtime().get_time_ns();
+
+    let expected_rows = [
+        (
+            "BTCUSDT-LINEAR.BYBIT",
+            PositionSide::Long,
+            "0.500",
+            "0.5",
+            Some("50000.00"),
+            1_697_673_600_012_000_000_u64,
+        ),
+        (
+            "ETHUSDT-LINEAR.BYBIT",
+            if flat {
+                PositionSide::Flat
+            } else {
+                PositionSide::Short
+            },
+            if flat { "0.00" } else { "5.00" },
+            if flat { "0" } else { "-5" },
+            if flat { None } else { Some("3000.00") },
+            1_697_673_700_112_000_000_u64,
+        ),
+    ];
+
+    let expected = if scoped {
+        &expected_rows[1..]
+    } else {
+        &expected_rows[..]
+    };
+
+    assert_eq!(reports.len(), expected.len());
+
+    for (report, (id, side, quantity, signed_quantity, avg_price, ts_last)) in
+        reports.iter().zip(expected)
+    {
+        assert_eq!(report.account_id, account_id);
+        assert_eq!(report.instrument_id, InstrumentId::from(*id));
+        assert_eq!(report.position_side, *side);
+        assert_eq!(report.quantity, Quantity::from(*quantity));
+        assert_eq!(
+            report.signed_decimal_qty,
+            rust_decimal::Decimal::from_str_exact(signed_quantity).unwrap()
+        );
+        assert_eq!(
+            report.avg_px_open,
+            avg_price.map(|value| rust_decimal::Decimal::from_str_exact(value).unwrap())
+        );
+        assert_eq!(report.ts_last.as_u64(), *ts_last);
+        assert!(report.ts_init >= ts_before && report.ts_init <= ts_after);
+        assert_eq!(report.ts_init, reports[0].ts_init);
+        assert_eq!(report.venue_position_id, None);
+        assert_eq!(
+            report.avg_px_open_reconciliation,
+            AvgPxReconciliation::Match
+        );
+        assert_eq!(report.avg_px_open_precision, None);
+    }
+
+    if !scoped {
+        assert_ne!(reports[0].report_id, reports[1].report_id);
+    }
+
+    let queries = state.position_queries.lock().await;
+    assert_eq!(queries.len(), if scoped { 1 } else { 2 });
+    assert_eq!(
+        queries[0].get("settleCoin").map(String::as_str),
+        (!scoped).then_some("USDT")
+    );
+
+    if !scoped {
+        assert_eq!(
+            queries[1].get("settleCoin").map(String::as_str),
+            Some("USDC")
+        );
+    }
+}
+
+#[rstest]
+#[case("cache", "Instrument ETHUSDT-LINEAR not found in cache")]
+#[case("size", "position.size")]
+#[tokio::test]
+async fn test_position_reports_reject_incomplete_later_page(
+    #[case] failure: &str,
+    #[case] expected_error: &str,
+) {
+    let mut positions = load_test_data("http_get_positions.json");
+    positions["result"]["list"]
+        .as_array_mut()
+        .unwrap()
+        .truncate(2);
+
+    if failure == "size" {
+        positions["result"]["list"][1]["size"] = json!("invalid");
+    }
+
+    let (addr, state) = start_position_report_server(positions, true).await;
+    let client = user_test_client(format!("http://{addr}"));
+    let instruments: BybitInstrumentLinearResponse =
+        serde_json::from_value(load_test_data("http_get_instruments_linear.json")).unwrap();
+
+    for definition in instruments.result.list {
+        if failure != "cache" || definition.symbol == "BTCUSDT" {
+            client.cache_instrument(
+                parse_linear_instrument(&definition, 0.into(), 0.into()).unwrap(),
+            );
+        }
+    }
+
+    let error = client
+        .request_position_status_reports(
+            AccountId::new("BYBIT-UNIFIED"),
+            BybitProductType::Linear,
+            None,
+        )
+        .await
+        .expect_err("a later page failure must discard earlier position reports");
+
+    assert!(
+        format!("{error:#}").contains(expected_error),
+        "unexpected error: {error:#}"
+    );
+    let queries = state.position_queries.lock().await;
+    assert_eq!(queries.len(), 2);
+    assert_eq!(queries[0].get("cursor"), None);
+    assert_eq!(
+        queries[1].get("cursor").map(String::as_str),
+        Some("position-page-2")
+    );
+    assert_eq!(
+        queries[0].get("settleCoin").map(String::as_str),
+        Some("USDT")
+    );
+    assert_eq!(
+        queries[1].get("settleCoin").map(String::as_str),
+        Some("USDT")
+    );
+}
+
+async fn start_position_report_server(
+    positions: Value,
+    paginated: bool,
+) -> (SocketAddr, TestServerState) {
+    let state = TestServerState::default();
+
+    let router = Router::new()
+        .route("/v5/market/time", get(handle_get_server_time))
+        .route("/v5/market/instruments-info", get(handle_get_instruments))
+        .route(
+            "/v5/position/list",
+            get(
+                move |Query(query): Query<HashMap<String, String>>,
+                      State(state): State<TestServerState>| {
+                    let mut response = positions.clone();
+                    async move {
+                        let list = response["result"]["list"].as_array_mut().unwrap();
+                        if query.get("settleCoin").map(String::as_str) == Some("USDC") {
+                            list.clear();
+                        } else if query.contains_key("symbol")
+                            || (paginated && query.contains_key("cursor"))
+                        {
+                            list.remove(0);
+                        } else if paginated {
+                            list.truncate(1);
+                            response["result"]["nextPageCursor"] = json!("position-page-2");
+                        }
+
+                        state.position_queries.lock().await.push(query);
+                        Json(response)
+                    }
+                },
+            ),
+        )
+        .with_state(state.clone());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    wait_for_server(addr, "/v5/market/time").await;
+    (addr, state)
 }

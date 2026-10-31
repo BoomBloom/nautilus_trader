@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::{collections::VecDeque, time::Duration};
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use nautilus_common::{
@@ -23,10 +23,10 @@ use nautilus_common::{
         DataEvent,
         defi::{
             DefiDataCommand, DefiRequestCommand, DefiSubscribeCommand, DefiUnsubscribeCommand,
-            SubscribeBlocks, SubscribePool, SubscribePoolFeeCollects, SubscribePoolFlashEvents,
-            SubscribePoolLiquidityUpdates, SubscribePoolSwaps, UnsubscribeBlocks, UnsubscribePool,
-            UnsubscribePoolFeeCollects, UnsubscribePoolFlashEvents,
-            UnsubscribePoolLiquidityUpdates, UnsubscribePoolSwaps,
+            PoolSnapshotResponse, SubscribeBlocks, SubscribePool, SubscribePoolFeeCollects,
+            SubscribePoolFlashEvents, SubscribePoolLiquidityUpdates, SubscribePoolSwaps,
+            UnsubscribeBlocks, UnsubscribePool, UnsubscribePoolFeeCollects,
+            UnsubscribePoolFlashEvents, UnsubscribePoolLiquidityUpdates, UnsubscribePoolSwaps,
         },
     },
 };
@@ -87,14 +87,19 @@ pub struct BlockchainDataClient {
 
 impl BlockchainDataClient {
     /// Creates a new [`BlockchainDataClient`] instance for the specified configuration.
-    #[must_use]
-    pub fn new(client_id: ClientId, config: BlockchainDataClientConfig) -> Self {
-        let chain = config.chain.clone();
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if DEX selections contain duplicates.
+    pub fn new(client_id: ClientId, config: BlockchainDataClientConfig) -> anyhow::Result<Self> {
+        config.validate()?;
+
+        let chain = Arc::clone(&config.chain);
         let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
         let (hypersync_tx, hypersync_rx) = tokio::sync::mpsc::unbounded_channel();
         let socket_factory = SocketControlFactory::new(client_id, None);
         let session_tasks = TaskGroup::new();
-        Self {
+        Ok(Self {
             client_id,
             chain,
             core_client: None,
@@ -106,7 +111,7 @@ impl BlockchainDataClient {
             command_rx: Some(command_rx),
             cancellation_token: session_tasks.cancellation_token(),
             session_tasks,
-        }
+        })
     }
 
     /// Spawns the main processing task that handles commands and blockchain data.
@@ -119,26 +124,29 @@ impl BlockchainDataClient {
     fn spawn_process_task(
         &mut self,
     ) -> anyhow::Result<tokio::sync::oneshot::Receiver<anyhow::Result<()>>> {
-        let command_rx = if let Some(r) = self.command_rx.take() {
-            r
-        } else {
-            log::error!("Command receiver already taken, not spawning handler");
-            anyhow::bail!("Command receiver already taken");
-        };
+        anyhow::ensure!(self.command_rx.is_some(), "Command receiver already taken");
 
         let cancellation_token = self.cancellation_token.clone();
 
         let data_tx = nautilus_common::live::runner::get_data_event_sender();
 
-        let mut hypersync_rx = self.hypersync_rx.take().unwrap();
-        let hypersync_tx = self.hypersync_tx.take();
+        let hypersync_tx = self.hypersync_tx.clone();
 
         let mut core_client = BlockchainDataClientCore::new(
             self.config.clone(),
             hypersync_tx,
             Some(data_tx),
             cancellation_token.clone(),
-        );
+        )?;
+        let command_rx = self
+            .command_rx
+            .take()
+            .expect("command receiver was checked");
+        let mut hypersync_rx = self
+            .hypersync_rx
+            .take()
+            .expect("HyperSync receiver is available before startup");
+        self.hypersync_tx = None;
         core_client.set_socket_control(self.socket_factory.control("blockchain-rpc"));
 
         let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
@@ -146,13 +154,6 @@ impl BlockchainDataClient {
             log::debug!("Started task 'process'");
 
             if let Err(e) = core_client.connect().await {
-                // TODO: connect() could return more granular error types to distinguish
-                // cancellation from actual failures without string matching
-                if e.to_string().contains("cancelled") || e.to_string().contains("Sync cancelled") {
-                    log::warn!("Blockchain core client connection interrupted: {e}");
-                } else {
-                    log::error!("Failed to connect blockchain core client: {e}");
-                }
                 let _ = startup_tx.send(Err(e));
                 return;
             }
@@ -577,28 +578,9 @@ impl BlockchainDataClient {
                             )
                         })?;
 
-                    // Subscribe to all pool event types
                     core_client
                         .subscription_manager
-                        .subscribe_swaps(dex, pool_address);
-                    core_client
-                        .subscription_manager
-                        .subscribe_burns(dex, pool_address);
-                    core_client
-                        .subscription_manager
-                        .subscribe_mints(dex, pool_address);
-                    core_client
-                        .subscription_manager
-                        .subscribe_collects(dex, pool_address);
-                    core_client
-                        .subscription_manager
-                        .subscribe_flashes(dex, pool_address);
-                    core_client
-                        .subscription_manager
-                        .subscribe_fee_protocol_updates(dex, pool_address);
-                    core_client
-                        .subscription_manager
-                        .subscribe_fee_protocol_collects(dex, pool_address);
+                        .subscribe_pool(dex, pool_address);
                     Self::update_rpc_pool_event_subscriptions(core_client, dex).await?;
                     Self::update_hypersync_pool_event_stream(core_client, dex).await?;
 
@@ -757,28 +739,9 @@ impl BlockchainDataClient {
                             anyhow::anyhow!("Invalid pool address: {}", cmd.instrument_id)
                         })?;
 
-                    // Unsubscribe from all pool event types
                     core_client
                         .subscription_manager
-                        .unsubscribe_swaps(dex, pool_address);
-                    core_client
-                        .subscription_manager
-                        .unsubscribe_burns(dex, pool_address);
-                    core_client
-                        .subscription_manager
-                        .unsubscribe_mints(dex, pool_address);
-                    core_client
-                        .subscription_manager
-                        .unsubscribe_collects(dex, pool_address);
-                    core_client
-                        .subscription_manager
-                        .unsubscribe_flashes(dex, pool_address);
-                    core_client
-                        .subscription_manager
-                        .unsubscribe_fee_protocol_updates(dex, pool_address);
-                    core_client
-                        .subscription_manager
-                        .unsubscribe_fee_protocol_collects(dex, pool_address);
+                        .unsubscribe_pool(dex, pool_address);
                     Self::update_rpc_pool_event_subscriptions(core_client, dex).await?;
                     Self::update_hypersync_pool_event_stream(core_client, dex).await?;
 
@@ -1138,7 +1101,7 @@ impl BlockchainDataClient {
 
                 match core_client.get_pool(&pool_identifier) {
                     Ok(pool) => {
-                        let pool = pool.clone();
+                        let pool = Arc::clone(pool);
                         log::debug!("Found pool for snapshot request: {}", cmd.instrument_id);
 
                         // Send the pool definition
@@ -1171,9 +1134,10 @@ impl BlockchainDataClient {
                                         .await?
                                         .is_usable()
                                     {
-                                        let snapshot_data =
-                                            DataEvent::DeFi(DefiData::PoolSnapshot(snapshot));
-                                        core_client.send_data(snapshot_data);
+                                        let response =
+                                            PoolSnapshotResponse::new(cmd.request_id, snapshot);
+                                        core_client
+                                            .send_data(DataEvent::PoolSnapshotResponse(response));
                                     }
                                 }
                                 Err(e) => log::error!(
@@ -1204,7 +1168,7 @@ impl BlockchainDataClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when bounded task shutdown fails.
+    /// Returns an error if bounded task shutdown fails.
     pub async fn await_process_task_close(&self) -> anyhow::Result<()> {
         self.session_tasks
             .finish_shutdown(Duration::from_secs(2), Duration::from_secs(2))
@@ -1287,6 +1251,8 @@ impl DataClient for BlockchainDataClient {
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {
+        self.config.validate()?;
+
         if self.session_tasks.is_open() && !self.session_tasks.is_empty() {
             return Ok(());
         }
@@ -1599,7 +1565,7 @@ mod tests {
         let address = address!("1111111111111111111111111111111111111111");
 
         BlockchainMessage::SwapEvent(SwapEvent::new(
-            pool.dex.clone(),
+            Arc::clone(&pool.dex),
             pool.pool_identifier,
             block_number,
             "0x1".to_string(),
@@ -1633,7 +1599,7 @@ mod tests {
         let address = address!("1111111111111111111111111111111111111111");
 
         BlockchainMessage::FlashEvent(FlashEvent::new(
-            pool.dex.clone(),
+            Arc::clone(&pool.dex),
             pool.pool_identifier,
             block_number,
             "0x1".to_string(),
@@ -1654,20 +1620,21 @@ mod tests {
                 .expect("Ethereum chain should exist")
                 .clone(),
         );
-        let dex = get_dex_extended(chain.name, &DexType::UniswapV3)
-            .expect("Ethereum UniswapV3 should be registered")
-            .dex
-            .clone();
+        let dex = Arc::clone(
+            &get_dex_extended(chain.name, &DexType::UniswapV3)
+                .expect("Ethereum UniswapV3 should be registered")
+                .dex,
+        );
         let pool_address = address!("4e68ccd3e89f51c3074ca5072bbac773960dfa36");
         let token0 = Token::new(
-            chain.clone(),
+            Arc::clone(&chain),
             address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
             "Wrapped Ether".to_string(),
             "WETH".to_string(),
             18,
         );
         let token1 = Token::new(
-            chain.clone(),
+            Arc::clone(&chain),
             address!("dAC17F958D2ee523a2206206994597C13D831ec7"),
             "Tether USD".to_string(),
             "USDT".to_string(),

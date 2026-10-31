@@ -124,7 +124,7 @@ pub trait StateStore {
     ///
     /// # Errors
     ///
-    /// Returns `Err(E)` if the closure returns an error or the request is rate-limited.
+    /// Returns an error if the closure returns an error or the request is rate-limited.
     fn measure_and_replace<T, F, E>(&self, key: &Self::Key, f: F) -> Result<T, E>
     where
         F: Fn(Option<Nanos>) -> Result<(T, Nanos), E>;
@@ -141,6 +141,7 @@ impl<K: Hash + Eq + Clone> StateStore for DashMapStateStore<K> {
             // fast path: measure existing entry
             return v.measure_and_replace_one(f);
         }
+
         // make an entry and measure that:
         let entry = self.entry(key.clone()).or_default();
         (*entry).measure_and_replace_one(f)
@@ -207,6 +208,7 @@ where
             .into_iter()
             .map(|(k, q)| (k, Gcra::new(q)))
             .collect();
+
         Self {
             default_gcra: base_quota.map(Gcra::new),
             state: DashMapStateStore::new(),
@@ -245,7 +247,7 @@ where
     ///
     /// # Errors
     ///
-    /// Returns `Err(NotUntil)` if the key is rate-limited, indicating when it will be allowed.
+    /// Returns an error if the key is rate-limited, indicating when it will be allowed.
     pub fn check_key(&self, key: &K) -> Result<(), NotUntil<C::Instant>> {
         let _guard = self.decision_lock.lock();
 
@@ -312,6 +314,7 @@ where
                 .get(key)
                 .copied()
                 .or_else(|| self.state.get(key).and_then(|state| state.load()));
+
             let decision = match self.gcra.get(key) {
                 Some(quota) => Some(quota.test(self.start, tat, now)),
                 None => self
@@ -385,6 +388,7 @@ where
                         limiter.commit_keys(planned);
                     }
                 }
+
                 wait
             };
 
@@ -427,6 +431,7 @@ mod tests {
         let start = clock.now();
         let gcra = DashMap::new();
         let base_quota = Quota::per_second(NonZeroU32::new(2).unwrap()).unwrap();
+
         RateLimiter {
             default_gcra: Some(Gcra::new(base_quota)),
             state: DashMapStateStore::new(),
@@ -467,6 +472,105 @@ mod tests {
         // Increment clock and check base quota is reset
         mock_limiter.advance_clock(Duration::from_secs(1));
         assert!(mock_limiter.check_key(&"default".to_string()).is_ok());
+    }
+
+    #[rstest]
+    #[case(1)]
+    #[case(3)]
+    #[case(8)]
+    fn test_burst_capacity_and_pacing_after_idle(#[case] burst: u32) {
+        let interval = Duration::from_nanos(100);
+        let quota = Quota::with_period(interval)
+            .unwrap()
+            .allow_burst(NonZeroU32::new(burst).unwrap());
+        let clock = FakeRelativeClock::default();
+        let limiter = RateLimiter::new_with_clock(Some(quota), vec![], clock.clone());
+        let key = "requests";
+
+        for idle in [
+            Duration::ZERO,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        ] {
+            clock.advance(idle);
+
+            for _ in 0..burst {
+                assert_eq!(limiter.check_key(&key), Ok(()));
+            }
+
+            let denied = limiter.check_key(&key).unwrap_err();
+            assert_eq!(denied.quota(), quota);
+            assert_eq!(denied.wait_time_from(clock.now()), interval);
+            clock.advance(Duration::from_nanos(99));
+            assert_eq!(
+                limiter
+                    .check_key(&key)
+                    .unwrap_err()
+                    .wait_time_from(clock.now()),
+                Duration::from_nanos(1),
+            );
+            clock.advance(Duration::from_nanos(1));
+            assert_eq!(limiter.check_key(&key), Ok(()));
+            assert_eq!(
+                limiter
+                    .check_key(&key)
+                    .unwrap_err()
+                    .wait_time_from(clock.now()),
+                interval,
+            );
+        }
+    }
+
+    #[rstest]
+    #[case(1)]
+    #[case(3)]
+    #[case(8)]
+    #[tokio::test]
+    async fn test_multi_key_admission_after_idle_preserves_capacity_and_atomicity(
+        #[case] burst: u32,
+    ) {
+        let interval = Duration::from_nanos(100);
+        let quota = Quota::with_period(interval)
+            .unwrap()
+            .allow_burst(NonZeroU32::new(burst).unwrap());
+        let clock = FakeRelativeClock::default();
+        let limiter = RateLimiter::new_with_clock(Some(quota), vec![], clock.clone());
+        let keys = ["first", "second"];
+        for _ in 0..burst {
+            limiter.await_keys_ready(Some(&keys)).await;
+        }
+
+        clock.advance(Duration::from_secs(1));
+        let now = clock.now();
+
+        for _ in 0..burst {
+            limiter.await_keys_ready(Some(&keys)).await;
+            assert_eq!(clock.now(), now);
+        }
+
+        assert_eq!(limiter.plan_keys(&["spare", "first"], now), Err(interval));
+        assert!(!limiter.state.contains_key(&"spare"));
+        limiter.await_keys_ready(Some(&["spare", "first"])).await;
+        assert_eq!(clock.now(), now + Nanos::from(interval));
+        assert_eq!(
+            limiter
+                .check_key(&"first")
+                .unwrap_err()
+                .wait_time_from(clock.now()),
+            interval
+        );
+
+        for _ in 1..burst {
+            assert_eq!(limiter.check_key(&"spare"), Ok(()));
+        }
+
+        assert_eq!(
+            limiter
+                .check_key(&"spare")
+                .unwrap_err()
+                .wait_time_from(clock.now()),
+            interval
+        );
     }
 
     #[rstest]
@@ -587,6 +691,7 @@ mod tests {
     async fn test_await_keys_ready_reserves_keys_together() {
         let fast = "fast".to_string();
         let slow = "slow".to_string();
+
         let limiter = Arc::new(RateLimiter::new_with_quota(
             None,
             vec![
@@ -611,13 +716,13 @@ mod tests {
                 .await_keys_ready(Some(&[waiting_fast, waiting_slow]))
                 .await;
         });
+
         test_task::yield_now().await;
 
         limiter.check_key(&fast).unwrap();
         assert!(!request.is_finished());
 
         advance_test_clock(Duration::from_millis(9_999)).await;
-        limiter.until_key_ready(&fast).await;
         limiter.until_key_ready(&fast).await;
         advance_test_clock(Duration::from_millis(1)).await;
         test_task::yield_now().await;
@@ -767,6 +872,7 @@ mod tests {
         let rate = 10u32;
         let clock = FakeRelativeClock::default();
         let start = clock.now();
+
         let limiter = RateLimiter {
             default_gcra: Some(Gcra::new(
                 Quota::per_second(NonZeroU32::new(rate).unwrap()).unwrap(),

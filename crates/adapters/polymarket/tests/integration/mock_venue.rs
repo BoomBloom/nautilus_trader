@@ -30,7 +30,7 @@ use axum::{
     Router,
     body::Bytes,
     extract::{
-        Query, State,
+        Path, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, StatusCode, Uri},
@@ -132,12 +132,18 @@ pub(super) struct TestServerState {
     pub(super) last_headers: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
     pub(super) last_path: Arc<tokio::sync::Mutex<String>>,
     pub(super) last_query: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
+    pub(super) trade_queries: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>>,
+    pub(super) balance_queries: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>>,
     pub(super) gamma_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     pub(super) version_response: Arc<tokio::sync::Mutex<Value>>,
+    pub(super) market_responses: Arc<tokio::sync::Mutex<HashMap<String, (StatusCode, Value)>>>,
+    pub(super) market_queries: Arc<tokio::sync::Mutex<Vec<String>>>,
     pub(super) version_response_status: Arc<tokio::sync::Mutex<StatusCode>>,
     pub(super) startup_request_paths: Arc<tokio::sync::Mutex<Vec<String>>>,
     pub(super) balance_response_status: Arc<tokio::sync::Mutex<StatusCode>>,
+    pub(super) balance_update_status: Arc<tokio::sync::Mutex<StatusCode>>,
     pub(super) balance_response: Arc<tokio::sync::Mutex<Value>>,
+    pub(super) balance_response_gate: Arc<RequestGate>,
     pub(super) order_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     pub(super) order_response_status: Arc<tokio::sync::Mutex<StatusCode>>,
     pub(super) order_response_headers: Arc<tokio::sync::Mutex<HeaderMap>>,
@@ -171,6 +177,7 @@ pub(super) struct TestServerState {
     pub(super) batch_cancel_response_headers: Arc<tokio::sync::Mutex<VecDeque<HeaderMap>>>,
     pub(super) batch_cancel_bodies: Arc<tokio::sync::Mutex<Vec<Value>>>,
     pub(super) batch_cancel_echo_rejections: Arc<AtomicBool>,
+    pub(super) batch_cancel_echo_cancellations: Arc<AtomicBool>,
     pub(super) batch_cancel_delete_count: Arc<tokio::sync::Mutex<usize>>,
     pub(super) batch_cancel_request_gate: Arc<RequestGate>,
     pub(super) market_cancel_response: Arc<tokio::sync::Mutex<Option<Value>>>,
@@ -178,19 +185,26 @@ pub(super) struct TestServerState {
     pub(super) market_cancel_delete_count: Arc<tokio::sync::Mutex<usize>>,
     pub(super) market_cancel_request_gate: Arc<RequestGate>,
     pub(super) order_request_gate: Arc<RequestGate>,
+    pub(super) order_response_gate: Arc<RequestGate>,
     pub(super) batch_order_request_gate: Arc<RequestGate>,
     pub(super) open_order_ids: Arc<tokio::sync::Mutex<HashSet<String>>>,
     pub(super) orders_response_override: Arc<tokio::sync::Mutex<Option<Value>>>,
     pub(super) orders_response_status: Arc<tokio::sync::Mutex<StatusCode>>,
     pub(super) orders_get_count: Arc<AtomicUsize>,
     pub(super) book_response: Arc<tokio::sync::Mutex<Option<Value>>>,
+    pub(super) book_response_status: Arc<tokio::sync::Mutex<StatusCode>>,
     pub(super) single_order_responses: Arc<tokio::sync::Mutex<VecDeque<Value>>>,
+    pub(super) single_order_response_statuses: Arc<tokio::sync::Mutex<VecDeque<StatusCode>>>,
     pub(super) single_order_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     pub(super) single_order_get_count: Arc<AtomicUsize>,
+    pub(super) single_order_request_gate: Arc<RequestGate>,
     pub(super) trades_response_override: Arc<tokio::sync::Mutex<Option<Value>>>,
+    pub(super) trades_response_by_id: Arc<tokio::sync::Mutex<HashMap<String, (StatusCode, Value)>>>,
+    pub(super) trades_filter_after: Arc<AtomicBool>,
     pub(super) positions_response_override: Arc<tokio::sync::Mutex<Option<Value>>>,
     pub(super) user_frames: tokio::sync::broadcast::Sender<String>,
     pub(super) user_socket_count: Arc<AtomicUsize>,
+    pub(super) user_upgrade_gate: Arc<RequestGate>,
 }
 
 impl Default for TestServerState {
@@ -198,10 +212,14 @@ impl Default for TestServerState {
         let (user_frames, _) = tokio::sync::broadcast::channel(32);
 
         Self {
+            market_responses: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            market_queries: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             last_body: Arc::new(tokio::sync::Mutex::new(None)),
             last_headers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             last_path: Arc::new(tokio::sync::Mutex::new(String::new())),
             last_query: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            trade_queries: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            balance_queries: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             gamma_response: Arc::new(tokio::sync::Mutex::new(None)),
             version_response: Arc::new(tokio::sync::Mutex::new(load_json(
                 "http_version_response.json",
@@ -209,6 +227,8 @@ impl Default for TestServerState {
             version_response_status: Arc::new(tokio::sync::Mutex::new(StatusCode::OK)),
             startup_request_paths: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             balance_response_status: Arc::new(tokio::sync::Mutex::new(StatusCode::OK)),
+            balance_update_status: Arc::new(tokio::sync::Mutex::new(StatusCode::OK)),
+            balance_response_gate: Arc::new(RequestGate::default()),
             balance_response: Arc::new(tokio::sync::Mutex::new(load_json(
                 "http_balance_allowance_collateral.json",
             ))),
@@ -245,6 +265,7 @@ impl Default for TestServerState {
             batch_cancel_response_headers: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             batch_cancel_bodies: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             batch_cancel_echo_rejections: Arc::new(AtomicBool::new(false)),
+            batch_cancel_echo_cancellations: Arc::new(AtomicBool::new(false)),
             batch_cancel_delete_count: Arc::new(tokio::sync::Mutex::new(0)),
             batch_cancel_request_gate: Arc::new(RequestGate::default()),
             market_cancel_response: Arc::new(tokio::sync::Mutex::new(None)),
@@ -252,16 +273,22 @@ impl Default for TestServerState {
             market_cancel_delete_count: Arc::new(tokio::sync::Mutex::new(0)),
             market_cancel_request_gate: Arc::new(RequestGate::default()),
             order_request_gate: Arc::new(RequestGate::default()),
+            order_response_gate: Arc::new(RequestGate::default()),
             batch_order_request_gate: Arc::new(RequestGate::default()),
             open_order_ids: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             orders_response_override: Arc::new(tokio::sync::Mutex::new(None)),
             orders_response_status: Arc::new(tokio::sync::Mutex::new(StatusCode::OK)),
             orders_get_count: Arc::new(AtomicUsize::new(0)),
             single_order_responses: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+            single_order_response_statuses: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             single_order_response: Arc::new(tokio::sync::Mutex::new(None)),
             single_order_get_count: Arc::new(AtomicUsize::new(0)),
+            single_order_request_gate: Arc::new(RequestGate::default()),
             trades_response_override: Arc::new(tokio::sync::Mutex::new(None)),
+            trades_response_by_id: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            trades_filter_after: Arc::new(AtomicBool::new(false)),
             positions_response_override: Arc::new(tokio::sync::Mutex::new(None)),
+            book_response_status: Arc::new(tokio::sync::Mutex::new(StatusCode::OK)),
             book_response: Arc::new(tokio::sync::Mutex::new(Some(json!({
                 "bids": [
                     {"price": "0.48", "size": "100.00"},
@@ -276,6 +303,7 @@ impl Default for TestServerState {
             })))),
             user_frames,
             user_socket_count: Arc::new(AtomicUsize::new(0)),
+            user_upgrade_gate: Arc::new(RequestGate::default()),
         }
     }
 }
@@ -348,6 +376,16 @@ async fn handle_get_orders(
 async fn handle_get_order(State(state): State<TestServerState>, uri: Uri) -> Response {
     *state.last_path.lock().await = uri.path().to_string();
     state.single_order_get_count.fetch_add(1, Ordering::AcqRel);
+    state.single_order_request_gate.wait().await;
+    if let Some(status) = state
+        .single_order_response_statuses
+        .lock()
+        .await
+        .pop_front()
+    {
+        return (status, Json(json!({"error": "order lookup failed"}))).into_response();
+    }
+
     if let Some(resp) = state.single_order_responses.lock().await.pop_front() {
         return Json(resp).into_response();
     }
@@ -365,9 +403,42 @@ async fn handle_get_trades(
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     *state.last_path.lock().await = uri.path().to_string();
+    let after = query
+        .get("after")
+        .and_then(|value| value.parse::<u64>().ok());
+    state.trade_queries.lock().await.push(query.clone());
+    let trade_id = query.get("id").cloned();
     *state.last_query.lock().await = query;
+
+    if let Some(trade_id) = &trade_id
+        && let Some((status, body)) = state.trades_response_by_id.lock().await.get(trade_id)
+    {
+        return (*status, Json(body.clone())).into_response();
+    }
+
     if let Some(override_value) = state.trades_response_override.lock().await.as_ref() {
-        return Json(override_value.clone()).into_response();
+        let mut page = override_value.clone();
+
+        if let Some(trade_id) = trade_id
+            && let Some(rows) = page["data"].as_array_mut()
+        {
+            rows.retain(|row| row["id"].as_str() == Some(trade_id.as_str()));
+        }
+
+        // The venue's `after` keeps only rows matched later than the given Unix second
+        if state.trades_filter_after.load(Ordering::Acquire)
+            && let Some(after) = after
+            && let Some(rows) = page["data"].as_array_mut()
+        {
+            rows.retain(|row| {
+                row["match_time"]
+                    .as_str()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .is_some_and(|match_time| match_time > after)
+            });
+        }
+
+        return Json(page).into_response();
     }
     Json(load_json("http_trades_page.json")).into_response()
 }
@@ -376,7 +447,10 @@ async fn handle_get_balance(
     State(state): State<TestServerState>,
     uri: Uri,
     headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Response {
+    let status = *state.balance_response_status.lock().await;
+    state.balance_queries.lock().await.push(query);
     *state.last_path.lock().await = uri.path().to_string();
     state
         .startup_request_paths
@@ -387,9 +461,24 @@ async fn handle_get_balance(
         .iter()
         .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
         .collect();
-    let status = *state.balance_response_status.lock().await;
     let response = state.balance_response.lock().await.clone();
+    state.balance_response_gate.wait().await;
     (status, Json(response)).into_response()
+}
+
+async fn handle_update_balance(
+    State(state): State<TestServerState>,
+    uri: Uri,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let status = *state.balance_update_status.lock().await;
+    state.balance_queries.lock().await.push(query);
+    state
+        .startup_request_paths
+        .lock()
+        .await
+        .push(uri.path().to_string());
+    (status, Json(json!({}))).into_response()
 }
 
 async fn handle_get_version(State(state): State<TestServerState>, uri: Uri) -> Response {
@@ -461,6 +550,7 @@ async fn handle_post_order(
     }
 
     record_open_order_ids(&state, std::slice::from_ref(&body)).await;
+    state.order_response_gate.wait().await;
     let mut response = (status, Json(body)).into_response();
     response
         .headers_mut()
@@ -579,6 +669,11 @@ async fn handle_delete_orders(
             .map(|order_id| (order_id.to_string(), json!("order not found")))
             .collect::<serde_json::Map<_, _>>();
         json!({"canceled": [], "not_canceled": not_canceled})
+    } else if state
+        .batch_cancel_echo_cancellations
+        .load(Ordering::Acquire)
+    {
+        json!({"canceled": request, "not_canceled": {}})
     } else {
         state
             .batch_cancel_response
@@ -636,6 +731,7 @@ async fn handle_user_upgrade(
         .lock()
         .await
         .push("/ws".to_string());
+    state.user_upgrade_gate.wait().await;
     ws.on_upgrade(move |socket| handle_user_socket(socket, state))
 }
 
@@ -705,13 +801,24 @@ async fn handle_gamma_markets(State(state): State<TestServerState>) -> Response 
     }
 }
 
+async fn handle_gamma_markets_keyset(State(state): State<TestServerState>) -> Response {
+    let markets = state
+        .gamma_response
+        .lock()
+        .await
+        .clone()
+        .unwrap_or_else(|| json!([]));
+    Json(json!({"markets": markets, "next_cursor": null})).into_response()
+}
+
 async fn handle_get_book(State(state): State<TestServerState>, uri: Uri) -> Response {
     *state.last_path.lock().await = uri.path().to_string();
+    let status = *state.book_response_status.lock().await;
     let resp = state.book_response.lock().await;
-    match resp.as_ref() {
-        Some(v) => Json(v.clone()).into_response(),
-        None => (StatusCode::OK, Json(json!({"bids": [], "asks": []}))).into_response(),
-    }
+    let body = resp
+        .clone()
+        .unwrap_or_else(|| json!({"bids": [], "asks": []}));
+    (status, Json(body)).into_response()
 }
 
 async fn handle_get_fee_rate(
@@ -815,6 +922,26 @@ async fn handle_get_positions(State(state): State<TestServerState>) -> impl Into
     }))
 }
 
+async fn handle_get_market(
+    State(state): State<TestServerState>,
+    Path(condition_id): Path<String>,
+) -> Response {
+    state.market_queries.lock().await.push(condition_id.clone());
+    if let Some((status, market)) = state
+        .market_responses
+        .lock()
+        .await
+        .get(&condition_id)
+        .cloned()
+    {
+        return (status, Json(market)).into_response();
+    }
+
+    let mut market = load_json("clob_market_response.json");
+    market["condition_id"] = json!(condition_id);
+    Json(market).into_response()
+}
+
 fn create_test_router(state: TestServerState) -> Router {
     Router::new()
         .route("/data/orders", get(handle_get_orders))
@@ -822,6 +949,7 @@ fn create_test_router(state: TestServerState) -> Router {
         .route("/data/trades", get(handle_get_trades))
         .route("/version", get(handle_get_version))
         .route("/balance-allowance", get(handle_get_balance))
+        .route("/balance-allowance/update", get(handle_update_balance))
         .route(
             "/order",
             post(handle_post_order).delete(handle_delete_order),
@@ -833,6 +961,8 @@ fn create_test_router(state: TestServerState) -> Router {
         .route("/cancel-all", delete(handle_cancel_all))
         .route("/cancel-market-orders", delete(handle_cancel_market_orders))
         .route("/markets", get(handle_gamma_markets))
+        .route("/markets/{condition_id}", get(handle_get_market))
+        .route("/markets/keyset", get(handle_gamma_markets_keyset))
         .route("/book", get(handle_get_book))
         .route("/fee-rate", get(handle_get_fee_rate))
         .route("/v1/heartbeats", post(handle_heartbeat))

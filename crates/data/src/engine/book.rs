@@ -31,6 +31,778 @@ use nautilus_model::{
 };
 use ustr::Ustr;
 
+use super::{
+    BookDeltasResponse, BookDepthResponse, DataEngine, DurationNanos, FAILED, OrderBookDelta,
+    PARAMS_IS_PARENT, Params, RecordFlag, SubscribeBookDeltas, SubscribeBookDepth, SubscriptionKey,
+    TimeEventCallback, TypedHandler, UUID4, UnsubscribeBookDeltas, UnsubscribeBookDepth,
+    UnsubscribeBookSnapshots, UnsubscribeCommand, is_parent_subscription,
+    log_error_on_cache_insert,
+};
+
+impl DataEngine {
+    /// Returns all instrument IDs for which book delta subscriptions exist.
+    #[must_use]
+    pub fn subscribed_book_deltas(&self) -> Vec<InstrumentId> {
+        self.collect_subscriptions(|client| &client.subscriptions_book_deltas)
+    }
+
+    /// Returns all instrument IDs for which book depth subscriptions exist.
+    #[must_use]
+    pub fn subscribed_book_depth(&self) -> Vec<InstrumentId> {
+        self.collect_subscriptions(|client| &client.subscriptions_book_depth)
+    }
+
+    /// Returns all instrument IDs for which book snapshot subscriptions exist.
+    #[must_use]
+    pub fn subscribed_book_snapshots(&self) -> Vec<InstrumentId> {
+        self.book_snapshot_counts
+            .keys()
+            .map(|(instrument_id, _)| *instrument_id)
+            .collect()
+    }
+
+    /// Returns whether a retained book subscription names or covers `instrument_id`.
+    ///
+    /// Includes resolved parent targets and ownership retained after a client subscription failure.
+    /// Does not indicate that an upstream feed is active or a book is complete.
+    #[must_use]
+    pub fn has_book_subscription(&self, instrument_id: &InstrumentId) -> bool {
+        self.book_subscription_owners.contains_key(instrument_id)
+            || self.book_subscriptions.contains_key(instrument_id)
+            || self.subscriptions_external.iter().any(|((_, key), _)| {
+                matches!(
+                    key,
+                    SubscriptionKey::BookDeltas(id)
+                        | SubscriptionKey::BookDepth(id)
+                        | SubscriptionKey::BookSnapshots(id, _)
+                        if id == instrument_id
+                )
+            })
+    }
+
+    pub(super) fn subscribe_book_deltas(
+        &mut self,
+        cmd: &SubscribeBookDeltas,
+    ) -> anyhow::Result<bool> {
+        let instrument_id = cmd.single_instrument_id()?;
+        if instrument_id.is_synthetic() {
+            anyhow::bail!("Cannot subscribe for synthetic instrument `OrderBookDelta` data");
+        }
+
+        let had_deltas =
+            self.has_book_delta_subscription_key(instrument_id, cmd.client_id, cmd.venue);
+
+        self.retain_book_subscription(SubscribeCommand::BookDeltas(cmd.clone()))?;
+
+        self.increment_book_delta_subscription(instrument_id, cmd.client_id, cmd.venue);
+
+        Ok(!had_deltas)
+    }
+
+    pub(super) fn subscribe_book_depth(
+        &mut self,
+        cmd: &SubscribeBookDepth,
+    ) -> anyhow::Result<bool> {
+        let instrument_id = cmd.single_instrument_id()?;
+        if instrument_id.is_synthetic() {
+            anyhow::bail!("Cannot subscribe for synthetic instrument `OrderBookDepth` data");
+        }
+
+        let had_depth =
+            self.has_book_depth_subscription_key(instrument_id, cmd.client_id, cmd.venue);
+
+        self.retain_book_subscription(SubscribeCommand::BookDepth(cmd.clone()))?;
+
+        self.increment_book_depth_subscription(instrument_id, cmd.client_id, cmd.venue);
+
+        Ok(!had_depth)
+    }
+
+    pub(super) fn subscribe_book_snapshots(
+        &mut self,
+        cmd: &SubscribeBookSnapshots,
+    ) -> anyhow::Result<()> {
+        let instrument_id = cmd.single_instrument_id()?;
+        if instrument_id.is_synthetic() {
+            anyhow::bail!("Cannot subscribe for synthetic instrument `OrderBookDelta` data");
+        }
+
+        let parent = resolve_parent_components(&instrument_id, cmd.params.as_ref())?;
+
+        let had_snapshots = self.has_book_snapshot_subscriptions(&instrument_id);
+
+        self.retain_book_subscription(SubscribeCommand::BookSnapshots(cmd.clone()))?;
+
+        self.increment_book_snapshot_subscription(cmd, parent);
+
+        if !had_snapshots {
+            self.book_snapshot_sources.insert(
+                instrument_id,
+                BookSnapshotSource {
+                    command: cmd.clone(),
+                    client_command: SubscribeCommand::BookDeltas(SubscribeBookDeltas::new(
+                        instrument_id,
+                        cmd.book_type,
+                        cmd.client_id,
+                        cmd.venue,
+                        UUID4::new(),
+                        cmd.ts_init,
+                        cmd.depth,
+                        true, // managed
+                        Some(cmd.command_id),
+                        cmd.params.clone(),
+                    )),
+                },
+            );
+        }
+
+        let source = self
+            .book_snapshot_sources
+            .get(&instrument_id)
+            .cloned()
+            .expect("snapshot source command must exist after increment");
+        self.subscribe_book_snapshot_source(&source.command, source.client_command);
+
+        Ok(())
+    }
+
+    fn subscribe_book_snapshot_source(
+        &mut self,
+        cmd: &SubscribeBookSnapshots,
+        client_command: SubscribeCommand,
+    ) {
+        let instrument_id = cmd
+            .single_instrument_id()
+            .expect("instrument command has one member at this boundary");
+
+        if let Some(client_id) = cmd.client_id.as_ref()
+            && self.is_external_client(*client_id)
+        {
+            if self.config.debug {
+                log::debug!("Skipping subscribe command for external client {client_id}: {cmd:?}");
+            }
+
+            return;
+        }
+
+        log::debug!(
+            "Forwarding BookSnapshots as BookDeltas for {}, client_id={:?}, venue={:?}",
+            instrument_id,
+            cmd.client_id,
+            cmd.venue,
+        );
+
+        if let Some(client) = self.get_command_client(cmd.client_id.as_ref(), cmd.venue.as_ref()) {
+            log::debug!("Calling client.execute_subscribe for BookDeltas: {instrument_id}");
+            client.execute_subscribe(client_command);
+        } else {
+            log::error!(
+                "Cannot handle command: no client found for client_id={:?}, venue={:?}",
+                cmd.client_id,
+                cmd.venue,
+            );
+        }
+    }
+
+    pub(super) fn unsubscribe_book_deltas(&mut self, cmd: &UnsubscribeBookDeltas) -> bool {
+        let instrument_id = cmd
+            .single_instrument_id()
+            .expect("instrument command has one member at this boundary");
+
+        match self.decrement_book_delta_subscription(instrument_id, cmd.client_id, cmd.venue) {
+            BookDeltasUnsubscribeResult::NotSubscribed => {
+                log::warn!("Cannot unsubscribe from `OrderBookDeltas` data: not subscribed");
+                return false;
+            }
+            BookDeltasUnsubscribeResult::Decremented => return false,
+            BookDeltasUnsubscribeResult::Removed => {}
+        }
+
+        true
+    }
+
+    pub(super) fn unsubscribe_book_depth(&mut self, cmd: &UnsubscribeBookDepth) -> bool {
+        let instrument_id = cmd
+            .single_instrument_id()
+            .expect("instrument command has one member at this boundary");
+
+        match self.decrement_book_depth_subscription(instrument_id, cmd.client_id, cmd.venue) {
+            BookDeltasUnsubscribeResult::NotSubscribed => {
+                log::warn!("Cannot unsubscribe from `OrderBookDepth` data: not subscribed");
+                return false;
+            }
+            BookDeltasUnsubscribeResult::Decremented => return false,
+            BookDeltasUnsubscribeResult::Removed => {}
+        }
+
+        true
+    }
+
+    pub(super) fn unsubscribe_book_snapshots(&mut self, cmd: &UnsubscribeBookSnapshots) {
+        let instrument_id = cmd
+            .single_instrument_id()
+            .expect("instrument command has one member at this boundary");
+
+        match self.decrement_book_snapshot_subscription(instrument_id, cmd.interval_ms) {
+            BookSnapshotUnsubscribeResult::NotSubscribed => {
+                log::warn!("Cannot unsubscribe from `OrderBook` snapshots: not subscribed");
+                return;
+            }
+            BookSnapshotUnsubscribeResult::Decremented => return,
+            BookSnapshotUnsubscribeResult::Removed => {}
+        }
+
+        if self.has_book_snapshot_subscriptions(&instrument_id) {
+            return;
+        }
+
+        let Some(source) = self.book_snapshot_sources.remove(&instrument_id) else {
+            log::error!(
+                "Cannot release order book snapshot source for {instrument_id}: command not retained",
+            );
+            return;
+        };
+
+        if let Some(client_id) = source.command.client_id.as_ref()
+            && self.is_external_client(*client_id)
+        {
+            return;
+        }
+
+        if let Some(client) = self.get_command_client(
+            source.command.client_id.as_ref(),
+            source.command.venue.as_ref(),
+        ) {
+            let deltas_cmd = UnsubscribeBookDeltas::new(
+                source
+                    .command
+                    .single_instrument_id()
+                    .expect("book commands are projected onto one instrument"),
+                source.command.client_id,
+                source.command.venue,
+                UUID4::new(),
+                cmd.ts_init,
+                Some(source.command.command_id),
+                source.command.params,
+            );
+            client.execute_unsubscribe(&UnsubscribeCommand::BookDeltas(deltas_cmd));
+        }
+    }
+
+    fn retain_book_subscription(&mut self, command: SubscribeCommand) -> anyhow::Result<()> {
+        let instrument_id = match &command {
+            SubscribeCommand::BookDeltas(cmd) => cmd
+                .single_instrument_id()
+                .expect("book commands are projected onto one instrument"),
+            SubscribeCommand::BookDepth(cmd) => cmd
+                .single_instrument_id()
+                .expect("book commands are projected onto one instrument"),
+            SubscribeCommand::BookSnapshots(cmd) => cmd
+                .single_instrument_id()
+                .expect("book commands are projected onto one instrument"),
+            _ => unreachable!("only book subscriptions are retained"),
+        };
+
+        let parent = resolve_parent_components(&instrument_id, command.params())?;
+
+        let targets = if let Some((root, class)) = parent {
+            self.cache
+                .borrow()
+                .instruments_by_parent(&instrument_id.venue, &root, class)
+                .iter()
+                .map(|instrument| instrument.id())
+                .collect()
+        } else {
+            vec![instrument_id]
+        };
+
+        let client_id = self
+            .get_command_client(command.client_id(), command.venue())
+            .map(|client| client.client_id);
+
+        let subscription = Rc::new(BookSubscriptionOwner {
+            command,
+            client_id,
+            targets,
+        });
+
+        let mut params = subscription
+            .command
+            .params()
+            .map(|params| IndexMap::clone(params))
+            .unwrap_or_default();
+        params.shift_remove(PARAMS_IS_PARENT);
+
+        for active in subscription
+            .targets
+            .iter()
+            .filter_map(|id| self.book_subscriptions.get(id))
+            .flat_map(|book| &book.owners)
+        {
+            if !subscription.managed()
+                && !active.managed()
+                && subscription.client_id != active.client_id
+            {
+                continue;
+            }
+
+            if subscription.is_depth() != active.is_depth() {
+                anyhow::ensure!(
+                    !subscription.managed() || !active.managed(),
+                    "Conflicting managed book source for {instrument_id}: deltas and depth cannot both manage the same book; use managed=false for the other subscription"
+                );
+                continue;
+            }
+
+            let mut active_params = active
+                .command
+                .params()
+                .map(|params| IndexMap::clone(params))
+                .unwrap_or_default();
+            active_params.shift_remove(PARAMS_IS_PARENT);
+            anyhow::ensure!(
+                subscription.client_id == active.client_id
+                    && subscription.config() == active.config()
+                    && params == active_params,
+                "Conflicting book subscription for {instrument_id}: shared book sources must use the same client, book type, depth, and parameters"
+            );
+        }
+
+        if subscription.managed() {
+            self.setup_book_updater(
+                &subscription.targets,
+                subscription.config().0,
+                subscription.is_depth(),
+            )?;
+        }
+
+        for target_id in &subscription.targets {
+            self.book_subscriptions
+                .entry(*target_id)
+                .or_default()
+                .owners
+                .push(Rc::clone(&subscription));
+        }
+
+        self.book_subscription_owners
+            .entry(instrument_id)
+            .or_default()
+            .push(subscription);
+        Ok(())
+    }
+
+    pub(super) fn release_book_subscription(&mut self, command: &UnsubscribeCommand) -> bool {
+        let key = SubscriptionKey::from_unsubscribe(command);
+
+        let instrument_id = match command {
+            UnsubscribeCommand::BookDeltas(cmd) => cmd
+                .single_instrument_id()
+                .expect("book commands are projected onto one instrument"),
+            UnsubscribeCommand::BookDepth(cmd) => cmd
+                .single_instrument_id()
+                .expect("book commands are projected onto one instrument"),
+            UnsubscribeCommand::BookSnapshots(cmd) => cmd
+                .single_instrument_id()
+                .expect("book commands are projected onto one instrument"),
+            _ => unreachable!("only book subscriptions are released"),
+        };
+
+        let Some(owners) = self.book_subscription_owners.get_mut(&instrument_id) else {
+            return false;
+        };
+
+        let index = owners.iter().position(|subscription| {
+            SubscriptionKey::from_subscribe(&subscription.command) == key
+                && subscription.command.client_id() == command.client_id()
+                && subscription.command.venue() == command.venue()
+                && command
+                    .correlation_id()
+                    .is_none_or(|id| subscription.command.command_id() == id)
+        });
+
+        let Some(index) = index else {
+            return false;
+        };
+
+        let subscription = owners.remove(index);
+        if owners.is_empty() {
+            self.book_subscription_owners.remove(&instrument_id);
+        }
+
+        for &target_id in &subscription.targets {
+            let book = self
+                .book_subscriptions
+                .get_mut(&target_id)
+                .expect("retained book subscription");
+            book.owners
+                .retain(|owner| !Rc::ptr_eq(owner, &subscription));
+            let managed = book.owners.iter().any(|owner| owner.managed());
+            if book.owners.is_empty() {
+                self.book_subscriptions.remove(&target_id);
+            }
+
+            if managed {
+                continue;
+            }
+
+            let Some(updater) = self.book_updaters.remove(&target_id) else {
+                continue;
+            };
+
+            let deltas_handler: TypedHandler<OrderBookDeltas> =
+                TypedHandler::new(Rc::clone(&updater));
+            let depth_handler: TypedHandler<OrderBookDepth> = TypedHandler::new(updater);
+            msgbus::unsubscribe_book_deltas(
+                switchboard::get_book_deltas_topic(target_id).into(),
+                &deltas_handler,
+            );
+            msgbus::unsubscribe_book_depth(
+                switchboard::get_book_depth_topic(target_id).into(),
+                &depth_handler,
+            );
+        }
+
+        true
+    }
+
+    fn has_book_snapshot_subscriptions(&self, instrument_id: &InstrumentId) -> bool {
+        self.book_snapshot_counts
+            .keys()
+            .any(|(id, _)| id == instrument_id)
+    }
+
+    fn has_book_delta_subscription_key(
+        &self,
+        instrument_id: InstrumentId,
+        client_id: Option<ClientId>,
+        venue: Option<Venue>,
+    ) -> bool {
+        self.book_deltas_counts
+            .contains_key(&(instrument_id, client_id, venue))
+    }
+
+    fn has_book_depth_subscription_key(
+        &self,
+        instrument_id: InstrumentId,
+        client_id: Option<ClientId>,
+        venue: Option<Venue>,
+    ) -> bool {
+        self.book_depth_counts
+            .contains_key(&(instrument_id, client_id, venue))
+    }
+
+    fn increment_book_delta_subscription(
+        &mut self,
+        instrument_id: InstrumentId,
+        client_id: Option<ClientId>,
+        venue: Option<Venue>,
+    ) {
+        let key = (instrument_id, client_id, venue);
+
+        if let Some(count) = self.book_deltas_counts.get_mut(&key) {
+            *count += 1;
+        } else {
+            self.book_deltas_counts.insert(key, 1);
+        }
+    }
+
+    fn decrement_book_delta_subscription(
+        &mut self,
+        instrument_id: InstrumentId,
+        client_id: Option<ClientId>,
+        venue: Option<Venue>,
+    ) -> BookDeltasUnsubscribeResult {
+        let key = (instrument_id, client_id, venue);
+
+        let Some(count) = self.book_deltas_counts.get_mut(&key) else {
+            return BookDeltasUnsubscribeResult::NotSubscribed;
+        };
+
+        if *count > 1 {
+            *count -= 1;
+            return BookDeltasUnsubscribeResult::Decremented;
+        }
+
+        self.book_deltas_counts.shift_remove(&key);
+        BookDeltasUnsubscribeResult::Removed
+    }
+
+    fn increment_book_depth_subscription(
+        &mut self,
+        instrument_id: InstrumentId,
+        client_id: Option<ClientId>,
+        venue: Option<Venue>,
+    ) {
+        let key = (instrument_id, client_id, venue);
+        *self.book_depth_counts.entry(key).or_insert(0) += 1;
+    }
+
+    fn decrement_book_depth_subscription(
+        &mut self,
+        instrument_id: InstrumentId,
+        client_id: Option<ClientId>,
+        venue: Option<Venue>,
+    ) -> BookDeltasUnsubscribeResult {
+        let key = (instrument_id, client_id, venue);
+
+        let Some(count) = self.book_depth_counts.get_mut(&key) else {
+            return BookDeltasUnsubscribeResult::NotSubscribed;
+        };
+
+        if *count > 1 {
+            *count -= 1;
+            return BookDeltasUnsubscribeResult::Decremented;
+        }
+
+        self.book_depth_counts.shift_remove(&key);
+        BookDeltasUnsubscribeResult::Removed
+    }
+
+    fn increment_book_snapshot_subscription(
+        &mut self,
+        cmd: &SubscribeBookSnapshots,
+        parent: Option<(Ustr, InstrumentClass)>,
+    ) -> bool {
+        let instrument_id = cmd
+            .single_instrument_id()
+            .expect("instrument command has one member at this boundary");
+        let key = (instrument_id, cmd.interval_ms);
+
+        if let Some(count) = self.book_snapshot_counts.get_mut(&key) {
+            *count += 1;
+            return false;
+        }
+
+        self.book_snapshot_counts.insert(key, 1);
+
+        let snapshot_infos = if let Some(snapshot_infos) = self.book_intervals.get(&cmd.interval_ms)
+        {
+            Rc::clone(snapshot_infos)
+        } else {
+            let snapshot_infos = Rc::new(RefCell::new(IndexMap::new()));
+            self.book_intervals
+                .insert(cmd.interval_ms, Rc::clone(&snapshot_infos));
+            self.schedule_book_snapshotter(cmd.interval_ms, Rc::clone(&snapshot_infos));
+            snapshot_infos
+        };
+
+        let topic = switchboard::get_book_snapshots_topic(instrument_id, cmd.interval_ms);
+
+        let snap_info = BookSnapshotInfo {
+            instrument_id,
+            venue: instrument_id.venue,
+            parent,
+            topic,
+            interval_ms: cmd.interval_ms,
+        };
+
+        snapshot_infos.borrow_mut().insert(instrument_id, snap_info);
+
+        true
+    }
+
+    fn decrement_book_snapshot_subscription(
+        &mut self,
+        instrument_id: InstrumentId,
+        interval_ms: NonZeroUsize,
+    ) -> BookSnapshotUnsubscribeResult {
+        let key = (instrument_id, interval_ms);
+
+        let Some(count) = self.book_snapshot_counts.get_mut(&key) else {
+            return BookSnapshotUnsubscribeResult::NotSubscribed;
+        };
+
+        if *count > 1 {
+            *count -= 1;
+            return BookSnapshotUnsubscribeResult::Decremented;
+        }
+
+        self.book_snapshot_counts.shift_remove(&key);
+
+        let remove_interval = if let Some(snapshot_infos) = self.book_intervals.get(&interval_ms) {
+            let mut snapshot_infos = snapshot_infos.borrow_mut();
+            snapshot_infos.shift_remove(&instrument_id);
+            snapshot_infos.is_empty()
+        } else {
+            false
+        };
+
+        if remove_interval {
+            self.book_intervals.remove(&interval_ms);
+
+            if let Some(snapshotter) = self.book_snapshotters.remove(&interval_ms) {
+                let timer_name = snapshotter.timer_name;
+                let mut clock = self.clock.borrow_mut();
+                if clock.timer_exists(&timer_name) {
+                    clock.cancel_timer(&timer_name);
+                }
+            }
+        }
+
+        BookSnapshotUnsubscribeResult::Removed
+    }
+
+    fn schedule_book_snapshotter(
+        &mut self,
+        interval_ms: NonZeroUsize,
+        snapshot_infos: BookSnapshotInfos,
+    ) {
+        let interval_ms_u64 =
+            u64::try_from(interval_ms.get()).expect("Snapshot interval exceeds u64");
+        let interval_ns = DurationNanos::from_millis(interval_ms_u64);
+        let now_ns = self.clock.borrow().timestamp_ns();
+        let start_time_ns = now_ns
+            .floor(interval_ns)
+            .checked_add(interval_ns)
+            .expect("Book snapshot timer start exceeds UnixNanos range");
+
+        let snapshotter = Rc::new(BookSnapshotter::new(
+            interval_ms,
+            snapshot_infos,
+            Rc::clone(&self.cache),
+        ));
+        let timer_name = snapshotter.timer_name;
+        let snapshotter_callback = Rc::clone(&snapshotter);
+        let callback_fn: Rc<dyn Fn(TimeEvent)> =
+            Rc::new(move |event| snapshotter_callback.snapshot(event));
+        let callback = TimeEventCallback::from(callback_fn);
+
+        self.clock
+            .borrow_mut()
+            .set_timer_ns(
+                &timer_name,
+                interval_ns,
+                Some(start_time_ns),
+                None,
+                Some(callback),
+                None,
+                None,
+            )
+            .expect(FAILED);
+
+        self.book_snapshotters.insert(interval_ms, snapshotter);
+    }
+
+    // Skip cache writes that would regress a book a `BookUpdater` is maintaining.
+    // Unmanaged subscriptions don't install a `BookUpdater`, so they don't gate writes.
+    fn cache_is_owned_by_live_subscription(&self, instrument_id: &InstrumentId) -> bool {
+        self.book_updaters.contains_key(instrument_id)
+    }
+
+    pub(super) fn handle_book_response(&self, book: &OrderBook) {
+        if self.cache_is_owned_by_live_subscription(&book.instrument_id) {
+            log::debug!(
+                "Skipping cache write for order book {}: live subscription owns the book",
+                book.instrument_id,
+            );
+            return;
+        }
+
+        log::debug!("Adding order book {} to cache", book.instrument_id);
+
+        if let Err(e) = self
+            .cache
+            .as_ref()
+            .borrow_mut()
+            .add_order_book(book.clone())
+        {
+            log_error_on_cache_insert(&e);
+        }
+    }
+
+    pub(super) fn handle_book_deltas_response(&self, resp: &BookDeltasResponse) {
+        if !self.cache_is_owned_by_live_subscription(&resp.instrument_id) {
+            let mut cache = self.cache.as_ref().borrow_mut();
+            if let Some(book) = cache.order_book_mut(&resp.instrument_id) {
+                for delta in resp.data.iter() {
+                    if let Err(e) = book.apply_delta(delta) {
+                        log::error!("Failed to apply historical delta to cache: {e}");
+                    }
+                }
+            } else {
+                log::debug!(
+                    "Skipping cache write for {} historical deltas on {}: no cache book yet",
+                    resp.data.len(),
+                    resp.instrument_id,
+                );
+            }
+        }
+
+        // Group deltas by `F_LAST` so each published batch preserves the original event
+        // boundary and metadata (timestamps and sequence from the closing delta), matching
+        // the live `handle_delta` buffering semantic. Collapsing the whole response into
+        // one batch would surface a synthetic event with the trailing delta's flags only.
+        if resp.data.is_empty() {
+            return;
+        }
+
+        let topic = switchboard::get_pipeline_book_deltas_topic(resp.instrument_id);
+        let mut frame: Vec<OrderBookDelta> = Vec::new();
+        for delta in resp.data.iter() {
+            frame.push(*delta);
+            if RecordFlag::F_LAST.matches(delta.flags) {
+                let batch = OrderBookDeltas::new(resp.instrument_id, std::mem::take(&mut frame));
+                msgbus::publish_deltas(topic, &batch);
+            }
+        }
+
+        if !frame.is_empty() {
+            let batch = OrderBookDeltas::new(resp.instrument_id, frame);
+            msgbus::publish_deltas(topic, &batch);
+        }
+    }
+
+    pub(super) fn handle_book_depth_response(&self, resp: &BookDepthResponse) {
+        let topic = switchboard::get_pipeline_book_depth_topic(resp.instrument_id);
+        for depth in resp.data.iter() {
+            msgbus::publish_depth(topic, depth);
+        }
+    }
+
+    fn setup_book_updater(
+        &mut self,
+        target_ids: &[InstrumentId],
+        book_type: BookType,
+        depth: bool,
+    ) -> anyhow::Result<()> {
+        {
+            let mut cache = self.cache.borrow_mut();
+
+            for target_id in target_ids {
+                if !cache.has_order_book(target_id) {
+                    cache.add_order_book(OrderBook::new(*target_id, book_type))?;
+                }
+            }
+        }
+
+        for target_id in target_ids {
+            let updater = Rc::clone(self.book_updaters.entry(*target_id).or_insert_with(|| {
+                Rc::new(BookUpdater::new(
+                    target_id,
+                    Rc::clone(&self.cache),
+                    self.config.emit_quotes_from_book,
+                ))
+            }));
+
+            if depth {
+                msgbus::subscribe_book_depth(
+                    switchboard::get_book_depth_topic(*target_id).into(),
+                    TypedHandler::new(updater),
+                    Some(self.msgbus_priority),
+                );
+            } else {
+                msgbus::subscribe_book_deltas(
+                    switchboard::get_book_deltas_topic(*target_id).into(),
+                    TypedHandler::new(updater),
+                    Some(self.msgbus_priority),
+                );
+            }
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Debug, Default)]
 pub(super) struct BookSubscription {
     pub(super) owners: Vec<Rc<BookSubscriptionOwner>>,
@@ -356,6 +1128,31 @@ impl BookSnapshotter {
     }
 }
 
+// Resolves parent expansion components for a book subscription command.
+//
+// Returns Ok(Some((root, class))) when params carries PARAMS_IS_PARENT=true and
+// the instrument_id parses as a recognized <root>.<class> shape; Ok(None) for
+// concrete (non-parent) subscriptions; Err when the caller asserts a parent
+// subscription but the id cannot be parsed, so subscribe entries can reject up
+// front before touching state.
+fn resolve_parent_components(
+    instrument_id: &InstrumentId,
+    params: Option<&Params>,
+) -> anyhow::Result<Option<(Ustr, InstrumentClass)>> {
+    if !is_parent_subscription(params) {
+        return Ok(None);
+    }
+
+    let Some((root, class)) = instrument_id.parse_parent_components() else {
+        anyhow::bail!(
+            "Cannot expand parent subscription for {instrument_id}: \
+             symbol does not parse as `<root>.<class>` with a recognized class suffix"
+        );
+    };
+
+    Ok(Some((Ustr::from(root), class)))
+}
+
 #[cfg(test)]
 mod tests {
     use nautilus_common::msgbus::TypedHandler;
@@ -433,8 +1230,8 @@ mod tests {
         let received = Rc::new(RefCell::new(Vec::new()));
         let handler = CacheWritingBookHandler {
             id: Ustr::from("CacheWritingBookHandler"),
-            cache: cache.clone(),
-            received: received.clone(),
+            cache: Rc::clone(&cache),
+            received: Rc::clone(&received),
         };
         msgbus::subscribe_book_snapshots(topic.into(), TypedHandler::new(handler), None);
 
@@ -481,8 +1278,8 @@ mod tests {
         let received = Rc::new(RefCell::new(Vec::new()));
         let handler = CacheWritingBookHandler {
             id: Ustr::from("CacheWritingBookHandler-NoUpdates"),
-            cache: cache.clone(),
-            received: received.clone(),
+            cache: Rc::clone(&cache),
+            received: Rc::clone(&received),
         };
         msgbus::subscribe_book_snapshots(topic.into(), TypedHandler::new(handler), None);
 

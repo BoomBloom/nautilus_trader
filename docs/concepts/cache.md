@@ -18,9 +18,9 @@ events to the engine asynchronously, so the cache changes **when the engine proc
 when the adapter first receives it.
 
 For quotes, trades, and bars, the `DataEngine` attempts to write to the `Cache` before publishing to
-subscribers. After a successful write, the latest value is available by the time the strategy
-handler runs. Order book deltas and depth snapshots are published directly; `BookUpdater`
-subscriptions maintain current book state separately:
+subscribers. After a successful write, the latest value is available by the time the strategy handler runs.
+Order book deltas and depth snapshots are published directly. `BookUpdater` subscriptions maintain current
+book state separately:
 
 ```mermaid
 flowchart LR
@@ -41,18 +41,19 @@ Within a strategy, access the shared `Cache` through `self.cache`:
 
 ```python
 def on_bar(self, bar: Bar) -> None:
-    # Read recent bars from the cache.
-    last_bar = self.cache.bar(self.bar_type, index=0)  # Same bar after a successful cache write.
+
+    # Read recent bars; index 0 is the same bar after a successful cache write
+    last_bar = self.cache.bar(self.bar_type, index=0)
     previous_bar = self.cache.bar(self.bar_type, index=1)
     third_last_bar = self.cache.bar(self.bar_type, index=2)
 
-    # Read current position state.
+    # Read current position state
     if self.last_position_opened_id is not None:
         position = self.cache.position(self.last_position_opened_id)
         if position is not None and position.is_open:
             open_quantity = position.quantity
 
-    # Read open orders for the instrument.
+    # Read open orders for the instrument
     open_orders = self.cache.orders_open(instrument_id=self.instrument_id)
 ```
 
@@ -72,8 +73,10 @@ from nautilus_trader.config import LiveNodeConfig
 # For backtesting
 engine_config = BacktestEngineConfig(
     cache=CacheConfig(
-        tick_capacity=10_000,  # Store last 10,000 ticks per instrument
-        bar_capacity=5_000,  # Store last 5,000 bars per bar type
+        # Retain up to 10,000 entries per history per instrument
+        tick_capacity=10_000,
+        # Store last 5,000 bars per bar type
+        bar_capacity=5_000,
     ),
 )
 
@@ -124,23 +127,73 @@ When `bar_capacity` is reached, the `Cache` automatically removes the oldest dat
 
 ### Database configuration
 
-Configure a database backing to recover successfully persisted, supported cache records after a
-restart. Restorable records include general data, currencies, instruments, instrument closes,
-accounts, orders, and positions. Startup does not restore bounded market-data histories or the
-running process.
+`CacheConfig` controls cache behavior. Set connection details in `RedisCacheConfig` or `PostgresCacheConfig`.
 
-Instrument closes persist whenever a backing database is configured. `save_market_data` does not
-gate them because they are recovery snapshots rather than bounded market-data history.
+Native backends implement `CacheDatabaseFactory` and `CacheDatabaseAdapter` and own their concrete
+connection settings. Python passes a concrete backend config or registered native factory to
+`LiveNodeBuilder.with_cache_database_factory`.
 
-`CacheConfig` controls cache behavior. Connection settings belong to the concrete backing config,
-such as `RedisCacheConfig` or `PostgresCacheConfig`.
+Custom backend factories must be integrated into NautilusTrader's native extension and use unique
+Python class names. Python does not expose a factory registration API for separately installed packages.
 
-A backing is a recovery mechanism, not a complete event archive or a synchronized distributed
-cache. Each node owns its in-memory cache; pointing multiple nodes at the same database namespace
-does not keep those caches coherent.
+#### Recovery
 
-Rust-native callers build a concrete database config and use the `CacheDatabaseFactory` trait to
-construct the adapter passed into the system builder:
+- Startup restores supported, successfully persisted general data, currencies, instruments,
+  instrument closes, synthetics, accounts, orders, and positions. Postgres also restores Greeks and yield curves.
+- Loading replaces Greeks and yield curves already in memory; Redis loads empty maps.
+- Instrument closes persist whenever a backing is configured, regardless of `save_market_data`:
+  they are recovery snapshots rather than bounded history.
+- Startup does not restore bounded market-data histories or the running process.
+- A backing does not provide a complete event archive or synchronize nodes. Each node owns its
+  in-memory cache, even when nodes share a database namespace.
+
+#### Explicit database operations
+
+- `cache.load_instrument(instrument_id)` and `cache.load_synthetic(instrument_id)` check memory first,
+  then load from the backing and cache successful results. Fill handling also uses this instrument fallback
+  when processing order fills and orderless spread legs. Failed or missing reads leave memory unchanged.
+- `cache.delete_actor(actor_id)` and `cache.delete_strategy(strategy_id)` remove saved component state
+  without unregistering components.
+- `cache.heartbeat(timestamp)` persists a caller-supplied timestamp in UNIX nanoseconds.
+
+#### Postgres
+
+- With `save_market_data = true`, Postgres queues `GreeksData` per instrument and `YieldCurve` per name.
+  Later writes replace earlier values, regardless of timestamp.
+- Validation and queueing errors preserve memory. The adapter logs later database write failures.
+- Orders, positions, their snapshots, and accounts belong to a trader. Two traders can reuse client order
+  or position IDs.
+- Flushes, including `flush_on_start`, delete only the trader's rows. Currencies, instruments,
+  instrument closes, synthetics, market data (including Greeks and yield curves), and user general data stay shared.
+  The trader's saved actor and strategy state and heartbeat are also deleted.
+- Actor and strategy state persistence supports `load_state` and `save_state`.
+- The `cache-database:` key prefix is reserved for backing data. User entries with this prefix do not restore.
+
+Run `nautilus database init` to create the `greeks` and `yield_curve` tables before connecting,
+even with `save_market_data = false`.
+
+:::warning
+Account events saved before trader scoping have no trader, and ownership cannot be inferred.
+Connecting fails for every node using that database until each affected account is assigned.
+The error lists the accounts. After initialization, assign each one:
+
+```bash
+nautilus database assign-account --account-id <ACCOUNT_ID> --trader-id <TRADER_ID>
+```
+
+:::
+
+#### Redis
+
+- Does not persist quotes, trades, bars, order books, funding rates, Greeks, or yield curves.
+- With `save_market_data = true`, these additions fail before changing memory. For funding rates,
+  only bulk additions attempt persistence; single additions stay in memory.
+- Direct `load_greeks` and `load_yield_curves` calls return errors; `load_all` returns empty maps for them.
+- For Greeks and yield curves, disable `save_market_data` for memory-only caching or use Postgres for persistence.
+
+#### Connect a backing
+
+Rust callers use `CacheDatabaseFactory` to construct an adapter:
 
 ```rust
 use nautilus_common::{
@@ -169,7 +222,7 @@ let cache_database = database
     .await?;
 ```
 
-For a Rust-native live node, attach the adapter before startup:
+Attach it to the node before startup:
 
 ```rust
 let node_config = LiveNodeConfig {
@@ -181,14 +234,8 @@ node.set_cache_database(cache_database)?;
 node.run().await?;
 ```
 
-:::warning
-With the default `LiveExecutionEngineConfig.load_cache = true`, the node restores persisted cache state
-and rebuilds derived indexes before connecting clients or reconciling execution state. Setting
-`CacheConfig.flush_on_start = true` clears the backing instead.
-:::
-
-Python passes the same database config to `LiveNodeBuilder.with_cache_database_factory`. The node
-constructs and owns the adapter when it starts, so the connection opens only when the node runs:
+Python passes the config to `LiveNodeBuilder.with_cache_database_factory`. The node creates and owns
+the adapter when it starts:
 
 ```python
 from nautilus_trader.common import Environment
@@ -208,48 +255,91 @@ finally:
     node.dispose()
 ```
 
-Pass `PostgresCacheConfig` instead to back cache data with Postgres. Postgres does not support actor
-or strategy state persistence, so do not combine it with `load_state` or `save_state`. Both configs
-come from `nautilus_trader.infrastructure`.
+Use `PostgresCacheConfig` for Postgres. Both configs come from `nautilus_trader.infrastructure`.
+
+Python configures persistence through `LiveNodeBuilder.with_cache_database_factory`.
+Concrete cache database objects and their connection, read, and write methods are not exposed to Python.
+Use the runtime `Cache` API from actors and strategies to access cached data.
+
+Missing `PostgresCacheConfig` fields resolve from Postgres environment variables and then built-in
+defaults. Explicit config fields take precedence over both.
+
+Rust callers pass `PostgresCacheConfig` and `TraderId` to `PostgresCacheDatabase::connect`.
+Direct connections and the factory use the same native configuration path.
+
+#### Startup and shutdown
 
 :::warning
-Always dispose the node. `dispose()` closes the backing, which flushes writes still held in the
-buffer when `CacheConfig.buffer_interval_ms` is set. Returning straight from `run()` can drop them.
+
+- `LiveExecutionEngineConfig.load_cache = true` (default) restores persisted state and rebuilds indexes
+  before connecting clients or reconciling execution state.
+- `CacheConfig.flush_on_start = true` clears the backing instead. Postgres clears only the node's trader rows.
+
+:::
+
+:::warning
+Always call `dispose()` after `run()`. It closes the backing and flushes buffered writes;
+returning from `run()` alone can drop them when `CacheConfig.buffer_interval_ms` is set.
 :::
 
 ## Using the cache
 
 ### Accessing market data
 
-The `Cache` provides access to order books, quotes, trades, bars, and other market data. Bounded
-market-data sequences use reverse indexing, so the **most recent entry sits at index 0**.
+The `Cache` provides access to order books, quotes, trades, bars, and other market data. Cached
+market-data histories use **reverse indexing**: index 0 is the latest entry, and index 1 is the previous
+entry. The list accessors use the same order as the single-entry accessors.
 
-#### Bar access
+| Data type           | History                              | Latest entry                       |
+| ------------------- | ------------------------------------ | ---------------------------------- |
+| Quotes              | `quotes(instrument_id)`              | `quote(instrument_id)`             |
+| Trades              | `trades(instrument_id)`              | `trade(instrument_id)`             |
+| Bars                | `bars(bar_type)`                     | `bar(bar_type)`                    |
+| Mark prices         | `mark_prices(instrument_id)`         | `mark_price(instrument_id)`        |
+| Index prices        | `index_prices(instrument_id)`        | `index_price(instrument_id)`       |
+| Funding rates       | `funding_rates(instrument_id)`       | `funding_rate(instrument_id)`      |
+| Instrument statuses | `instrument_statuses(instrument_id)` | `instrument_status(instrument_id)` |
+
+- **Ordering:** Bars use descending `ts_event`. Other histories use reverse insertion order, even
+  for older timestamps; they are not sorted by `ts_event` or `ts_init`.
+- **History lists:** Accessors return a list, or `None` when the key has no entries. `[-1]` selects
+  the oldest retained bar or the least recently inserted entry in other histories.
+- **Single entries:** Only `quote()`, `trade()`, and `bar()` accept `index`. They return `None` for a
+  missing entry at a valid non-negative index. Negative indices or values beyond the platform's
+  unsigned index limit raise `OverflowError`; negative indexing works on returned Python lists.
+- **Capacity:** `bar_capacity` limits each bar type; `tick_capacity` limits each other history per
+  instrument. A new insertion at capacity removes the last entry.
+
+#### Order book
+
+The cache holds the current order book state for each instrument, rather than a history of book
+updates. Instrument closes also keep one value per instrument: `instrument_close(instrument_id)`
+returns the last inserted close, or `None` if absent.
 
 ```python
-# Get all cached bars for a bar type.
-bars = self.cache.bars(bar_type)  # Returns list[Bar] or None.
+# Get the current order book. Returns OrderBook or None
+book = self.cache.order_book(instrument_id)
 
-# Get the most recent bar.
-latest_bar = self.cache.bar(bar_type)  # Returns Bar or None.
+# Check whether an order book exists
+has_book = self.cache.has_order_book(instrument_id)
 
-# Get a historical bar by index (0 = most recent).
-second_last_bar = self.cache.bar(bar_type, index=1)  # Returns Bar or None.
-
-# Check whether bars exist and get the count.
-bar_count = self.cache.bar_count(bar_type)
-has_bars = self.cache.has_bars(bar_type)
+# Get the number of applied book updates
+update_count = self.cache.book_update_count(instrument_id)
 ```
 
 #### Quote ticks
 
 ```python
-# Get quotes.
-quotes = self.cache.quotes(instrument_id)  # Returns list[QuoteTick] or None.
-latest_quote = self.cache.quote(instrument_id)  # Returns QuoteTick or None.
-second_last_quote = self.cache.quote(instrument_id, index=1)  # Returns QuoteTick or None.
+# Get quotes. Returns list[QuoteTick] or None
+quotes = self.cache.quotes(instrument_id)
 
-# Check quote availability.
+# Returns QuoteTick or None
+latest_quote = self.cache.quote(instrument_id)
+
+# Returns QuoteTick or None
+second_last_quote = self.cache.quote(instrument_id, index=1)
+
+# Check quote availability
 quote_count = self.cache.quote_count(instrument_id)
 has_quotes = self.cache.has_quote_ticks(instrument_id)
 ```
@@ -257,38 +347,64 @@ has_quotes = self.cache.has_quote_ticks(instrument_id)
 #### Trade ticks
 
 ```python
-# Get trades.
-trades = self.cache.trades(instrument_id)  # Returns list[TradeTick] or None.
-latest_trade = self.cache.trade(instrument_id)  # Returns TradeTick or None.
-second_last_trade = self.cache.trade(instrument_id, index=1)  # Returns TradeTick or None.
+# Get trades. Returns list[TradeTick] or None
+trades = self.cache.trades(instrument_id)
 
-# Check trade availability.
+# Returns TradeTick or None
+latest_trade = self.cache.trade(instrument_id)
+
+# Returns TradeTick or None
+second_last_trade = self.cache.trade(instrument_id, index=1)
+
+# Check trade availability
 trade_count = self.cache.trade_count(instrument_id)
 has_trades = self.cache.has_trade_ticks(instrument_id)
 ```
 
-#### Order book
+Quotes and trades accumulate all ticks, including those sharing a timestamp.
+
+#### Bar access
 
 ```python
-# Get the current order book.
-book = self.cache.order_book(instrument_id)  # Returns OrderBook or None.
+# Get all cached bars for a bar type. Returns list[Bar] or None
+bars = self.cache.bars(bar_type)
 
-# Check whether an order book exists.
-has_book = self.cache.has_order_book(instrument_id)
+# Get the most recent bar. Returns Bar or None
+latest_bar = self.cache.bar(bar_type)
 
-# Get the number of applied book updates.
-update_count = self.cache.book_update_count(instrument_id)
+# Get a historical bar by index (0 = most recent). Returns Bar or None
+second_last_bar = self.cache.bar(bar_type, index=1)
+
+# Check whether bars exist and get the count
+bar_count = self.cache.bar_count(bar_type)
+has_bars = self.cache.has_bars(bar_type)
 ```
+
+To process bars from oldest to newest, reverse the returned list:
+
+```python
+bars_chronological = list(reversed(self.cache.bars(bar_type) or []))
+```
+
+Bars newer than the cached latest are added; older bars are skipped but still delivered in the response.
+
+- **Time bars**: a bar with the same `ts_event` replaces the cached one (the later data wins), so duplicates
+  from overlapping historical requests do not accumulate.
+- **Non-time bars**: Renko bricks or volume bars emitted from a single update can legitimately share a
+  `ts_event`. All bars at the same timestamp are kept, including any re-delivered by an overlapping request.
+- **Internal request aggregation**: the cache inserts request-generated bars at their ordered position instead
+  of skipping them. The cache is their only delivery path.
 
 #### Price access
 
 ```python
 from nautilus_trader.model import PriceType
 
-# Get the current price by type. Returns Price or None.
+# Get the current price by type. Returns Price or None
 price = self.cache.price(
     instrument_id=instrument_id,
-    price_type=PriceType.MID,  # Options: BID, ASK, MID, LAST
+    # Options: BID, ASK, MID, LAST, MARK
+    price_type=PriceType.MID,
 )
 ```
 
@@ -297,10 +413,11 @@ price = self.cache.price(
 ```python
 from nautilus_trader.model import AggregationSource, PriceType
 
-# Get all available bar types for an instrument. Returns list[BarType].
+# Get all available bar types for an instrument. Returns list[BarType]
 bar_types = self.cache.bar_types(
     instrument_id=instrument_id,
-    price_type=PriceType.LAST,  # Options: BID, ASK, MID, LAST
+    # Options: BID, ASK, MID, LAST, MARK
+    price_type=PriceType.LAST,
     aggregation_source=AggregationSource.EXTERNAL,
 )
 ```
@@ -314,7 +431,8 @@ from nautilus_trader.trading import Strategy
 
 class MarketDataStrategy(Strategy):
     def on_start(self) -> None:
-        # Subscribe to 1-minute bars.
+
+        # Subscribe to 1-minute bars
         self.bar_type = BarType.from_str(f"{self.instrument_id}-1-MINUTE-LAST-EXTERNAL")
         self.subscribe_bars(self.bar_type)
 
@@ -323,12 +441,12 @@ class MarketDataStrategy(Strategy):
         if len(bars) < 3:
             return
 
-        # Access the latest three bars for analysis.
+        # Access the latest three bars for analysis
         current_bar = bars[0]
         prev_bar = bars[1]
         prev_prev_bar = bars[2]
 
-        # Read the latest quote and trade.
+        # Read the latest quote and trade
         latest_quote = self.cache.quote(self.instrument_id)
         latest_trade = self.cache.trade(self.instrument_id)
 
@@ -338,13 +456,6 @@ class MarketDataStrategy(Strategy):
 ```
 
 ### Trading objects
-
-The `Cache` provides access to trading objects such as:
-
-- Orders
-- Positions
-- Accounts
-- Instruments
 
 #### Orders
 
@@ -359,73 +470,85 @@ order = self.cache.order(ClientOrderId("O-123"))
 # Get all orders in the system
 orders = self.cache.orders()
 
-# Get orders filtered by specific criteria
-orders_for_venue = self.cache.orders(venue=venue)  # All orders for a specific venue
-orders_for_strategy = self.cache.orders(
-    strategy_id=strategy_id
-)  # All orders for a specific strategy
-orders_for_instrument = self.cache.orders(
-    instrument_id=instrument_id
-)  # All orders for an instrument
+# All orders for a specific venue
+orders_for_venue = self.cache.orders(venue=venue)
+
+# All orders for a specific strategy
+orders_for_strategy = self.cache.orders(strategy_id=strategy_id)
+
+# All orders for an instrument
+orders_for_instrument = self.cache.orders(instrument_id=instrument_id)
 ```
 
 ##### Order state queries
 
 ```python
-# Get orders by their current state
-open_orders = self.cache.orders_open()  # Orders currently active at the venue
-closed_orders = self.cache.orders_closed()  # Orders that have completed their lifecycle
-emulated_orders = self.cache.orders_emulated()  # Orders being simulated locally by the system
-inflight_orders = (
-    self.cache.orders_inflight()
-)  # Orders submitted (or modified) to venue, but not yet confirmed
-local_active_orders = (
-    self.cache.orders_active_local()
-)  # Orders still managed locally (initialized, emulated, or released)
+# Orders currently active at the venue
+open_orders = self.cache.orders_open()
 
-# Check specific order states
-exists = self.cache.order_exists(
-    client_order_id
-)  # Checks if an order with the given ID exists in the cache
-is_open = self.cache.is_order_open(client_order_id)  # Checks if an order is currently open
-is_closed = self.cache.is_order_closed(client_order_id)  # Checks if an order is closed
-is_emulated = self.cache.is_order_emulated(
-    client_order_id
-)  # Checks if an order is being simulated locally
-is_inflight = self.cache.is_order_inflight(
-    client_order_id
-)  # Checks if an order is submitted or modified, but not yet confirmed
-is_active_local = self.cache.is_order_active_local(
-    client_order_id
-)  # Checks if an order is still managed locally
+# Orders that have completed their lifecycle
+closed_orders = self.cache.orders_closed()
+
+# Orders being simulated locally by the system
+emulated_orders = self.cache.orders_emulated()
+
+# Orders submitted (or modified) to venue, but not yet confirmed
+inflight_orders = self.cache.orders_inflight()
+
+# Orders still managed locally (initialized, emulated, or released)
+local_active_orders = [order for order in self.cache.orders() if order.is_active_local]
+
+# Checks if an order with the given ID exists in the cache
+exists = self.cache.order_exists(client_order_id)
+
+# Checks if an order is currently open
+is_open = self.cache.is_order_open(client_order_id)
+
+# Checks if an order is closed
+is_closed = self.cache.is_order_closed(client_order_id)
+
+# Checks if an order is being simulated locally
+is_emulated = self.cache.is_order_emulated(client_order_id)
+
+# Checks if an order is submitted or modified, but not yet confirmed
+is_inflight = self.cache.is_order_inflight(client_order_id)
+
+# Checks if an order is still managed locally
+order = self.cache.order(client_order_id)
+is_active_local = order is not None and order.is_active_local
 ```
 
 ##### Order statistics
 
 ```python
-# Get counts of orders in different states
-open_count = self.cache.orders_open_count()  # Number of open orders
-closed_count = self.cache.orders_closed_count()  # Number of closed orders
-emulated_count = self.cache.orders_emulated_count()  # Number of emulated orders
-inflight_count = self.cache.orders_inflight_count()  # Number of inflight orders
-local_active_count = (
-    self.cache.orders_active_local_count()
-)  # Number of locally active orders (initialized, emulated, or released)
-total_count = self.cache.orders_total_count()  # Total number of orders in the system
+# Number of open orders
+open_count = self.cache.orders_open_count()
 
-# Get filtered order counts
-buy_orders_count = self.cache.orders_open_count(
-    side=OrderSide.BUY
-)  # Number of currently open BUY orders
-venue_orders_count = self.cache.orders_total_count(
-    venue=venue
-)  # Total number of orders for a given venue
+# Number of closed orders
+closed_count = self.cache.orders_closed_count()
+
+# Number of emulated orders
+emulated_count = self.cache.orders_emulated_count()
+
+# Number of inflight orders
+inflight_count = self.cache.orders_inflight_count()
+
+# Number of locally active orders (initialized, emulated, or released)
+local_active_count = sum(order.is_active_local for order in self.cache.orders())
+
+# Total number of orders in the system
+total_count = self.cache.orders_total_count()
+
+# Number of currently open BUY orders
+buy_orders_count = self.cache.orders_open_count(side=OrderSide.BUY)
+
+# Total number of orders for a given venue
+venue_orders_count = self.cache.orders_total_count(venue=venue)
 ```
 
 #### Positions
 
-The `Cache` retains positions until they are purged or reset and provides several ways to query
-them.
+The `Cache` keeps positions until they are purged or reset and provides several ways to query them.
 
 ##### Position access
 
@@ -433,78 +556,100 @@ them.
 # Get a specific position by its ID
 position = self.cache.position(PositionId("P-123"))
 
-# Get positions by their state
-all_positions = self.cache.positions()  # All positions in the system
-open_positions = self.cache.positions_open()  # All currently open positions
-closed_positions = self.cache.positions_closed()  # All closed positions
+# All positions in the system
+all_positions = self.cache.positions()
 
-# Get positions filtered by various criteria
-venue_positions = self.cache.positions(venue=venue)  # Positions for a specific venue
-instrument_positions = self.cache.positions(
-    instrument_id=instrument_id
-)  # Positions for a specific instrument
-strategy_positions = self.cache.positions(
-    strategy_id=strategy_id
-)  # Positions for a specific strategy
-long_positions = self.cache.positions(side=PositionSide.LONG)  # All long positions
+# All currently open positions
+open_positions = self.cache.positions_open()
+
+# All closed positions
+closed_positions = self.cache.positions_closed()
+
+# Positions for a specific venue
+venue_positions = self.cache.positions(venue=venue)
+
+# Positions for a specific instrument
+instrument_positions = self.cache.positions(instrument_id=instrument_id)
+
+# Positions for a specific strategy
+strategy_positions = self.cache.positions(strategy_id=strategy_id)
+
+# All long positions
+long_positions = self.cache.positions(side=PositionSide.LONG)
 ```
 
 ##### Position state queries
 
 ```python
-# Check position states
-exists = self.cache.position_exists(position_id)  # Checks if a position with the given ID exists
-is_open = self.cache.is_position_open(position_id)  # Checks if a position is open
-is_closed = self.cache.is_position_closed(position_id)  # Checks if a position is closed
+# Checks if a position with the given ID exists
+exists = self.cache.position_exists(position_id)
 
-# Get position and order relationships
-orders = self.cache.orders_for_position(position_id)  # All orders related to a specific position
-position = self.cache.position_for_order(
-    client_order_id
-)  # Find the position associated with a specific order
+# Checks if a position is open
+is_open = self.cache.is_position_open(position_id)
+
+# Checks if a position is closed
+is_closed = self.cache.is_position_closed(position_id)
+
+# All orders related to a specific position
+orders = self.cache.orders_for_position(position_id)
+
+# Find the position associated with a specific order
+position = self.cache.position_for_order(client_order_id)
 ```
 
 ##### Position statistics
 
 ```python
-# Get position counts in different states
-open_count = self.cache.positions_open_count()  # Number of currently open positions
-closed_count = self.cache.positions_closed_count()  # Number of closed positions
-total_count = self.cache.positions_total_count()  # Total number of positions in the system
+# Number of currently open positions
+open_count = self.cache.positions_open_count()
 
-# Get filtered position counts
-long_positions_count = self.cache.positions_open_count(
-    side=PositionSide.LONG
-)  # Number of open long positions
-instrument_positions_count = self.cache.positions_total_count(
-    instrument_id=instrument_id
-)  # Number of positions for a given instrument
+# Number of closed positions
+closed_count = self.cache.positions_closed_count()
+
+# Total number of positions in the system
+total_count = self.cache.positions_total_count()
+
+# Number of open long positions
+long_positions_count = self.cache.positions_open_count(side=PositionSide.LONG)
+
+# Number of positions for a given instrument
+instrument_positions_count = self.cache.positions_total_count(instrument_id=instrument_id)
 ```
 
 #### Accounts
 
 ```python
-# Access account information
-account = self.cache.account(account_id)  # Retrieve account by ID
-account = self.cache.account_for_venue(venue)  # Retrieve account for a specific venue
-account_id = self.cache.account_id(venue)  # Retrieve account ID for a venue
+# Retrieve account by ID
+account = self.cache.account(account_id)
+
+# Retrieve account for a specific venue
+account = self.cache.account_for_venue(venue)
+
+# Retrieve account ID for a venue
+account_id = self.cache.account_id(venue)
 ```
+
+A venue lookup resolves only when exactly one account is issued under the venue (the account ID prefix, such
+as `BINANCE` in `BINANCE-001`). When several accounts share a venue, `account_for_venue` and `account_id`
+return `None`. Get those accounts by ID.
 
 #### Instruments
 
 ```python
-# Get instrument information
-instrument = self.cache.instrument(instrument_id)  # Retrieve a specific instrument by its ID
-all_instruments = self.cache.instruments()  # Retrieve all instruments in the cache
+# Retrieve a specific instrument by its ID
+instrument = self.cache.instrument(instrument_id)
 
-# Get instruments for a venue.
-venue_instruments = self.cache.instruments(venue=venue)  # Instruments for a specific venue
+# Retrieve all instruments in the cache
+all_instruments = self.cache.instruments()
 
-# Get instrument identifiers
-instrument_ids = self.cache.instrument_ids()  # Get all instrument IDs
-venue_instrument_ids = self.cache.instrument_ids(
-    venue=venue
-)  # Get instrument IDs for a specific venue
+# Instruments for a specific venue
+venue_instruments = self.cache.instruments(venue=venue)
+
+# Get all instrument IDs
+instrument_ids = self.cache.instrument_ids()
+
+# Get instrument IDs for a specific venue
+venue_instrument_ids = self.cache.instrument_ids(venue=venue)
 ```
 
 ### Purging cached data
@@ -513,19 +658,27 @@ Long-running sessions accumulate closed orders, closed positions, account events
 unused instruments. The cache exposes targeted and bulk purge methods so strategies and
 the live trading engine can keep memory bounded without restarting the system.
 
+Purges change memory only by default. Pass `purge_from_database=True` to order and position purge methods
+in Python to queue deletion of their persisted histories and routine snapshots. Rust callers pass the
+boolean explicitly and handle the returned `Result`. A successful return confirms queue admission;
+the adapter logs later database failures. Encoded position snapshots used to replay corrections remain
+persisted as general data.
+Instrument purges change memory only.
+
 #### Targeted purges
 
-Use these to drop a single entity. Each refuses to purge while the entity is still active.
+Use these to drop a single entity. Order and position guards use in-memory state; direct purges can
+also target IDs absent from memory.
 
-- `cache.purge_order(client_order_id)`: removes the order and every order-keyed index entry.
-  Skips open orders.
+- `cache.purge_order(client_order_id)`: removes the order and each order-keyed index entry. Skips open orders.
 - `cache.purge_position(position_id)`: removes the position, its snapshots, and position-keyed
   index entries. Skips open positions.
 - `cache.purge_instrument(instrument_id)`: removes the instrument and its transient per-instrument
   maps (order book, quotes, trades, mark/index/funding prices, instrument status and close, greeks,
   and bars referencing the instrument). Skips while any associated order is non-terminal (anything
   that has not reached a closed state, including initialized, submitted, accepted, emulated,
-  released, and inflight orders) or any associated position is non-closed.
+  released, and inflight orders) or any associated position is non-closed. Cached orders and
+  positions remain indexed until purged separately, preserving historical queries and realized PnL.
 
 :::warning
 `purge_instrument` is intended for actors and strategies with their own lifecycle logic
@@ -545,14 +698,22 @@ lookback window in seconds.
 - `cache.purge_closed_positions(ts_now, buffer_secs)`: closed positions whose close timestamp
   is older than `buffer_secs`.
 - `cache.purge_account_events(ts_now, lookback_secs)`: account state events older than
-  `lookback_secs`. A value of `0` purges all events.
+  `lookback_secs`. The latest event always remains, including when the lookback is `0`.
+  With `purge_from_database=True`, Redis and Postgres log deletion requests and retain the full account
+  history for incremental balance, margin, and starting-balance replay.
+
+:::warning
+Keep the closed source position of a virtual `HEDGING` flip while its order can still receive fills.
+Purging it removes the history needed to route later fills and can cause the engine to reject them.
+:::
 
 #### Automatic purging in live trading
 
-`LiveExecutionEngineConfig` schedules the bulk purges on a timer. All purge intervals default to `None`,
-which disables the corresponding loop. Set an interval to enable a loop and set its buffer or
-lookback to control how recent entries remain protected. This example uses the recommended starting
-values from the live-trading configuration guide:
+`LiveExecutionEngineConfig` schedules the bulk purges on a timer. All purge intervals default to `None`, which
+disables the corresponding loop. Set an interval to enable a loop and set its buffer or lookback to control
+how recent entries stay protected. Set `purge_from_database=True` to also delete persisted closed orders
+and positions. Redis and Postgres retain persisted account-event history. This example uses the recommended starting values
+from the live-trading configuration guide and keeps purges in memory:
 
 ```python
 from nautilus_trader.config import LiveExecutionEngineConfig
@@ -588,11 +749,11 @@ small amounts of application data.
 #### Basic storage and retrieval
 
 ```python
-# Store serialized data.
+# Store serialized data
 self.cache.add(key="my_key", value=b"some binary data")
 
-# Retrieve serialized data.
-stored_data = self.cache.get("my_key")  # Returns bytes or None.
+# Retrieve serialized data. Returns bytes or None
+stored_data = self.cache.get("my_key")
 ```
 
 :::warning
@@ -603,12 +764,9 @@ The `Cache` is not a general database. Use a dedicated store for large datasets 
 
 ### Cache vs. portfolio usage
 
-The `Cache` and `Portfolio` serve different purposes:
-
 **Cache**:
 
-- Retains execution objects, selected object histories, and bounded recent market data until purge
-  or reset.
+- Keeps execution objects, selected object histories, and bounded recent market data until purge or reset.
 - Applies local state changes immediately, such as initializing an order before submission.
 - Applies external events when the engine processes them, such as when an order fills.
 
@@ -624,11 +782,12 @@ from nautilus_trader.trading import Strategy
 
 class MyStrategy(Strategy):
     def on_position_changed(self, event: PositionChanged) -> None:
-        # Read the fills retained by the cached position.
+
+        # Read the fills retained by the cached position
         position = self.cache.position(event.position_id)
         fills = position.events() if position is not None else []
 
-        # Read current aggregate exposure from the portfolio.
+        # Read current aggregate exposure from the portfolio
         current_exposure = self.portfolio.net_exposure(event.instrument_id)
 ```
 
@@ -640,8 +799,8 @@ Use cache entries for shared, serialized data and strategy variables for local w
 
 - Available to actors and strategies that share the system cache.
 - Can persist general byte entries when a backing database is configured and writes complete.
-- Remains available when an individual strategy resets, but a cache or execution-engine reset clears
-  the in-memory entries.
+- Stays available when an individual strategy resets, but a cache or execution-engine reset clears the
+  in-memory entries.
 
 **Strategy variables**:
 

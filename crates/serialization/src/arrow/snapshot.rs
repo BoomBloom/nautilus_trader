@@ -46,8 +46,8 @@ const ORDER_SNAPSHOT_FIELDS: &[JsonFieldSpec] = &[
     JsonFieldSpec::timestamp("expire_time", true),
     JsonFieldSpec::utf8("filled_qty", false),
     JsonFieldSpec::utf8("liquidity_side", true),
-    JsonFieldSpec::decimal_str("avg_px", true),
-    JsonFieldSpec::decimal_str("slippage", true),
+    JsonFieldSpec::utf8("avg_px", true),
+    JsonFieldSpec::utf8("slippage", true),
     JsonFieldSpec::utf8_json("commissions", false),
     JsonFieldSpec::utf8("status", false),
     JsonFieldSpec::boolean("is_post_only", false),
@@ -82,14 +82,14 @@ const POSITION_SNAPSHOT_FIELDS: &[JsonFieldSpec] = &[
     JsonFieldSpec::utf8("closing_order_id", true),
     JsonFieldSpec::utf8("entry", false),
     JsonFieldSpec::utf8("side", false),
-    JsonFieldSpec::f64("signed_qty", false),
+    JsonFieldSpec::utf8("signed_qty", false),
     JsonFieldSpec::utf8("quantity", false),
     JsonFieldSpec::utf8("peak_qty", false),
     JsonFieldSpec::utf8("quote_currency", false),
     JsonFieldSpec::utf8("base_currency", true),
     JsonFieldSpec::utf8("settlement_currency", false),
-    JsonFieldSpec::f64("avg_px_open", false),
-    JsonFieldSpec::f64("avg_px_close", true),
+    JsonFieldSpec::utf8("avg_px_open", false),
+    JsonFieldSpec::utf8("avg_px_close", true),
     JsonFieldSpec::f64("realized_return", true),
     JsonFieldSpec::utf8("realized_pnl", true),
     JsonFieldSpec::utf8("unrealized_pnl", true),
@@ -208,7 +208,7 @@ mod tests {
     }
 
     // The catalog spec before `avg_px` and `slippage` became exact
-    fn legacy_float64_fields() -> Vec<JsonFieldSpec> {
+    fn float64_fields() -> Vec<JsonFieldSpec> {
         ORDER_SNAPSHOT_FIELDS
             .iter()
             .map(|spec| match spec.name {
@@ -251,51 +251,25 @@ mod tests {
     }
 
     #[rstest]
-    fn test_order_snapshot_decodes_legacy_float64_columns() {
-        // A catalog file written while the fields were `f64`: the columns are `Float64`, not
-        // `Utf8`, and must still decode to the same economic state without a version marker.
+    fn test_order_snapshot_rejects_float64_avg_px_column() {
+        // Converting a float into an exact price would lose precision silently
         let snapshot = make_order_snapshot(Some(dec!(1.07)), Some(dec!(0.07)));
         let metadata = snapshot.metadata();
-        let legacy_batch = encode_batch(
+        let batch = encode_batch(
             "OrderSnapshot",
             &metadata,
             std::slice::from_ref(&snapshot),
-            &legacy_float64_fields(),
+            &float64_fields(),
         )
         .unwrap();
 
-        assert_eq!(
-            legacy_batch
-                .schema()
-                .field_with_name("avg_px")
-                .unwrap()
-                .data_type(),
-            &DataType::Float64
-        );
+        let error =
+            OrderSnapshot::decode_typed_batch(batch.schema().metadata(), batch).unwrap_err();
 
-        let decoded =
-            OrderSnapshot::decode_typed_batch(legacy_batch.schema().metadata(), legacy_batch)
-                .unwrap();
-
-        assert_eq!(decoded, vec![snapshot]);
-    }
-
-    #[rstest]
-    fn test_order_snapshot_decodes_legacy_float64_null_columns() {
-        let snapshot = make_order_snapshot(None, None);
-        let metadata = snapshot.metadata();
-        let legacy_batch = encode_batch(
-            "OrderSnapshot",
-            &metadata,
-            std::slice::from_ref(&snapshot),
-            &legacy_float64_fields(),
-        )
-        .unwrap();
-        let decoded =
-            OrderSnapshot::decode_typed_batch(legacy_batch.schema().metadata(), legacy_batch)
-                .unwrap();
-
-        assert_eq!(decoded, vec![snapshot]);
+        assert!(matches!(
+            error,
+            EncodingError::InvalidColumnType("avg_px", _, DataType::Utf8, DataType::Float64)
+        ));
     }
 
     fn make_position_snapshot() -> PositionSnapshot {
@@ -309,14 +283,14 @@ mod tests {
             closing_order_id: Some(ClientOrderId::from("O-2")),
             entry: OrderSide::Buy,
             side: PositionSide::Long,
-            signed_qty: 100.0,
+            signed_qty: dec!(100.0),
             quantity: Quantity::from("100"),
             peak_qty: Quantity::from("100"),
             quote_currency: Currency::USD(),
             base_currency: Some(Currency::EUR()),
             settlement_currency: Currency::USD(),
-            avg_px_open: 1.0500,
-            avg_px_close: Some(1.0600),
+            avg_px_open: dec!(1.0500123456789012345678901234),
+            avg_px_close: Some(dec!(1.0600123456789012345678901234)),
             realized_return: Some(0.0095),
             realized_pnl: Some(Money::new(100.0, Currency::USD())),
             unrealized_pnl: Some(Money::new(50.0, Currency::USD())),

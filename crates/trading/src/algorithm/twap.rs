@@ -1092,10 +1092,13 @@ mod tests {
 
         let order = create_market_order_with_params_and_qty(params, Quantity::from("1.2"));
         let primary_id = order.client_order_id();
-        let mut submit_params = Params::new();
-        submit_params.insert(
-            "routing_profile".to_string(),
-            serde_json::Value::String("intermediate-slice".to_string()),
+
+        let submit_params = Params::new(
+            [(
+                "routing_profile".to_string(),
+                serde_json::Value::String("intermediate-slice".to_string()),
+            )]
+            .into(),
         );
         algo.core
             .remember_submit_params(primary_id, Some(submit_params.clone()));
@@ -1152,10 +1155,13 @@ mod tests {
 
         let order = create_market_order_with_params(params);
         let primary_id = order.client_order_id();
-        let mut submit_params = Params::new();
-        submit_params.insert(
-            "routing_profile".to_string(),
-            serde_json::Value::String("final-slice".to_string()),
+
+        let submit_params = Params::new(
+            [(
+                "routing_profile".to_string(),
+                serde_json::Value::String("final-slice".to_string()),
+            )]
+            .into(),
         );
         algo.core
             .remember_submit_params(primary_id, Some(submit_params.clone()));
@@ -1210,10 +1216,13 @@ mod tests {
 
         let order = create_market_order_with_params_and_qty(params, Quantity::from("1.2"));
         let primary_id = order.client_order_id();
-        let mut submit_params = Params::new();
-        submit_params.insert(
-            "routing_profile".to_string(),
-            serde_json::Value::String("closed-primary".to_string()),
+
+        let submit_params = Params::new(
+            [(
+                "routing_profile".to_string(),
+                serde_json::Value::String("closed-primary".to_string()),
+            )]
+            .into(),
         );
         algo.core
             .remember_submit_params(primary_id, Some(submit_params));
@@ -1274,7 +1283,7 @@ mod tests {
             cache
                 .update_order(&OrderEventAny::Canceled(canceled))
                 .unwrap();
-            cache.purge_order(primary_id);
+            cache.purge_order(primary_id, false).unwrap();
         }
         assert!(algo.cache().order(&primary_id).is_none());
 
@@ -1463,7 +1472,7 @@ mod tests {
             cache
                 .update_order(&OrderEventAny::Canceled(canceled))
                 .unwrap();
-            cache.purge_order(primary_id);
+            cache.purge_order(primary_id, false).unwrap();
         }
 
         assert!(algo.cache().order(&primary_id).is_none());
@@ -1548,10 +1557,13 @@ mod tests {
         ));
 
         let primary_id = order.client_order_id();
-        let mut submit_params = Params::new();
-        submit_params.insert(
-            "routing_profile".to_string(),
-            serde_json::Value::String("whole-size".to_string()),
+
+        let submit_params = Params::new(
+            [(
+                "routing_profile".to_string(),
+                serde_json::Value::String("whole-size".to_string()),
+            )]
+            .into(),
         );
         algo.core
             .remember_submit_params(primary_id, Some(submit_params));
@@ -1585,10 +1597,13 @@ mod tests {
 
         let order = create_market_order_with_params_and_qty(params, Quantity::from("1.2"));
         let primary_id = order.client_order_id();
-        let mut submit_params = Params::new();
-        submit_params.insert(
-            "routing_profile".to_string(),
-            serde_json::Value::String("minimum-quantity".to_string()),
+
+        let submit_params = Params::new(
+            [(
+                "routing_profile".to_string(),
+                serde_json::Value::String("minimum-quantity".to_string()),
+            )]
+            .into(),
         );
         algo.core
             .remember_submit_params(primary_id, Some(submit_params));

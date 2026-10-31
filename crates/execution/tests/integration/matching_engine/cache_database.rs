@@ -26,16 +26,16 @@ use nautilus_model::{
     accounts::AccountAny,
     data::{
         Bar, CustomData, DataType, FundingRateUpdate, InstrumentClose, QuoteTick, TradeTick,
-        greeks::{GreeksData, YieldCurveData},
+        greeks::{GreeksData, YieldCurve},
     },
     events::{OrderEventAny, OrderSnapshot, position::snapshot::PositionSnapshot},
     identifiers::{
         AccountId, ActorId, ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId,
         VenueOrderId,
     },
-    instruments::{InstrumentAny, SyntheticInstrument},
+    instruments::{Instrument, InstrumentAny, SyntheticInstrument},
     orderbook::OrderBook,
-    orders::OrderAny,
+    orders::{Order, OrderAny},
     position::Position,
     types::{Currency, Money},
 };
@@ -45,8 +45,17 @@ use ustr::Ustr;
 #[derive(Debug, Default)]
 struct FailNthAddOrderState {
     fail_add_order_on: Option<usize>,
+    fail_add_position: bool,
     fail_index_order_position: bool,
     add_order_calls: usize,
+    accounts: AHashMap<AccountId, AccountAny>,
+    instruments: AHashMap<InstrumentId, InstrumentAny>,
+    instrument_loads: Vec<InstrumentId>,
+    orders: AHashMap<ClientOrderId, OrderAny>,
+    order_events: Vec<OrderEventAny>,
+    deleted_orders: Vec<ClientOrderId>,
+    deleted_positions: Vec<PositionId>,
+    deleted_account_events: Vec<(AccountId, String)>,
     order_snapshots: Vec<OrderSnapshot>,
     position_snapshots: Vec<PositionSnapshot>,
 }
@@ -67,6 +76,28 @@ impl FailNthAddOrderDatabaseControl {
         self.state.lock().fail_index_order_position = fail;
     }
 
+    pub(super) fn set_fail_add_position(&self, fail: bool) {
+        self.state.lock().fail_add_position = fail;
+    }
+
+    pub(super) fn set_accounts(&self, accounts: impl IntoIterator<Item = AccountAny>) {
+        self.state.lock().accounts = accounts
+            .into_iter()
+            .map(|account| (account.id(), account))
+            .collect();
+    }
+
+    pub(super) fn set_orders(&self, orders: impl IntoIterator<Item = OrderAny>) {
+        self.state.lock().orders = orders
+            .into_iter()
+            .map(|order| (order.client_order_id(), order))
+            .collect();
+    }
+
+    pub(super) fn order_events(&self) -> Vec<OrderEventAny> {
+        self.state.lock().order_events.clone()
+    }
+
     #[allow(dead_code, reason = "used by the sibling exec_engine test module")]
     pub(super) fn order_snapshots(&self) -> Vec<OrderSnapshot> {
         self.state.lock().order_snapshots.clone()
@@ -75,6 +106,34 @@ impl FailNthAddOrderDatabaseControl {
     #[allow(dead_code, reason = "used by the sibling exec_engine test module")]
     pub(super) fn position_snapshots(&self) -> Vec<PositionSnapshot> {
         self.state.lock().position_snapshots.clone()
+    }
+
+    #[allow(dead_code, reason = "used by the sibling exec_engine test module")]
+    pub(super) fn deleted_orders(&self) -> Vec<ClientOrderId> {
+        self.state.lock().deleted_orders.clone()
+    }
+
+    #[allow(dead_code, reason = "used by the sibling exec_engine test module")]
+    pub(super) fn deleted_positions(&self) -> Vec<PositionId> {
+        self.state.lock().deleted_positions.clone()
+    }
+
+    #[allow(dead_code, reason = "used by the sibling exec_engine test module")]
+    pub(super) fn deleted_account_events(&self) -> Vec<(AccountId, String)> {
+        self.state.lock().deleted_account_events.clone()
+    }
+
+    #[allow(dead_code, reason = "used by the sibling exec_engine test module")]
+    pub(super) fn set_instruments(&self, instruments: impl IntoIterator<Item = InstrumentAny>) {
+        self.state.lock().instruments = instruments
+            .into_iter()
+            .map(|instrument| (instrument.id(), instrument))
+            .collect();
+    }
+
+    #[allow(dead_code, reason = "used by the sibling exec_engine test module")]
+    pub(super) fn instrument_loads(&self) -> Vec<InstrumentId> {
+        self.state.lock().instrument_loads.clone()
     }
 }
 
@@ -106,7 +165,12 @@ impl CacheDatabaseAdapter for FailNthAddOrderDatabase {
     }
 
     async fn load_all(&self) -> anyhow::Result<CacheMap> {
-        Ok(CacheMap::default())
+        let state = self.control.state.lock();
+        Ok(CacheMap {
+            accounts: state.accounts.clone(),
+            orders: state.orders.clone(),
+            ..Default::default()
+        })
     }
 
     fn load(&self) -> anyhow::Result<AHashMap<String, Bytes>> {
@@ -167,6 +231,15 @@ impl CacheDatabaseAdapter for FailNthAddOrderDatabase {
         _instrument_id: &InstrumentId,
     ) -> anyhow::Result<Option<SyntheticInstrument>> {
         Ok(None)
+    }
+
+    fn load_instrument_sync(
+        &self,
+        instrument_id: &InstrumentId,
+    ) -> anyhow::Result<Option<InstrumentAny>> {
+        let mut state = self.control.state.lock();
+        state.instrument_loads.push(*instrument_id);
+        Ok(state.instruments.get(instrument_id).cloned())
     }
 
     async fn load_account(&self, _account_id: &AccountId) -> anyhow::Result<Option<AccountAny>> {
@@ -271,6 +344,10 @@ impl CacheDatabaseAdapter for FailNthAddOrderDatabase {
     }
 
     fn add_position(&self, _position: &Position) -> anyhow::Result<()> {
+        if self.control.state.lock().fail_add_position {
+            anyhow::bail!("test add position failure");
+        }
+
         Ok(())
     }
 
@@ -310,7 +387,7 @@ impl CacheDatabaseAdapter for FailNthAddOrderDatabase {
         Ok(())
     }
 
-    fn add_yield_curve(&self, _yield_curve: &YieldCurveData) -> anyhow::Result<()> {
+    fn add_yield_curve(&self, _yield_curve: &YieldCurve) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -322,15 +399,22 @@ impl CacheDatabaseAdapter for FailNthAddOrderDatabase {
         Ok(())
     }
 
-    fn delete_order(&self, _client_order_id: &ClientOrderId) -> anyhow::Result<()> {
+    fn delete_order(&self, id: &ClientOrderId) -> anyhow::Result<()> {
+        self.control.state.lock().deleted_orders.push(*id);
         Ok(())
     }
 
-    fn delete_position(&self, _position_id: &PositionId) -> anyhow::Result<()> {
+    fn delete_position(&self, id: &PositionId) -> anyhow::Result<()> {
+        self.control.state.lock().deleted_positions.push(*id);
         Ok(())
     }
 
-    fn delete_account_event(&self, _account_id: &AccountId, _event_id: &str) -> anyhow::Result<()> {
+    fn delete_account_event(&self, account_id: &AccountId, event_id: &str) -> anyhow::Result<()> {
+        self.control
+            .state
+            .lock()
+            .deleted_account_events
+            .push((*account_id, event_id.to_string()));
         Ok(())
     }
 
@@ -374,7 +458,12 @@ impl CacheDatabaseAdapter for FailNthAddOrderDatabase {
         Ok(())
     }
 
-    fn update_order(&self, _order_event: &OrderEventAny) -> anyhow::Result<()> {
+    fn update_order(&self, order_event: &OrderEventAny) -> anyhow::Result<()> {
+        self.control
+            .state
+            .lock()
+            .order_events
+            .push(order_event.clone());
         Ok(())
     }
 

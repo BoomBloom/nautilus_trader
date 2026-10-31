@@ -17,10 +17,11 @@
 
 use std::{any::Any, collections::HashMap, fmt::Debug, str::FromStr, time::Duration};
 
-use nautilus_common::factories::ClientConfig;
+use nautilus_common::{config::check_unique_values, factories::ClientConfig};
 #[cfg(test)]
 use nautilus_core::string::secret::REDACTED;
 use nautilus_core::string::secret::SecretString;
+use nautilus_live::book::DEFAULT_BOOK_SNAPSHOT_TIMEOUT_SECS;
 use nautilus_model::{
     enums::OmsType,
     identifiers::{AccountId, InstrumentId},
@@ -32,7 +33,10 @@ use nautilus_network::{
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use crate::common::enums::{BinanceEnvironment, BinanceMarginType, BinanceProductType};
+use crate::common::{
+    enums::{BinanceEnvironment, BinanceMarginType, BinanceProductType},
+    instruments::filter_values,
+};
 
 /// Configuration for Binance instrument loading.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, bon::Builder)]
@@ -82,10 +86,12 @@ impl Default for BinanceInstrumentProviderConfig {
 impl BinanceInstrumentProviderConfig {
     /// Validates instrument loading configuration.
     ///
+    /// Filter selection uniqueness uses trimmed, uppercase values.
+    ///
     /// # Errors
     ///
-    /// Returns an error for malformed IDs, unsupported filters, or a legacy
-    /// callable filter that Binance v2 cannot execute safely.
+    /// Returns an error if IDs are malformed, selections contain duplicates, filters are
+    /// unsupported, or a legacy callable filter cannot run safely in Binance v2.
     pub fn validate(&self, product_type: BinanceProductType) -> anyhow::Result<()> {
         if let Some(filter_callable) = self
             .filter_callable
@@ -124,6 +130,21 @@ impl BinanceInstrumentProviderConfig {
             validate_filter_strings(key, value)?;
         }
 
+        self.validate_selections()?;
+        Ok(())
+    }
+
+    pub(crate) fn validate_selections(&self) -> anyhow::Result<()> {
+        if let Some(values) = &self.load_ids {
+            check_unique_values("instrument_provider.load_ids", values)?;
+        }
+
+        for (name, value) in &self.filters {
+            if value.is_array() {
+                filter_values(self, name)?;
+            }
+        }
+
         Ok(())
     }
 
@@ -153,6 +174,7 @@ fn validate_filter_strings(name: &str, value: &serde_json::Value) -> anyhow::Res
         valid,
         "Binance instrument filter {name:?} must be a non-empty string or array of strings"
     );
+
     Ok(())
 }
 
@@ -225,6 +247,12 @@ pub struct BinanceDataClientConfig {
     /// changes (e.g. Trading -> Halt). Set to 0 to disable. Defaults to 3600 (60 minutes).
     #[builder(default = 3600)]
     pub instrument_status_poll_secs: u64,
+    /// Maximum time to wait for an initial, post-reconnect, or recovery order book
+    /// snapshot in seconds.
+    ///
+    /// Bounds each REST depth snapshot request for diff depth books. Set to 0 to disable.
+    #[builder(default = DEFAULT_BOOK_SNAPSHOT_TIMEOUT_SECS)]
+    pub book_snapshot_timeout_secs: u64,
     /// Receive window in milliseconds for signed HTTP requests.
     #[builder(default = 5_000)]
     pub recv_window_ms: u64,
@@ -255,6 +283,7 @@ nautilus_core::impl_pyo3_config_getters!(BinanceDataClientConfig {
     instrument_provider: BinanceInstrumentProviderConfig,
     instrument_refresh_interval_secs: u64,
     instrument_status_poll_secs: u64,
+    book_snapshot_timeout_secs: u64,
     recv_window_ms: u64,
     max_retries: u32,
     retry_delay_initial_ms: u64,
@@ -274,7 +303,7 @@ impl BinanceDataClientConfig {
     ///
     /// # Errors
     ///
-    /// Returns an error for invalid receive-window, provider, or Binance US settings.
+    /// Returns an error if the receive-window, provider, or Binance US settings are invalid.
     pub fn validate(&self) -> anyhow::Result<()> {
         validate_recv_window(self.recv_window_ms)?;
         validate_retry_config(&self.retry_config())?;
@@ -470,8 +499,8 @@ impl BinanceExecutionClientConfig {
     ///
     /// # Errors
     ///
-    /// Returns an error for invalid receive-window, WS trading setup timeout, provider, or
-    /// Binance US settings.
+    /// Returns an error if the receive-window, WS trading setup timeout, provider, or Binance US
+    /// settings are invalid.
     pub fn validate(&self) -> anyhow::Result<()> {
         validate_recv_window(self.recv_window_ms)?;
         validate_retry_config(&self.retry_config())?;
@@ -533,6 +562,7 @@ impl ClientConfig for BinanceExecutionClientConfig {
 
 #[cfg(test)]
 mod tests {
+    use nautilus_common::config::ConfigError;
     use rstest::rstest;
 
     use super::*;
@@ -583,6 +613,7 @@ instrument_status_poll_secs = 600
         assert_eq!(config.product_type, BinanceProductType::UsdM);
         assert_eq!(config.spot_market_data_mode, BinanceSpotMarketDataMode::Sbe);
         assert_eq!(config.instrument_status_poll_secs, 600);
+        assert_eq!(config.book_snapshot_timeout_secs, 10);
     }
 
     #[rstest]
@@ -822,5 +853,83 @@ oms_type = "Hedging"
                 "Binance instrument filter \"bases\" must be a non-empty string or array of strings"
             );
         }
+    }
+
+    #[rstest]
+    #[case("load_ids", serde_json::json!(["BTCUSDT.BINANCE", "ETHUSDT.BINANCE"]))]
+    fn test_instrument_provider_selection_uniqueness(
+        #[case] field: &str,
+        #[case] mut values: serde_json::Value,
+        #[values(false, true)] duplicate: bool,
+    ) {
+        if duplicate {
+            let entries = values.as_array_mut().unwrap();
+            entries.push(entries[0].clone());
+        }
+
+        let mut input = serde_json::to_value(BinanceInstrumentProviderConfig::default()).unwrap();
+        input[field] = values;
+        let config: BinanceInstrumentProviderConfig = serde_json::from_value(input).unwrap();
+        let original = serde_json::to_value(&config).unwrap();
+
+        let expected = if duplicate {
+            Err(ConfigError::duplicate(
+                format!("instrument_provider.{field}"),
+                None,
+            ))
+        } else {
+            Ok(())
+        };
+
+        let result = config
+            .validate(BinanceProductType::Spot)
+            .map_err(|e| e.downcast::<ConfigError>().unwrap());
+
+        assert_eq!(result, expected);
+        assert_eq!(serde_json::to_value(&config).unwrap(), original);
+    }
+
+    #[rstest]
+    #[case("symbols")]
+    #[case("bases")]
+    #[case("quotes")]
+    #[case("contract_types")]
+    fn test_filter_arrays_reject_duplicates(#[case] field: &str) {
+        let mut config = BinanceInstrumentProviderConfig::default();
+        config.filters.insert(
+            field.to_string(),
+            serde_json::json!(["first", "second", "first"]),
+        );
+        let error = config.validate(BinanceProductType::UsdM).unwrap_err();
+
+        assert_eq!(
+            error.downcast_ref::<ConfigError>(),
+            Some(&ConfigError::duplicate(
+                format!("instrument_provider.filters.{field}"),
+                None
+            ))
+        );
+    }
+
+    #[rstest]
+    #[case("symbols", serde_json::json!(["BTCUSDT", " btcusdt "]))]
+    #[case("bases", serde_json::json!(["BTC", " btc "]))]
+    #[case("quotes", serde_json::json!(["USDT", " usdt "]))]
+    #[case("contract_types", serde_json::json!(["PERPETUAL", " perpetual "]))]
+    fn test_filter_arrays_reject_normalized_duplicates(
+        #[case] field: &str,
+        #[case] values: serde_json::Value,
+    ) {
+        let mut config = BinanceInstrumentProviderConfig::default();
+        config.filters.insert(field.to_string(), values.clone());
+        let error = config.validate(BinanceProductType::UsdM).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ConfigError>(),
+            Some(&ConfigError::duplicate(
+                format!("instrument_provider.filters.{field}"),
+                None
+            ))
+        );
+        assert_eq!(config.filters.get(field), Some(&values));
     }
 }

@@ -20,11 +20,19 @@ use std::{
     fmt::Debug,
 };
 
+use nautilus_common::config::{ConfigResult, check_unique_values};
 use nautilus_core::string::secret::SecretString;
-use nautilus_model::identifiers::InstrumentId;
-use serde::{Deserialize, Serialize};
+use nautilus_model::{
+    identifiers::{InstrumentId, futures::FuturesYearDigits},
+    types::Currency,
+};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
 
-use crate::common::consts::{DEFAULT_CLIENT_ID, DEFAULT_HOST, DEFAULT_PORT};
+use crate::common::{
+    consts::{DEFAULT_CLIENT_ID, DEFAULT_HOST, DEFAULT_PORT},
+    contracts::{ConfiguredContract, parse_configured_contract_from_json},
+    enums::IbSecurityType,
+};
 
 /// Market data type for switching between real-time and frozen/delayed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,15 +118,50 @@ pub struct InteractiveBrokersDataClientConfig {
     /// execution/account.rs for call sites.
     #[builder(default = 60)]
     pub request_timeout: u64,
-    /// Whether to handle revised bars.
+    /// Whether to publish every revision of an open bar.
+    ///
+    /// When `false`, a bar that IB keeps up to date is published once it completes: on IB's
+    /// update after the bar closes, 2 seconds after the close, or on the next bar's first update,
+    /// whichever comes first.
     #[builder(default)]
     pub handle_revised_bars: bool,
     /// Whether to use batch quotes (reqMktData) by default instead of tick-by-tick.
     #[builder(default = true)]
     pub batch_quotes: bool,
+    /// Whether to include special-condition trades in tick-by-tick subscriptions.
+    #[builder(default = true)]
+    pub all_last_trades: bool,
+    /// Optional interval without incoming market data before emitting a subscription idle event.
+    pub subscription_idle_timeout_secs: Option<u64>,
+    /// Bound on ibapi's automatic reconnect attempts for the shared client connection
+    /// (`ClientBuilder::max_reconnect_attempts`). `None` keeps ibapi's default. `Some(0)`
+    /// disables reconnection; `Some(u32::MAX)` retries for practical purposes forever.
+    pub max_reconnect_attempts: Option<u32>,
     /// Instrument provider configuration.
     #[builder(default)]
     pub instrument_provider: InteractiveBrokersInstrumentProviderConfig,
+}
+
+impl InteractiveBrokersDataClientConfig {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        self.instrument_provider.validate()?;
+
+        anyhow::ensure!(
+            self.subscription_idle_timeout_secs != Some(0),
+            "subscription_idle_timeout_secs must be positive when set",
+        );
+
+        if let Some(timeout) = self.subscription_idle_timeout_secs {
+            anyhow::ensure!(
+                std::time::Instant::now()
+                    .checked_add(std::time::Duration::from_secs(timeout))
+                    .is_some(),
+                "subscription_idle_timeout_secs exceeds the supported clock range",
+            );
+        }
+
+        Ok(())
+    }
 }
 
 impl Default for InteractiveBrokersDataClientConfig {
@@ -154,8 +197,12 @@ pub struct InteractiveBrokersExecutionClientConfig {
     /// Client ID.
     #[builder(default = DEFAULT_CLIENT_ID)]
     pub client_id: i32,
-    /// Account ID.
+    /// Raw IB account code, such as `DU123456`. The Nautilus account ID becomes
+    /// `{client name}-{code}`.
     pub account_id: Option<String>,
+    /// Base currency for the account, normally the currency IB reports the account summary in.
+    /// `None` keeps a multi-currency account with one balance per currency.
+    pub base_currency: Option<Currency>,
     /// Connection timeout in seconds.
     #[builder(default = 300)]
     pub connection_timeout: u64,
@@ -168,6 +215,11 @@ pub struct InteractiveBrokersExecutionClientConfig {
     /// Whether to track option exercise from position updates.
     #[builder(default)]
     pub track_option_exercise_from_position_update: bool,
+    /// Bound on ibapi's automatic reconnect attempts, see the field of the same name on
+    /// [`InteractiveBrokersDataClientConfig`]. The shared-client registry connects once
+    /// per `(host, port, client_id)`, so when data and exec share a connection the first
+    /// creator's value wins.
+    pub max_reconnect_attempts: Option<u32>,
     /// Instrument provider configuration.
     #[builder(default)]
     pub instrument_provider: InteractiveBrokersInstrumentProviderConfig,
@@ -232,7 +284,11 @@ pub struct InteractiveBrokersInstrumentProviderConfig {
     pub load_ids: HashSet<InstrumentId>,
     /// IB contracts to load on startup.
     #[builder(default)]
-    pub load_contracts: Vec<serde_json::Value>,
+    #[serde(
+        deserialize_with = "deserialize_configured_contracts",
+        serialize_with = "serialize_configured_contracts"
+    )]
+    pub load_contracts: Vec<ConfiguredContract>,
     /// Minimum expiry days for options and futures chains.
     pub min_expiry_days: Option<u32>,
     /// Maximum expiry days for options and futures chains.
@@ -251,7 +307,7 @@ pub struct InteractiveBrokersInstrumentProviderConfig {
     pub symbol_to_mic_venue: HashMap<String, String>,
     /// Security types to filter out.
     #[builder(default)]
-    pub filter_sec_types: HashSet<String>,
+    pub filter_sec_types: HashSet<IbSecurityType>,
     /// Fully-qualified Python callable path for custom instrument filtering.
     ///
     /// Configuring this without the Python feature enabled is an error.
@@ -259,12 +315,42 @@ pub struct InteractiveBrokersInstrumentProviderConfig {
     /// Path to cache file for persistent instrument caching (equivalent to pickle_path in Python).
     /// If provided, instruments will be cached to disk and loaded from cache if still valid.
     pub cache_path: Option<String>,
+    /// Year digits in futures IDs: 2 by default, or 1 for existing catalogs and caches.
+    #[builder(default)]
+    pub futures_year_digits: FuturesYearDigits,
 }
 
 impl Default for InteractiveBrokersInstrumentProviderConfig {
     fn default() -> Self {
         Self::builder().build()
     }
+}
+
+fn deserialize_configured_contracts<'de, D>(
+    deserializer: D,
+) -> Result<Vec<ConfiguredContract>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Vec::<serde_json::Value>::deserialize(deserializer)?
+        .iter()
+        .map(parse_configured_contract_from_json)
+        .collect::<anyhow::Result<Vec<_>>>()
+        .map_err(D::Error::custom)
+}
+
+fn serialize_configured_contracts<S>(
+    contracts: &[ConfiguredContract],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    contracts
+        .iter()
+        .map(ConfiguredContract::to_json_value)
+        .collect::<Vec<_>>()
+        .serialize(serializer)
 }
 
 /// Trading mode for Dockerized IB Gateway.
@@ -298,7 +384,7 @@ pub enum TradingMode {
 ///
 /// This configuration is for managing containerized IB Gateway instances.
 /// It supports environment variable loading and sensitive data masking.
-#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[derive(Clone, Serialize, Deserialize, bon::Builder)]
 #[serde(default)]
 #[cfg_attr(
     feature = "python",
@@ -318,6 +404,7 @@ pub struct DockerizedIBGatewayConfig {
     /// Username for IB account (falls back to `TWS_USERNAME` env var via [`Default`]).
     pub username: Option<SecretString>,
     /// Password for IB account (falls back to `TWS_PASSWORD` env var via [`Default`]).
+    #[serde(skip_serializing)]
     pub password: Option<SecretString>,
     /// Trading mode (paper or live).
     #[builder(default)]
@@ -336,20 +423,6 @@ pub struct DockerizedIBGatewayConfig {
 }
 
 impl DockerizedIBGatewayConfig {
-    /// Mask sensitive information for display.
-    pub fn mask_sensitive_info(value: &str) -> String {
-        if value.len() <= 2 {
-            "*".repeat(value.len())
-        } else {
-            format!(
-                "{}{}{}",
-                &value[0..1],
-                "*".repeat(value.len() - 2),
-                &value[value.len() - 1..]
-            )
-        }
-    }
-
     /// Validate configuration.
     ///
     /// # Errors
@@ -374,6 +447,20 @@ impl DockerizedIBGatewayConfig {
     }
 }
 
+impl Debug for DockerizedIBGatewayConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(DockerizedIBGatewayConfig))
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("trading_mode", &self.trading_mode)
+            .field("read_only_api", &self.read_only_api)
+            .field("timeout", &self.timeout)
+            .field("container_image", &self.container_image)
+            .field("vnc_port", &self.vnc_port)
+            .finish()
+    }
+}
+
 impl Default for DockerizedIBGatewayConfig {
     fn default() -> Self {
         Self::builder()
@@ -383,24 +470,372 @@ impl Default for DockerizedIBGatewayConfig {
     }
 }
 
+impl InteractiveBrokersInstrumentProviderConfig {
+    /// Validates configured selections.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a selection repeats a value.
+    pub fn validate(&self) -> ConfigResult<()> {
+        check_unique_values("load_contracts", &self.load_contracts)
+    }
+}
+
+impl InteractiveBrokersExecutionClientConfig {
+    /// Validates that configured selections contain no duplicates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a selection repeats a value.
+    pub fn validate(&self) -> ConfigResult<()> {
+        self.instrument_provider.validate()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use nautilus_common::config::ConfigError;
+    use nautilus_model::{identifiers::futures::FuturesYearDigits, types::Currency};
     use rstest::rstest;
 
-    use super::*;
+    use super::{
+        DockerizedIBGatewayConfig, InteractiveBrokersExecutionClientConfig,
+        InteractiveBrokersInstrumentProviderConfig,
+    };
+    use crate::common::enums::IbSecurityType;
 
     #[rstest]
-    fn dockerized_gateway_config_debug_redacts_credentials() {
+    fn test_gateway_password_is_redacted_from_debug_and_serialization() {
         let config = DockerizedIBGatewayConfig::builder()
-            .username("test-user".into())
-            .password("test-password".into())
+            .username(String::from("user").into())
+            .password(String::from("secret-password").into())
             .build();
 
-        let formatted = format!("{config:?}");
+        let debug = format!("{config:?}");
+        let json = serde_json::to_string(&config).unwrap();
 
-        assert!(formatted.contains("username: Some(<redacted>)"));
-        assert!(formatted.contains("password: Some(<redacted>)"));
-        assert!(!formatted.contains("test-user"));
-        assert!(!formatted.contains("test-password"));
+        assert!(!debug.contains("secret-password"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!json.contains("secret-password"));
+        assert!(!json.contains("password"));
+    }
+
+    #[rstest]
+    fn test_execution_client_config_base_currency() {
+        let config: InteractiveBrokersExecutionClientConfig =
+            serde_json::from_value(serde_json::json!({"base_currency": "EUR"})).unwrap();
+
+        assert_eq!(config.base_currency, Some(Currency::EUR()));
+        assert_eq!(
+            InteractiveBrokersExecutionClientConfig::default().base_currency,
+            None
+        );
+    }
+
+    #[rstest]
+    fn test_instrument_provider_config_decodes_typed_contracts_and_filters() {
+        let config: InteractiveBrokersInstrumentProviderConfig =
+            serde_json::from_value(serde_json::json!({
+                "load_contracts": [{
+                    "secType": "STK",
+                    "symbol": "AAPL",
+                    "exchange": "SMART",
+                    "conId": 265598
+                }],
+                "filter_sec_types": ["opt"]
+            }))
+            .unwrap();
+
+        assert_eq!(config.load_contracts.len(), 1);
+        assert_eq!(config.load_contracts[0].contract.contract_id, 265598);
+        assert_eq!(
+            config.load_contracts[0].contract.security_type,
+            ibapi::contracts::SecurityType::Stock
+        );
+        assert!(config.filter_sec_types.contains(&IbSecurityType::Option));
+    }
+
+    #[rstest]
+    fn test_instrument_provider_config_keeps_per_contract_chain_settings() {
+        let config: InteractiveBrokersInstrumentProviderConfig =
+            serde_json::from_value(serde_json::json!({
+                "build_futures_chain": true,
+                "load_contracts": [
+                    {
+                        "secType": "STK",
+                        "symbol": "SPY",
+                        "exchange": "SMART",
+                        "primaryExchange": "ARCA",
+                        "build_options_chain": true,
+                        "min_expiry_days": 7,
+                        "max_expiry_days": 14
+                    },
+                    {
+                        "secType": "FUT",
+                        "exchange": "NYMEX",
+                        "localSymbol": "CLZ6",
+                        "build_futures_chain": false
+                    }
+                ]
+            }))
+            .unwrap();
+
+        let spy = &config.load_contracts[0];
+        assert_eq!(spy.build_options_chain, Some(true));
+        assert_eq!(spy.build_futures_chain, None);
+        assert_eq!(spy.min_expiry_days, Some(7));
+        assert_eq!(spy.max_expiry_days, Some(14));
+        assert_eq!(spy.options_chain_exchange, None);
+        assert_eq!(
+            spy.chain_spec_json().unwrap(),
+            serde_json::json!({
+                "build_options_chain": true,
+                "min_expiry_days": 7,
+                "max_expiry_days": 14
+            })
+        );
+
+        let cl = &config.load_contracts[1];
+        assert_eq!(cl.build_futures_chain, Some(false));
+        assert_eq!(
+            cl.chain_spec_json().unwrap(),
+            serde_json::json!({"build_futures_chain": false})
+        );
+
+        let round_trip = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            round_trip["load_contracts"][0]["build_options_chain"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            round_trip["load_contracts"][1]["build_futures_chain"],
+            serde_json::json!(false)
+        );
+    }
+
+    #[rstest]
+    fn test_instrument_provider_config_accepts_con_id_only_contract() {
+        let config: InteractiveBrokersInstrumentProviderConfig =
+            serde_json::from_value(serde_json::json!({
+                "load_contracts": [{"conId": 265598}]
+            }))
+            .unwrap();
+
+        assert_eq!(config.load_contracts[0].contract.contract_id, 265598);
+        assert_eq!(
+            config.load_contracts[0].contract.security_type,
+            ibapi::contracts::SecurityType::Stock
+        );
+    }
+
+    #[rstest]
+    #[case(
+        serde_json::json!({"load_contracts": [{"secType": "UNKNOWN"}]}),
+        "Unknown IB security type: UNKNOWN"
+    )]
+    #[case(
+        serde_json::json!({"load_contracts": [{"secType": "STK", "conId": "265598"}]}),
+        "Configured contract field 'conId' must be an integer"
+    )]
+    #[case(
+        serde_json::json!({"load_contracts": [{"symbol": "SPY"}]}),
+        "Configured contract requires 'secType' as a known IB security type string, or a positive 'conId'"
+    )]
+    #[case(
+        serde_json::json!({"load_contracts": [{"secType": "STK", "build_options_chain": "yes"}]}),
+        "Configured contract field 'build_options_chain' must be a boolean"
+    )]
+    #[case(
+        serde_json::json!({"load_contracts": [{"secType": "STK", "min_expiry_days": -1}]}),
+        "Configured contract field 'min_expiry_days' must be a non-negative integer"
+    )]
+    #[case(
+        serde_json::json!({"filter_sec_types": ["UNKNOWN"]}),
+        "Unknown IB security type: UNKNOWN"
+    )]
+    fn test_instrument_provider_config_rejects_invalid_typed_values(
+        #[case] value: serde_json::Value,
+        #[case] expected: &str,
+    ) {
+        let error = serde_json::from_value::<InteractiveBrokersInstrumentProviderConfig>(value)
+            .unwrap_err();
+
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+
+    #[rstest]
+    #[case("load_contracts", serde_json::json!([{"secType": "STK", "conId": 265598}, {"secType": "STK", "conId": 756733}]))]
+    fn test_instrument_provider_selection_uniqueness(
+        #[case] field: &str,
+        #[case] mut values: serde_json::Value,
+        #[values(false, true)] duplicate: bool,
+    ) {
+        if duplicate {
+            let entries = values.as_array_mut().unwrap();
+            entries.push(entries[0].clone());
+        }
+
+        let mut input =
+            serde_json::to_value(InteractiveBrokersInstrumentProviderConfig::default()).unwrap();
+        input[field] = values;
+        let config: InteractiveBrokersInstrumentProviderConfig =
+            serde_json::from_value(input).unwrap();
+        let original = serde_json::to_value(&config).unwrap();
+
+        let expected = if duplicate {
+            Err(ConfigError::duplicate(field, None))
+        } else {
+            Ok(())
+        };
+
+        let result = config.validate();
+
+        assert_eq!(result, expected);
+        assert_eq!(serde_json::to_value(&config).unwrap(), original);
+    }
+
+    #[rstest]
+    fn test_client_configs_reject_duplicate_provider_selections() {
+        let provider: InteractiveBrokersInstrumentProviderConfig = serde_json::from_value(serde_json::json!({
+            "load_contracts": [{"secType": "STK", "conId": 265598}, {"secType": "STK", "conId": 265598}]
+        })).unwrap();
+
+        let data = super::InteractiveBrokersDataClientConfig {
+            instrument_provider: provider.clone(),
+            ..Default::default()
+        };
+
+        let execution = InteractiveBrokersExecutionClientConfig {
+            instrument_provider: provider,
+            ..Default::default()
+        };
+
+        let data_result = data
+            .validate()
+            .map_err(|e| e.downcast::<ConfigError>().unwrap());
+        let execution_result = execution.validate();
+        let expected = Err(ConfigError::duplicate("load_contracts", None));
+
+        assert_eq!(data_result, expected);
+        assert_eq!(execution_result, expected);
+    }
+
+    #[rstest]
+    #[case::data(false)]
+    #[case::execution(true)]
+    fn test_client_constructor_rejects_duplicate_config_before_setup(#[case] execution: bool) {
+        use std::{cell::RefCell, rc::Rc, sync::Arc};
+
+        use nautilus_common::cache::Cache;
+        use nautilus_live::ExecutionClientCore;
+        use nautilus_model::{
+            enums::{AccountType, OmsType},
+            identifiers::{AccountId, ClientId, TraderId, Venue},
+        };
+
+        use crate::{
+            data::InteractiveBrokersDataClient, execution::InteractiveBrokersExecutionClient,
+            providers::instruments::InteractiveBrokersInstrumentProvider,
+        };
+
+        let duplicate_config: InteractiveBrokersInstrumentProviderConfig =
+            serde_json::from_value(serde_json::json!({
+                "load_contracts": [{"conId": 265598}, {"conId": 265598}]
+            }))
+            .unwrap();
+        let provider =
+            Arc::new(InteractiveBrokersInstrumentProvider::new(Default::default()).unwrap());
+
+        let error = if execution {
+            let core = ExecutionClientCore::new(
+                TraderId::from("TESTER-001"),
+                ClientId::from("IB"),
+                Venue::from("IB"),
+                OmsType::Netting,
+                AccountId::from("IB-001"),
+                AccountType::Margin,
+                None,
+                Rc::new(RefCell::new(Cache::default())),
+            );
+
+            let config = InteractiveBrokersExecutionClientConfig {
+                client_id: 1,
+                instrument_provider: duplicate_config,
+                ..Default::default()
+            };
+
+            InteractiveBrokersExecutionClient::new(core, config, provider).err()
+        } else {
+            InteractiveBrokersDataClient::new(
+                ClientId::from("IB"),
+                super::InteractiveBrokersDataClientConfig {
+                    instrument_provider: duplicate_config,
+                    ..Default::default()
+                },
+                provider,
+            )
+            .err()
+        }
+        .expect("duplicate config must fail before client setup or connection");
+
+        assert_eq!(
+            error.downcast_ref::<ConfigError>(),
+            Some(&ConfigError::duplicate("load_contracts", None))
+        );
+    }
+
+    #[rstest]
+    fn test_provider_constructor_rejects_duplicate_config() {
+        let config = serde_json::from_value(serde_json::json!({
+            "load_contracts": [{"conId": 265598}, {"conId": 265598}]
+        }))
+        .unwrap();
+
+        let error =
+            crate::providers::instruments::InteractiveBrokersInstrumentProvider::new(config)
+                .unwrap_err();
+
+        assert_eq!(error, ConfigError::duplicate("load_contracts", None));
+    }
+
+    #[rstest]
+    fn test_provider_defaults_to_two_digit_futures_years() {
+        let config = InteractiveBrokersInstrumentProviderConfig::default();
+        let decoded: InteractiveBrokersInstrumentProviderConfig =
+            serde_json::from_str("{}").unwrap();
+        assert_eq!(config.futures_year_digits, FuturesYearDigits::Two);
+        assert_eq!(decoded.futures_year_digits, FuturesYearDigits::Two);
+    }
+
+    #[rstest]
+    #[case(1, FuturesYearDigits::One)]
+    #[case(2, FuturesYearDigits::Two)]
+    fn test_provider_deserializes_futures_year_digits(
+        #[case] digits: u8,
+        #[case] expected: FuturesYearDigits,
+    ) {
+        let config: InteractiveBrokersInstrumentProviderConfig =
+            serde_json::from_value(serde_json::json!({"futures_year_digits": digits})).unwrap();
+        assert_eq!(config.futures_year_digits, expected);
+        assert_eq!(
+            serde_json::to_value(&config).unwrap()["futures_year_digits"],
+            serde_json::json!(digits)
+        );
+    }
+
+    #[rstest]
+    #[case(0)]
+    #[case(3)]
+    #[case(4)]
+    #[case(u8::MAX)]
+    fn test_provider_rejects_invalid_serialized_futures_year_digits(#[case] digits: u8) {
+        let error = serde_json::from_value::<InteractiveBrokersInstrumentProviderConfig>(
+            serde_json::json!({"futures_year_digits": digits}),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "`futures_year_digits` must be either 1 or 2"
+        );
     }
 }

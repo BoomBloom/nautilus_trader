@@ -15,6 +15,7 @@
 
 //! Configuration structures for the Deribit adapter.
 
+use nautilus_common::config::{ConfigResult, check_unique_values};
 #[cfg(test)]
 use nautilus_core::string::secret::REDACTED;
 use nautilus_core::string::secret::SecretString;
@@ -77,7 +78,8 @@ pub struct DeribitDataClientConfig {
     /// Optional WebSocket authentication timeout (seconds), defaulting to
     /// `AUTHENTICATION_TIMEOUT_SECS` when unset.
     pub auth_timeout_secs: Option<u64>,
-    /// Interval for refreshing instruments (in minutes).
+    /// Interval in minutes for refreshing instruments of the configured product types.
+    /// A zero value disables periodic refresh.
     #[builder(default = 60)]
     pub update_instruments_interval_mins: u64,
     /// If `true`, subscribes for uncached instruments lazy-load via HTTP; otherwise fail fast.
@@ -116,6 +118,15 @@ impl DeribitDataClientConfig {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Validates that configured selections contain no duplicates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `product_types` repeats a value.
+    pub fn validate(&self) -> ConfigResult<()> {
+        check_unique_values("product_types", &self.product_types)
     }
 
     /// Returns `true` when API credentials are available (in config or env vars).
@@ -217,6 +228,15 @@ impl Default for DeribitExecutionClientConfig {
 }
 
 impl DeribitExecutionClientConfig {
+    /// Validates that configured selections contain no duplicates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `product_types` repeats a value.
+    pub fn validate(&self) -> ConfigResult<()> {
+        check_unique_values("product_types", &self.product_types)
+    }
+
     /// Returns `true` when API credentials are available (in config or env vars).
     #[must_use]
     pub fn has_api_credentials(&self) -> bool {
@@ -245,9 +265,68 @@ impl DeribitExecutionClientConfig {
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
+    use nautilus_common::{cache::Cache, config::ConfigError};
+    use nautilus_live::ExecutionClientCore;
+    use nautilus_model::{
+        enums::{AccountType, OmsType},
+        identifiers::{ClientId, TraderId, Venue},
+    };
     use rstest::rstest;
 
     use super::*;
+    use crate::{data::DeribitDataClient, execution::DeribitExecutionClient};
+
+    #[rstest]
+    fn test_data_client_rejects_duplicate_types() {
+        let config = DeribitDataClientConfig {
+            product_types: vec![DeribitProductType::Future, DeribitProductType::Future],
+            ..Default::default()
+        };
+
+        let error = DeribitDataClient::new(ClientId::from("DERIBIT"), config)
+            .expect_err("duplicate config must fail before client setup");
+
+        assert_eq!(
+            error.downcast_ref::<ConfigError>(),
+            Some(&ConfigError::duplicate("product_types", None)),
+        );
+    }
+
+    #[rstest]
+    #[case::empty(vec![], false)]
+    #[case::distinct(vec![DeribitProductType::Option, DeribitProductType::Future], false)]
+    #[case::adjacent(vec![DeribitProductType::Future, DeribitProductType::Future], true)]
+    #[case::separated(vec![DeribitProductType::Future, DeribitProductType::Option, DeribitProductType::Future], true)]
+    fn test_config_duplicate_types(
+        #[case] values: Vec<DeribitProductType>,
+        #[case] duplicate: bool,
+    ) {
+        let data = DeribitDataClientConfig {
+            product_types: values.clone(),
+            ..Default::default()
+        };
+
+        let execution = DeribitExecutionClientConfig {
+            product_types: values.clone(),
+            ..Default::default()
+        };
+
+        let expected = if duplicate {
+            Err(ConfigError::duplicate("product_types", None))
+        } else {
+            Ok(())
+        };
+
+        let data_result = data.validate();
+        let execution_result = execution.validate();
+
+        assert_eq!(data_result, expected);
+        assert_eq!(execution_result, expected);
+        assert_eq!(data.product_types, values);
+        assert_eq!(execution.product_types, values);
+    }
 
     #[rstest]
     fn test_config_debug_redacts_credentials() {
@@ -359,5 +438,32 @@ auto_load_missing_instruments = true
         assert_eq!(config.http_timeout_secs, expected.http_timeout_secs);
         assert_eq!(config.max_retries, expected.max_retries);
         assert_eq!(config.transport_backend, expected.transport_backend);
+    }
+
+    #[rstest]
+    fn test_execution_client_rejects_duplicate_types() {
+        let core = ExecutionClientCore::new(
+            TraderId::from("TESTER-001"),
+            ClientId::from("DERIBIT"),
+            Venue::from("DERIBIT"),
+            OmsType::Netting,
+            AccountId::from("DERIBIT-001"),
+            AccountType::Margin,
+            None,
+            Rc::new(RefCell::new(Cache::default())),
+        );
+
+        let config = DeribitExecutionClientConfig {
+            product_types: vec![DeribitProductType::Future, DeribitProductType::Future],
+            ..Default::default()
+        };
+
+        let error = DeribitExecutionClient::new(core, config)
+            .expect_err("duplicate config must fail before credentials or client setup");
+
+        assert_eq!(
+            error.downcast_ref::<ConfigError>(),
+            Some(&ConfigError::duplicate("product_types", None))
+        );
     }
 }

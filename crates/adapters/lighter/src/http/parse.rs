@@ -33,7 +33,8 @@ use crate::{
     common::{
         enums::LighterMarketStatus,
         parse::{
-            parse_millis_to_nanos, parse_secs_to_nanos, price_from_decimal, quantity_from_decimal,
+            funding_rate_from_percent, parse_millis_to_nanos, parse_secs_to_nanos,
+            price_from_decimal, quantity_from_decimal,
         },
         symbol::{MarketRegistry, format_instrument_id_with_venue},
     },
@@ -249,9 +250,10 @@ pub fn parse_funding_rate_update(
     let timestamp =
         u64::try_from(funding.timestamp).context("negative Lighter funding timestamp")?;
     let ts_event = parse_secs_to_nanos(timestamp)?;
+    let magnitude = funding_rate_from_percent(funding.rate);
     let rate = match funding.direction {
-        LighterFundingDirection::Long => funding.rate,
-        LighterFundingDirection::Short => -funding.rate,
+        LighterFundingDirection::Long => magnitude,
+        LighterFundingDirection::Short => -magnitude,
     };
 
     Ok(FundingRateUpdate::new(
@@ -481,8 +483,6 @@ fn parse_perp_instrument(
         .maybe_min_notional(min_notional(order_book, quote_currency)?)
         .margin_init(margin_fraction(detail.default_initial_margin_fraction))
         .margin_maint(margin_fraction(detail.maintenance_margin_fraction))
-        .maker_fee(order_book.maker_fee)
-        .taker_fee(order_book.taker_fee)
         .ts_event(ts_init)
         .ts_init(ts_init)
         .build()
@@ -527,8 +527,6 @@ fn parse_spot_instrument(
         .maybe_min_quantity(min_quantity(order_book, detail.size_decimals)?)
         .maybe_max_notional(max_notional(order_book, quote_currency)?)
         .maybe_min_notional(min_notional(order_book, quote_currency)?)
-        .maker_fee(order_book.maker_fee)
-        .taker_fee(order_book.taker_fee)
         .ts_event(ts_init)
         .ts_init(ts_init)
         .build()
@@ -864,13 +862,13 @@ mod tests {
             parse_funding_rate_update(&short_pays, instrument.id(), Some(60), ts_init).unwrap();
 
         assert_eq!(positive.instrument_id, instrument.id());
-        assert_eq!(positive.rate, Decimal::new(12, 4));
+        assert_eq!(positive.rate, Decimal::new(12, 6));
         assert_eq!(positive.interval, Some(60));
         assert_eq!(
             positive.ts_event,
             UnixNanos::from(1_778_702_400_000_000_000)
         );
-        assert_eq!(negative.rate, Decimal::new(-12, 4));
+        assert_eq!(negative.rate, Decimal::new(-12, 6));
     }
 
     #[rstest]

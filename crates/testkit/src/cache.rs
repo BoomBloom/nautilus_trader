@@ -29,7 +29,7 @@ use nautilus_model::{
     accounts::AccountAny,
     data::{
         Bar, CustomData, DataType, FundingRateUpdate, InstrumentClose, QuoteTick, TradeTick,
-        greeks::{GreeksData, YieldCurveData},
+        greeks::{GreeksData, YieldCurve},
     },
     events::{OrderEventAny, OrderSnapshot, position::snapshot::PositionSnapshot},
     identifiers::{
@@ -60,6 +60,8 @@ struct TestCacheDatabaseState {
     fail_update_actor: bool,
     fail_update_strategy: bool,
     fail_update_position: bool,
+    fail_update_position_id: Option<PositionId>,
+    updated_positions: Vec<Position>,
 }
 
 /// Shared control and observation handle for [`TestCacheDatabase`].
@@ -153,6 +155,17 @@ impl TestCacheDatabaseControl {
     /// Configures position updates to fail.
     pub fn set_fail_update_position(&self, fail: bool) {
         self.state.lock().fail_update_position = fail;
+    }
+
+    /// Configures updates of a single position to fail.
+    pub fn set_fail_update_position_id(&self, position_id: Option<PositionId>) {
+        self.state.lock().fail_update_position_id = position_id;
+    }
+
+    /// Returns the positions persisted by successful updates, in update order.
+    #[must_use]
+    pub fn updated_positions(&self) -> Vec<Position> {
+        self.state.lock().updated_positions.clone()
     }
 }
 
@@ -392,7 +405,7 @@ impl CacheDatabaseAdapter for TestCacheDatabase {
         Ok(())
     }
 
-    fn add_yield_curve(&self, _yield_curve: &YieldCurveData) -> anyhow::Result<()> {
+    fn add_yield_curve(&self, _yield_curve: &YieldCurve) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -404,15 +417,21 @@ impl CacheDatabaseAdapter for TestCacheDatabase {
         Ok(())
     }
 
-    fn delete_order(&self, _client_order_id: &ClientOrderId) -> anyhow::Result<()> {
+    fn delete_order(&self, client_order_id: &ClientOrderId) -> anyhow::Result<()> {
+        self.control
+            .record(format!("delete_order:{client_order_id}"));
         Ok(())
     }
 
-    fn delete_position(&self, _position_id: &PositionId) -> anyhow::Result<()> {
+    fn delete_position(&self, position_id: &PositionId) -> anyhow::Result<()> {
+        self.control
+            .record(format!("delete_position:{position_id}"));
         Ok(())
     }
 
-    fn delete_account_event(&self, _account_id: &AccountId, _event_id: &str) -> anyhow::Result<()> {
+    fn delete_account_event(&self, account_id: &AccountId, event_id: &str) -> anyhow::Result<()> {
+        self.control
+            .record(format!("delete_account_event:{account_id}:{event_id}"));
         Ok(())
     }
 
@@ -471,10 +490,12 @@ impl CacheDatabaseAdapter for TestCacheDatabase {
         Ok(())
     }
 
-    fn update_position(&self, _position: &Position) -> anyhow::Result<()> {
-        if self.control.state.lock().fail_update_position {
+    fn update_position(&self, position: &Position) -> anyhow::Result<()> {
+        let mut state = self.control.state.lock();
+        if state.fail_update_position || state.fail_update_position_id == Some(position.id) {
             anyhow::bail!("test position update failure");
         }
+        state.updated_positions.push(position.clone());
         Ok(())
     }
 

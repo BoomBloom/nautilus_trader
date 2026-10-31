@@ -20,21 +20,24 @@
     reason = "catalog store functions forward object-store errors"
 )]
 
+use anyhow::Context;
 use nautilus_common::live::block_on_nautilus_with;
+use nautilus_model::data::NautilusDataType;
 use object_store::ObjectMeta;
 
 use super::{
     HashSet, ObjectPath, ObjectStore, ObjectStoreExt, ParquetDataCatalog, PathBuf, StreamExt,
-    UnixNanos, append_path_to_file_uri, are_intervals_disjoint, extract_path_components,
-    is_remote_uri_scheme, make_object_store_path, query_intersects_filename, remote_full_uri,
-    remote_store_root_url, timestamps_to_filename, urisafe_instrument_id,
+    UnixNanos, append_path_to_file_uri, are_intervals_disjoint, decode_object_store_segment,
+    is_remote_uri_scheme, make_object_store_path, parse_filename_timestamps,
+    query::{filter_identifier_files, is_parquet_bar_prefix},
+    query_intersects_filename, remote_full_uri, remote_store_root_url, timestamps_to_filename,
+    urisafe_instrument_id,
 };
 use crate::{
     catalog::types::{
-        CatalogDataType, custom_data_read_prefixes, custom_type_name,
-        parquet_catalog_data_type_path_prefixes,
+        CatalogDataType, catalog_data_type_from_path, parquet_catalog_data_type_path_prefixes,
     },
-    common::paths::normalize_path_separators,
+    common::{paths::normalize_path_separators, storage::StorageBackend},
 };
 
 impl ParquetDataCatalog {
@@ -119,6 +122,7 @@ impl ParquetDataCatalog {
                 extended = true;
             }
         }
+
         anyhow::ensure!(
             extended,
             "Cannot extend file name for {data_type}: no instrument class holds {}; \
@@ -179,7 +183,42 @@ impl ParquetDataCatalog {
         self.rename_parquet_file(directory, original.0, original.1, proposed.0, proposed.1)
     }
 
-    /// Lists all Parquet files in a specified directory.
+    /// Helper method to rename a parquet file by moving it via object store operations
+    fn rename_parquet_file(
+        &self,
+        directory: &str,
+        old_start: u64,
+        old_end: u64,
+        new_start: u64,
+        new_end: u64,
+    ) -> anyhow::Result<()> {
+        let new_filename =
+            timestamps_to_filename(UnixNanos::from(new_start), UnixNanos::from(new_end));
+        let new_path = format!("{directory}/{new_filename}");
+        let matches = self
+            .list_parquet_files(directory)?
+            .into_iter()
+            .filter(|file| parse_filename_timestamps(file) == Some((old_start, old_end)))
+            .collect::<Vec<_>>();
+
+        anyhow::ensure!(
+            matches.len() == 1,
+            "expected one parquet file for interval ({old_start}, {old_end}) in {directory}, \
+             found {}",
+            matches.len()
+        );
+
+        let old_path = &matches[0];
+        if old_path.ends_with(&new_filename) {
+            return Ok(());
+        }
+
+        let old_object_path = self.to_object_path_parsed(old_path)?;
+        let new_object_path = self.to_object_path(&new_path)?;
+        self.move_file(&old_object_path, &new_object_path)
+    }
+
+    /// Lists all Parquet files under a directory, including its subdirectories.
     ///
     /// This method scans a directory and returns the full paths of all files with the `.parquet`
     /// extension. It works with both local filesystems and remote object stores, making it
@@ -187,12 +226,14 @@ impl ParquetDataCatalog {
     ///
     /// # Parameters
     ///
-    /// - `directory`: The directory path to scan for Parquet files.
+    /// - `directory`: The directory path to scan for Parquet files, unencoded as
+    ///   [`Self::make_path`] returns it.
     ///
     /// # Returns
     ///
-    /// Returns a vector of full file paths (as strings) for all Parquet files found in the directory.
-    /// The paths are relative to the object store root and suitable for use with object store operations.
+    /// Returns a vector of full file paths (as strings) for all Parquet files under the directory.
+    /// The paths are percent-encoded object-store keys relative to the store root; convert one with
+    /// [`Self::to_object_path_parsed`].
     /// Returns an empty vector if the directory doesn't exist or contains no Parquet files.
     ///
     /// # Errors
@@ -205,7 +246,8 @@ impl ParquetDataCatalog {
     /// # Notes
     ///
     /// - Only files ending with `.parquet` are included.
-    /// - Subdirectories are not recursively scanned.
+    /// - Subdirectories are scanned recursively, so a type directory such as `data/quotes`
+    ///   returns the files of every identifier under it.
     /// - File paths are returned in the order provided by the object store.
     /// - Works with all supported object store backends (local, S3, GCS, Azure, etc.).
     ///
@@ -229,19 +271,14 @@ impl ParquetDataCatalog {
     /// # Ok::<(), anyhow::Error>(())
     /// ```
     pub fn list_parquet_files(&self, directory: &str) -> anyhow::Result<Vec<String>> {
-        self.execute_async(|| async {
-            let prefix = ObjectPath::from(format!("{directory}/"));
-            let mut stream = self.object_store.list(Some(&prefix));
-            let mut files = Vec::new();
+        let files = self
+            .list_objects(directory)?
+            .into_iter()
+            .filter(|object| object.location.as_ref().ends_with(".parquet"))
+            .map(|object| object.location.to_string())
+            .collect();
 
-            while let Some(object) = stream.next().await {
-                let object = object?;
-                if object.location.as_ref().ends_with(".parquet") {
-                    files.push(object.location.to_string());
-                }
-            }
-            Ok::<Vec<String>, anyhow::Error>(files)
-        })
+        Ok(files)
     }
 
     /// Lists all instrument identifiers for a specific data type.
@@ -261,21 +298,12 @@ impl ParquetDataCatalog {
     ///
     /// Returns an error if directory listing fails.
     pub fn list_instruments(&self, data_type: &CatalogDataType) -> anyhow::Result<Vec<String>> {
-        if let Some(type_name) = custom_type_name(data_type) {
-            let mut instruments = Vec::new();
-            for prefix in custom_data_read_prefixes(type_name) {
-                instruments.extend(self.list_prefix_instruments(prefix.as_ref())?);
-            }
-
-            instruments.sort();
-            instruments.dedup();
-            return Ok(instruments);
-        }
-
         let mut instruments = Vec::new();
-        for data_type in parquet_catalog_data_type_path_prefixes(data_type) {
-            instruments.extend(self.list_prefix_instruments(data_type.as_ref())?);
+
+        for prefix in parquet_catalog_data_type_path_prefixes(data_type) {
+            instruments.extend(self.list_prefix_instruments(prefix.as_ref())?);
         }
+
         // The same identifier can live under more than one instrument class.
         instruments.sort();
         instruments.dedup();
@@ -284,25 +312,25 @@ impl ParquetDataCatalog {
     }
 
     fn list_prefix_instruments(&self, data_type: &str) -> anyhow::Result<Vec<String>> {
-        self.execute_async(|| async {
-            let prefix = format!("data/{data_type}/");
-            let object_prefix = ObjectPath::from(prefix.as_str());
-            let mut stream = self.object_store.list(Some(&object_prefix));
-            let mut instruments = HashSet::new();
+        let directory = self.make_path(data_type, None)?;
+        let prefix = ObjectPath::from(directory.as_str());
+        let mut instruments = HashSet::new();
 
-            while let Some(object) = stream.next().await {
-                let object = object?;
-                let path = object.location.as_ref();
-                // First segment below the prefix, covering nested `custom/{TypeName}` paths
-                if let Some(rest) = path.strip_prefix(prefix.as_str())
-                    && let Some(identifier) = rest.split('/').next()
-                    && !identifier.is_empty()
-                {
-                    instruments.insert(identifier.to_string());
-                }
+        for object in self.list_objects(&directory)? {
+            // Relative to the prefix a datum is `{identifier}/{filename}.parquet`
+            let Some(relative) = object.location.prefix_match(&prefix) else {
+                continue;
+            };
+            let segments: Vec<_> = relative.collect();
+
+            if let [identifier, filename] = segments.as_slice()
+                && filename.as_ref().ends_with(".parquet")
+            {
+                instruments.insert(decode_object_store_segment(identifier.as_ref()));
             }
-            Ok::<Vec<String>, anyhow::Error>(instruments.into_iter().collect())
-        })
+        }
+
+        Ok(instruments.into_iter().collect())
     }
 
     /// Lists Parquet files matching specific criteria (data type, identifiers, time range).
@@ -331,23 +359,8 @@ impl ParquetDataCatalog {
         start: Option<UnixNanos>,
         end: Option<UnixNanos>,
     ) -> anyhow::Result<Vec<String>> {
-        if let Some(type_name) = custom_type_name(data_type) {
-            let mut all_files = Vec::new();
-            for prefix in custom_data_read_prefixes(type_name) {
-                all_files.extend(self.list_prefix_files_with_criteria(
-                    prefix.as_ref(),
-                    identifiers,
-                    start,
-                    end,
-                )?);
-            }
-
-            all_files.sort();
-            all_files.dedup();
-            return Ok(all_files);
-        }
-
         let mut all_files = Vec::new();
+
         for data_cls in parquet_catalog_data_type_path_prefixes(data_type) {
             all_files.extend(self.list_prefix_files_with_criteria(
                 data_cls.as_ref(),
@@ -367,44 +380,20 @@ impl ParquetDataCatalog {
         start: Option<UnixNanos>,
         end: Option<UnixNanos>,
     ) -> anyhow::Result<Vec<String>> {
-        let mut all_files = Vec::new();
-
         let start_u64 = start.map(|s| s.as_u64());
         let end_u64 = end.map(|e| e.as_u64());
 
         let base_dir = self.make_path(data_cls, None)?;
 
         // Use recursive listing to match Python's glob behavior
-        let list_result = self.list_objects(&base_dir)?;
+        let mut all_files = self.list_parquet_files(&base_dir)?;
 
-        for object in list_result {
-            let path_str = object.location.to_string();
-
-            // Filter by identifiers if provided
-            if let Some(ids) = identifiers {
-                let path_components = extract_path_components(&path_str);
-                let mut matches = false;
-
-                for id in ids {
-                    if path_components.iter().any(|c| c.contains(id)) {
-                        matches = true;
-                        break;
-                    }
-                }
-
-                if !matches {
-                    continue;
-                }
-            }
-
-            // Filter by timestamp range if filename can be parsed
-            if path_str.ends_with(".parquet")
-                && query_intersects_filename(&path_str, start_u64, end_u64)
-            {
-                all_files.push(path_str);
-            }
+        if let Some(identifiers) = identifiers {
+            all_files =
+                filter_identifier_files(all_files, identifiers, is_parquet_bar_prefix(data_cls));
         }
 
+        all_files.retain(|path| query_intersects_filename(path, start_u64, end_u64));
         Ok(all_files)
     }
 
@@ -417,6 +406,7 @@ impl ParquetDataCatalog {
             while let Some(object) = stream.next().await {
                 objects.push(object?);
             }
+
             Ok(objects)
         })
     }
@@ -465,10 +455,19 @@ impl ParquetDataCatalog {
     }
 
     /// Resolves a path for use with DataFusion (avoiding Windows path doubling for file://).
-    /// Returns the path as-is if it is already a full URI or absolute; otherwise builds
-    /// file:// base + path for local catalogs or `reconstruct_full_uri` for remote.
+    /// A remote path resolves to a URL under the store root whose path decodes to the object
+    /// key. A local path is returned as-is if it is already a full URI or absolute; otherwise it
+    /// joins the file:// base or goes through `reconstruct_full_uri`.
     #[must_use]
     pub(crate) fn resolve_path_for_datafusion(&self, path: &str) -> String {
+        // DataFusion decodes the URL path once, so encode the key again
+        if self.is_remote_uri()
+            && let Ok(key) = self.object_store_path(path)
+            && let Ok(root) = remote_store_root_url(&self.original_uri)
+        {
+            return append_path_to_file_uri(root.as_str(), &key);
+        }
+
         if path.contains("://") {
             return path.to_string();
         }
@@ -480,6 +479,7 @@ impl ParquetDataCatalog {
         if self.original_uri.starts_with("file://") {
             return append_path_to_file_uri(&self.original_uri, path);
         }
+
         self.reconstruct_full_uri(path)
     }
 
@@ -490,6 +490,7 @@ impl ParquetDataCatalog {
         if !resolved.ends_with('/') {
             resolved.push('/');
         }
+
         resolved
     }
 
@@ -513,6 +514,16 @@ impl ParquetDataCatalog {
         } else {
             self.original_uri.clone()
         }
+    }
+
+    pub(crate) fn register_remote_object_store(&mut self) -> anyhow::Result<()> {
+        if self.is_remote_uri() {
+            let base_url = remote_store_root_url(&self.original_uri)?;
+            self.session
+                .register_object_store(&base_url, self.object_store.clone());
+        }
+
+        Ok(())
     }
 
     /// Helper method to check if the original URI uses a remote object store scheme
@@ -607,30 +618,9 @@ impl ParquetDataCatalog {
                 components.push(safe_id);
             }
         }
+
         let path = make_object_store_path(&self.base_path, components);
         Ok(path)
-    }
-
-    /// Helper method to rename a parquet file by moving it via object store operations
-    fn rename_parquet_file(
-        &self,
-        directory: &str,
-        old_start: u64,
-        old_end: u64,
-        new_start: u64,
-        new_end: u64,
-    ) -> anyhow::Result<()> {
-        let old_filename =
-            timestamps_to_filename(UnixNanos::from(old_start), UnixNanos::from(old_end));
-        let old_path = format!("{directory}/{old_filename}");
-        let old_object_path = self.to_object_path(&old_path)?;
-
-        let new_filename =
-            timestamps_to_filename(UnixNanos::from(new_start), UnixNanos::from(new_end));
-        let new_path = format!("{directory}/{new_filename}");
-        let new_object_path = self.to_object_path(&new_path)?;
-
-        self.move_file(&old_object_path, &new_object_path)
     }
 
     /// Converts a catalog path string to an [`ObjectPath`] for object store operations.
@@ -658,9 +648,9 @@ impl ParquetDataCatalog {
     ///
     /// # Errors
     ///
-    /// Returns an error for remote catalogs when `path` is a full URI whose scheme/host
-    /// does not match the catalog's own root (cross-bucket misuse). Without this guard
-    /// the caller could silently write to or read from the wrong bucket.
+    /// Returns an error if the catalog is remote and `path` is a full URI whose scheme/host does
+    /// not match the catalog's own root (cross-bucket misuse). Without this guard the caller could
+    /// silently write to or read from the wrong bucket.
     ///
     /// # Examples
     ///
@@ -687,16 +677,6 @@ impl ParquetDataCatalog {
         Ok(ObjectPath::from(self.object_store_path(path)?))
     }
 
-    pub(crate) fn register_remote_object_store(&mut self) -> anyhow::Result<()> {
-        if self.is_remote_uri() {
-            let base_url = remote_store_root_url(&self.original_uri)?;
-            self.session
-                .register_object_store(&base_url, self.object_store.clone());
-        }
-
-        Ok(())
-    }
-
     /// Converts a path string to [`ObjectPath`] using parse (no percent-encoding).
     ///
     /// Use this for paths that were returned by the object store (e.g. from `list()`),
@@ -705,14 +685,14 @@ impl ParquetDataCatalog {
     ///
     /// # Errors
     ///
-    /// Returns an error for the same cross-bucket case as [`Self::to_object_path`], or
-    /// when the resulting string fails [`ObjectPath::parse`].
+    /// Returns an error if the same cross-bucket condition as [`Self::to_object_path`] occurs or
+    /// the resulting string fails [`ObjectPath::parse`].
     pub fn to_object_path_parsed(&self, path: &str) -> anyhow::Result<ObjectPath> {
         let to_parse = self.object_store_path(path)?;
         ObjectPath::parse(&to_parse).map_err(anyhow::Error::from)
     }
 
-    fn object_store_path(&self, path: &str) -> anyhow::Result<String> {
+    pub(super) fn object_store_path(&self, path: &str) -> anyhow::Result<String> {
         let normalized_path = normalize_path_separators(path);
 
         if self.is_remote_uri() {
@@ -755,7 +735,7 @@ impl ParquetDataCatalog {
         Ok(path_url.path().trim_start_matches('/').to_string())
     }
 
-    fn path_without_local_base(&self, path: &str) -> String {
+    pub(crate) fn path_without_local_base(&self, path: &str) -> String {
         let base_path = if self.base_path.is_empty() {
             self.native_base_path_string()
         } else {
@@ -805,6 +785,7 @@ impl ParquetDataCatalog {
         if old_path == new_path {
             return Ok(());
         }
+
         self.execute_async(|| async {
             self.object_store
                 .rename(old_path, new_path)
@@ -834,8 +815,8 @@ impl ParquetDataCatalog {
     ///
     /// # Returns
     ///
-    /// Returns a vector of directory names (stems) found in the subdirectory,
-    /// or an error if the operation fails.
+    /// Returns the sorted directory names (stems) found in the subdirectory, decoded from their
+    /// percent-encoded object-store form, or an error if the operation fails.
     ///
     /// # Errors
     ///
@@ -869,70 +850,53 @@ impl ParquetDataCatalog {
         if !self.is_remote_uri() {
             let directory = PathBuf::from(self.native_base_path_string()).join(subdirectory);
 
-            // Check if directory exists
-            if !directory.exists() {
-                return Ok(Vec::new());
-            }
+            let entries = match std::fs::read_dir(&directory) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("failed to list {}", directory.display()));
+                }
+            };
 
-            // List all entries in the directory
             let mut directories = Vec::new();
 
-            if let Ok(entries) = std::fs::read_dir(&directory) {
-                for entry in entries.flatten() {
-                    if let Ok(file_type) = entry.file_type()
-                        && file_type.is_dir()
-                    {
-                        // Use file_name() to get the directory name (not file_stem which removes extension)
-                        if let Some(name) = entry.path().file_name() {
-                            directories.push(name.to_string_lossy().to_string());
-                        }
-                    }
+            for entry in entries {
+                let entry =
+                    entry.with_context(|| format!("failed to list {}", directory.display()))?;
+                let file_type = entry
+                    .file_type()
+                    .with_context(|| format!("failed to read {}", entry.path().display()))?;
+
+                // Use file_name() to get the directory name (not file_stem which removes extension)
+                if file_type.is_dir()
+                    && let Some(name) = entry.path().file_name()
+                {
+                    directories.push(decode_object_store_segment(&name.to_string_lossy()));
                 }
             }
+
             directories.sort();
             return Ok(directories);
         }
 
-        // For remote URIs, use object store listing (only lists directories with files)
-        let directory = make_object_store_path(&self.base_path, [subdirectory]);
+        let storage = StorageBackend {
+            object_store: self.object_store.clone(),
+            base_path: self.base_path.clone(),
+            original_uri: self.original_uri.clone(),
+        };
 
-        let list_result = self.execute_async(|| async {
-            let prefix = ObjectPath::from(format!("{directory}/"));
-            let mut stream = self.object_store.list(Some(&prefix));
-            let mut directories = Vec::new();
-            let mut seen_dirs = std::collections::HashSet::new();
-
-            while let Some(object) = stream.next().await {
-                let object = object?;
-                let path_str = object.location.to_string();
-
-                // Extract the immediate subdirectory name
-                if let Some(relative_path) = path_str.strip_prefix(&format!("{directory}/")) {
-                    let parts: Vec<&str> = relative_path.split('/').collect();
-                    if let Some(first_part) = parts.first()
-                        && !first_part.is_empty()
-                        && !seen_dirs.contains(*first_part)
-                    {
-                        seen_dirs.insert(first_part.to_string());
-                        directories.push(first_part.to_string());
-                    }
-                }
-            }
-
-            Ok::<Vec<String>, anyhow::Error>(directories)
-        })?;
-
-        Ok(list_result)
+        self.execute_async(|| async { storage.list_directory_stems(subdirectory).await })
     }
 
-    /// Lists all data types available in the catalog.
+    /// Lists the data, record, and instrument types stored in the catalog.
     ///
-    /// This method returns the names of all data type directories in the catalog.
-    /// Data types correspond to different kinds of market data (e.g., "quotes", "trades", "bars").
+    /// Each `data/<type>` directory maps to its catalog type, and each `data/custom/<type_name>`
+    /// directory to a custom data type. Unrecognized directories are skipped with a warning.
     ///
     /// # Returns
     ///
-    /// Returns a vector of data type names, or an error if the operation fails.
+    /// Returns the catalog types, or an error if the operation fails.
     ///
     /// # Errors
     ///
@@ -956,12 +920,31 @@ impl ParquetDataCatalog {
     /// // List all data types
     /// let data_types = catalog.list_data_types()?;
     /// for data_type in data_types {
-    ///     println!("Available data type: {}", data_type);
+    ///     println!("Available data type: {data_type}");
     /// }
     /// # Ok::<(), anyhow::Error>(())
     /// ```
-    pub fn list_data_types(&self) -> anyhow::Result<Vec<String>> {
-        self.list_directory_stems("data")
+    pub fn list_data_types(&self) -> anyhow::Result<Vec<CatalogDataType>> {
+        let mut data_types = Vec::new();
+
+        for stem in self.list_directory_stems("data")? {
+            if stem == "custom" {
+                for type_name in self.list_directory_stems("data/custom")? {
+                    data_types.push(CatalogDataType::from(NautilusDataType::Custom {
+                        type_name,
+                    }));
+                }
+
+                continue;
+            }
+
+            match catalog_data_type_from_path(&stem) {
+                Ok(data_type) => data_types.push(data_type),
+                Err(e) => log::warn!("Skipping catalog directory data/{stem}: {e}"),
+            }
+        }
+
+        Ok(data_types)
     }
 
     /// Lists all backtest run IDs available in the catalog.
@@ -1040,5 +1023,136 @@ impl ParquetDataCatalog {
     /// ```
     pub fn list_live_runs(&self) -> anyhow::Result<Vec<String>> {
         self.list_directory_stems("live")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use nautilus_model::data::NautilusDataType;
+    use object_store::{ObjectStoreExt, PutPayload, memory::InMemory, path::Path as ObjectPath};
+    use rstest::rstest;
+
+    use super::ParquetDataCatalog;
+    use crate::{catalog::types::CatalogDataType, common::datafusion::DataBackendSession};
+
+    /// Builds a catalog over an in-memory store. Only remote catalogs carry a non-empty
+    /// `base_path`, so seeding one here is the sole way to reproduce a bucket sub-prefix.
+    fn memory_catalog(base_path: &str) -> ParquetDataCatalog {
+        ParquetDataCatalog {
+            base_path: base_path.to_string(),
+            original_uri: "memory://".to_string(),
+            object_store: Arc::new(InMemory::new()),
+            session: DataBackendSession::new(5_000),
+            batch_size: 5_000,
+            compression: parquet::basic::Compression::SNAPPY,
+            max_row_group_size: 5_000,
+        }
+    }
+
+    fn seed(catalog: &ParquetDataCatalog, keys: &[&str]) {
+        catalog
+            .execute_async(|| async {
+                for key in keys {
+                    catalog
+                        .object_store
+                        .put(&ObjectPath::from(*key), PutPayload::from_static(b"x"))
+                        .await?;
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[rstest]
+    #[case("nautilus-data", "nautilus-data/")]
+    #[case("", "")]
+    fn list_instruments_returns_ids_under_base_path(
+        #[case] base_path: &str,
+        #[case] key_prefix: &str,
+    ) {
+        let catalog = memory_catalog(base_path);
+        let keys = [
+            "data/quotes/EURUSD.SIM/0-1.parquet",
+            "data/quotes/EURUSD.SIM/2-3.parquet",
+            "data/quotes/GBPUSD.SIM/0-1.parquet",
+            "data/trades/AUDUSD.SIM/0-1.parquet",
+        ]
+        .map(|key| format!("{key_prefix}{key}"));
+        seed(&catalog, &keys.each_ref().map(String::as_str));
+
+        assert_eq!(
+            catalog
+                .list_instruments(&NautilusDataType::QuoteTick.into())
+                .unwrap(),
+            ["EURUSD.SIM", "GBPUSD.SIM"]
+        );
+    }
+
+    #[rstest]
+    #[case("nautilus-data", "nautilus-data/")]
+    #[case("", "")]
+    fn list_parquet_files_lists_type_directory_recursively(
+        #[case] base_path: &str,
+        #[case] key_prefix: &str,
+    ) {
+        let catalog = memory_catalog(base_path);
+        let keys = [
+            "data/quotes/EURUSD.SIM/0-1.parquet",
+            "data/quotes/EURUSD.SIM/0-1.json",
+            "data/quotes/BTC€.SIM/2-3.parquet",
+            "data/trades/AUDUSD.SIM/0-1.parquet",
+        ]
+        .map(|key| format!("{key_prefix}{key}"));
+        seed(&catalog, &keys.each_ref().map(String::as_str));
+
+        let directory = catalog.make_path("quotes", None).unwrap();
+        let mut files = catalog.list_parquet_files(&directory).unwrap();
+        files.sort();
+
+        assert_eq!(
+            files,
+            [
+                format!("{key_prefix}data/quotes/BTC%E2%82%AC.SIM/2-3.parquet"),
+                format!("{key_prefix}data/quotes/EURUSD.SIM/0-1.parquet"),
+            ]
+        );
+    }
+
+    #[rstest]
+    fn list_instruments_ignores_unpartitioned_files() {
+        // An empty `base_path` keeps this distinct from the remote prefix defect, so an empty
+        // result can only come from the layout check.
+        let catalog = memory_catalog("");
+        seed(
+            &catalog,
+            &[
+                "data/custom/MyType/1-2.parquet",
+                "data/custom/MyType/1-2.json",
+            ],
+        );
+
+        let custom = CatalogDataType::Data(NautilusDataType::Custom {
+            type_name: "MyType".to_string(),
+        });
+
+        assert!(catalog.list_instruments(&custom).unwrap().is_empty());
+    }
+
+    #[rstest]
+    fn list_instruments_decodes_percent_encoded_ids() {
+        let catalog = memory_catalog("nautilus-data");
+        seed(
+            &catalog,
+            &["nautilus-data/data/quotes/BTC€.SIM/0-1.parquet"],
+        );
+
+        assert_eq!(
+            catalog
+                .list_instruments(&NautilusDataType::QuoteTick.into())
+                .unwrap(),
+            ["BTC€.SIM"]
+        );
     }
 }

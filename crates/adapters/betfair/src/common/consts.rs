@@ -64,7 +64,10 @@ pub const BETFAIR_STREAM_SERVER_HEARTBEAT_MS: u64 = 5_000;
 // Interactive login URL (non-cert)
 pub const BETFAIR_IDENTITY_LOGIN_URL: &str = "https://identitysso.betfair.com/api/login";
 
-// Keep-alive URL (must match login host: interactive SSO, not cert)
+/// Betfair certificate login endpoint.
+pub const BETFAIR_CERT_LOGIN_URL: &str = "https://identitysso-cert.betfair.com/api/certlogin";
+
+// Keep-alive URL (interactive SSO for both login methods)
 pub const BETFAIR_KEEP_ALIVE_URL: &str = "https://identitysso.betfair.com/api/keepAlive";
 
 // Rate limiter keys
@@ -79,6 +82,7 @@ pub const BETFAIR_CUSTOMER_ORDER_REF_MAX_LEN: usize = 32;
 
 // Betting API JSON-RPC methods
 pub const METHOD_LIST_MARKET_CATALOGUE: &str = "SportsAPING/v1.0/listMarketCatalogue";
+pub const METHOD_LIST_EVENTS: &str = "SportsAPING/v1.0/listEvents";
 pub const METHOD_LIST_CURRENT_ORDERS: &str = "SportsAPING/v1.0/listCurrentOrders";
 pub const METHOD_PLACE_ORDERS: &str = "SportsAPING/v1.0/placeOrders";
 pub const METHOD_CANCEL_ORDERS: &str = "SportsAPING/v1.0/cancelOrders";

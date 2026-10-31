@@ -132,7 +132,7 @@ if [[ -n "$rust_files" ]]; then
       return 0
     }
 
-    function is_exempt(keyword, i, trimmed, previous, prev_trimmed) {
+    function is_exempt(keyword, i, trimmed, previous, prev_trimmed,    j, column, depth, token) {
       if (prev_trimmed == "") return 1
       if (prev_trimmed ~ /\{[[:space:]]*$/) return 1
       if (prev_trimmed ~ /^\/\// || prev_trimmed ~ /^\*[[:space:]]/ || prev_trimmed ~ /^\*\//) return 1
@@ -156,6 +156,30 @@ if [[ -n "$rust_files" ]]; then
 
       if (shares_identifier(keyword, condition_text(keyword, trimmed), previous)) return 1
       if (i < total && shares_identifier(keyword, lines[i + 1], previous)) return 1
+      if (keyword != "spawn") {
+        depth = 0
+        for (j = i; j <= total; j++) {
+          if (j > inspected_end) inspected_end = j
+          for (column = 1; column <= length(lines[j]); column++) {
+            token = substr(lines[j], column, 1)
+            if (token == "(" || token == "[") {
+              depth++
+            } else if (token == ")" || token == "]") {
+              if (depth == 0) return 0
+              depth--
+            } else if (depth == 0) {
+              if (token == "{") {
+                if (j < total) {
+                  inspected_end = j + 1
+                  return shares_identifier(keyword, lines[j + 1], previous)
+                }
+                return 0
+              }
+              if (token == "}" || token == ";" || substr(lines[j], column, 2) == "=>") return 0
+            }
+          }
+        }
+      }
       return 0
     }
 
@@ -241,38 +265,27 @@ report_control_flow() {
   done <<< "$control_flow_output"
 }
 
-echo "Checking for blank line above \`if\` statements (Rust)..."
 report_control_flow if
-
-echo "Checking for blank line above \`match\` blocks (Rust)..."
 report_control_flow match
-
-echo "Checking for blank line above \`for\` loops (Rust)..."
 report_control_flow for
-
-echo "Checking for blank line above \`while\` loops (Rust)..."
 report_control_flow while
-
-echo "Checking for blank line above \`loop\` blocks (Rust)..."
 report_control_flow loop
-
-echo "Checking for blank line above \`spawn\` calls (Rust)..."
 report_control_flow spawn
 
-# Check: module declaration ordering in `mod.rs`
+# Check: out-of-line module declaration ordering
 #
-# External module declarations must be alphabetized within these sections:
-# `#[macro_use]`, public, restricted, cfg-gated, private, and test-only.
+# Unconditional modules precede cfg-gated modules, each ordered by visibility.
+# Macro preludes come first; test-only modules come last.
 # Adjacent non-empty sections must have exactly one blank line between them.
-
-echo "Checking module declaration ordering (Rust)..."
 
 CONTROL_FLOW_VIOLATIONS=$VIOLATIONS
 MODULE_ORDER_VIOLATIONS=0
+module_sections="macro prelude, public, restricted, private"
+module_sections+=", cfg-gated public, cfg-gated restricted, cfg-gated private, test-only"
 
 while IFS= read -r file; do
-  [[ "$file" == */mod.rs && "$file" != */generated/* ]] || continue
-  module_output=$(LC_ALL=C awk '
+  [[ "$file" != */generated/* ]] || continue
+  module_output=$(LC_ALL=C awk -v module_sections="$module_sections" '
     function reset_block() {
       previous_line = 0
       previous_category = -1
@@ -285,12 +298,7 @@ while IFS= read -r file; do
     }
 
     function category_name(category) {
-      if (category == 0) return "macro prelude"
-      if (category == 1) return "public"
-      if (category == 2) return "restricted"
-      if (category == 3) return "cfg-gated"
-      if (category == 4) return "private"
-      return "test-only"
+      return sections[category + 1]
     }
 
     function report(message) {
@@ -329,6 +337,7 @@ while IFS= read -r file; do
     }
 
     BEGIN {
+      split(module_sections, sections, ", ")
       reset_block()
       attributes = ""
       in_attribute = 0
@@ -390,15 +399,17 @@ while IFS= read -r file; do
         if (compact_attributes ~ /#\[macro_use\]/) {
           category = 0
         } else if (compact_attributes ~ /#\[cfg\(test\)\]/ || has_direct_test(compact_attributes)) {
-          category = 5
-        } else if (compact_attributes ~ /#\[cfg\(/) {
-          category = 3
-        } else if (line ~ /^pub[[:space:]]+mod[[:space:]]+/) {
-          category = 1
-        } else if (line ~ /^pub\([^)]*\)[[:space:]]+mod[[:space:]]+/) {
-          category = 2
+          category = 7
         } else {
-          category = 4
+          if (line ~ /^pub[[:space:]]+mod[[:space:]]+/) {
+            category = 1
+          } else if (line ~ /^pub\([^)]*\)[[:space:]]+mod[[:space:]]+/) {
+            category = 2
+          } else {
+            category = 3
+          }
+
+          if (compact_attributes ~ /#\[cfg\(/) category += 3
         }
 
         if (previous_category >= 0 && category != previous_category) {
@@ -412,7 +423,7 @@ while IFS= read -r file; do
 
         if (category < highest_category) {
           message = "Module `" name "` is in the wrong section; expected order: "
-          report(message "macro prelude, public, restricted, cfg-gated, private, test-only")
+          report(message module_sections)
         } else if (category > highest_category) {
           highest_category = category
         }
@@ -464,10 +475,10 @@ if [ $VIOLATIONS -gt 0 ]; then
     echo "Exceptions: first expression in a block, or line above shares an identifier with the condition"
   fi
   if [ $MODULE_ORDER_VIOLATIONS -gt 0 ]; then
-    echo -e "${YELLOW}To fix modules:${NC} Order and alphabetize sections as public, restricted, cfg-gated, private, test-only"
+    echo -e "${YELLOW}To fix modules:${NC} Order and alphabetize sections as $module_sections"
   fi
   exit 1
 fi
 
-echo "Formatting conventions are valid (Rust)"
+echo "Rust formatting conventions passed"
 exit 0

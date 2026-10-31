@@ -150,6 +150,63 @@ for control_flow in match for while loop spawn; do
   expect_failure "$control_flow_case" "Missing blank line above .${control_flow}."
 done
 
+for control_flow in if for; do
+  for continuation in first later absent; do
+    wrapped_case="$CASE_ROOT/wrapped-$control_flow-$continuation"
+    create_case "$wrapped_case"
+
+    case "$continuation" in
+      first)
+        first_body='        consume(expected);'
+        next_body='        work();'
+        ;;
+      later)
+        first_body='        work();'
+        next_body='        consume(expected);'
+        ;;
+      absent)
+        first_body='        work();'
+        next_body='        consume(unrelated);'
+        ;;
+    esac
+
+    case "$control_flow" in
+      if)
+        write_rs "$wrapped_case/crates/common/src/lib.rs" \
+          'fn check() {' \
+          '    let expected = prepare();' \
+          '    if current_start_date' \
+          '        .zip(current_end_date)' \
+          '        .is_some_and(|(start, end)| end <= start)' \
+          '    {' \
+          "$first_body" \
+          "$next_body" \
+          '    }' \
+          '}'
+        ;;
+      for)
+        write_rs "$wrapped_case/crates/common/src/lib.rs" \
+          'fn check() {' \
+          '    let expected = prepare();' \
+          '    for contract in contracts' \
+          '        .iter()' \
+          '        .filter(|contract| contract.security_type == SecurityType::Spread)' \
+          '    {' \
+          "$first_body" \
+          "$next_body" \
+          '    }' \
+          '}'
+        ;;
+    esac
+
+    if [ "$continuation" = first ]; then
+      expect_success "$wrapped_case"
+    else
+      expect_failure "$wrapped_case" "Missing blank line above .${control_flow}."
+    fi
+  done
+done
+
 valid_control_flow_case="$CASE_ROOT/allow-first-control-flow-statements"
 create_case "$valid_control_flow_case"
 write_rs "$valid_control_flow_case/crates/common/src/lib.rs" \
@@ -182,40 +239,96 @@ write_rs "$valid_control_flow_case/crates/common/src/lib.rs" \
   '}'
 expect_success "$valid_control_flow_case"
 
-valid_modules_case="$CASE_ROOT/allow-valid-module-sections"
-create_case "$valid_modules_case"
-write_rs "$valid_modules_case/crates/common/src/mod.rs" \
-  '#[macro_use]' \
-  'mod macros;' \
-  '' \
-  'pub mod alpha;' \
-  '#[path = "zeta.rs"]' \
-  'pub mod zeta;' \
-  '' \
-  'pub(crate) mod crate_api;' \
-  'pub(super) mod parent_api;' \
-  'pub(in crate::common) mod scoped_api;' \
-  '' \
-  '#[cfg(all(feature = "python", any(test, feature = "test-support")))]' \
-  'mod cfg_nested;' \
-  '#[cfg(feature = "python")]' \
-  'pub mod cfg_public;' \
-  '#[cfg(any(test, feature = "test-support"))]' \
-  'mod cfg_stubs;' \
-  '' \
-  'mod internal;' \
-  '' \
-  '#[cfg(all(test, feature = "python"))]' \
-  'mod python_tests;' \
-  '#[cfg(all(feature = "python", test))]' \
-  'mod reversed_tests;' \
-  '#[cfg(test)]' \
-  'mod tests;' \
-  '' \
-  'mod inline {' \
-  '    pub fn run() {}' \
-  '}'
-expect_success "$valid_modules_case"
+for module_file in mod.rs lib.rs component.rs; do
+  valid_modules_case="$CASE_ROOT/allow-valid-module-sections-$module_file"
+  create_case "$valid_modules_case"
+  write_rs "$valid_modules_case/crates/common/src/$module_file" \
+    '#[macro_use]' \
+    'mod macros;' \
+    '' \
+    'pub mod alpha;' \
+    '#[path = "zeta.rs"]' \
+    'pub mod zeta;' \
+    '' \
+    'pub(crate) mod crate_api;' \
+    'pub(super) mod parent_api;' \
+    'pub(in crate::common) mod scoped_api;' \
+    '' \
+    'mod internal;' \
+    '' \
+    '#[cfg(feature = "python")]' \
+    'pub mod cfg_public;' \
+    '' \
+    '#[cfg(feature = "python")]' \
+    'pub(crate) mod cfg_crate;' \
+    '#[cfg(feature = "python")]' \
+    'pub(super) mod cfg_parent;' \
+    '' \
+    '#[cfg(all(feature = "python", any(test, feature = "test-support")))]' \
+    'mod cfg_nested;' \
+    '#[cfg(any(test, feature = "test-support"))]' \
+    'mod cfg_stubs;' \
+    '' \
+    '#[cfg(all(test, feature = "python"))]' \
+    'mod python_tests;' \
+    '#[cfg(all(feature = "python", test))]' \
+    'mod reversed_tests;' \
+    '#[cfg(test)]' \
+    'mod tests;' \
+    '' \
+    'mod inline {' \
+    '    pub fn run() {}' \
+    '}'
+  expect_success "$valid_modules_case"
+
+  gated_first_case="$CASE_ROOT/reject-gated-before-unconditional-$module_file"
+  create_case "$gated_first_case"
+  write_rs "$gated_first_case/crates/common/src/$module_file" \
+    '#[cfg(feature = "python")]' \
+    'pub mod optional;' \
+    '' \
+    'mod internal;'
+  expect_failure "$gated_first_case" 'Module .*internal.* is in the wrong section'
+done
+
+for visibility in public restricted private; do
+  unconditional_case="$CASE_ROOT/reject-unconditional-after-gated-$visibility"
+  create_case "$unconditional_case"
+  case "$visibility" in
+    public) declaration='pub mod unconditional;' ;;
+    restricted) declaration='pub(crate) mod unconditional;' ;;
+    private) declaration='mod unconditional;' ;;
+  esac
+  write_rs "$unconditional_case/crates/common/src/mod.rs" \
+    '#[cfg(feature = "python")]' \
+    'mod optional;' \
+    '' \
+    "$declaration"
+  expect_failure "$unconditional_case" 'Module .*unconditional.* is in the wrong section'
+done
+
+for declaration in 'pub mod public;' 'pub(crate) mod restricted;'; do
+  gated_visibility_case="$CASE_ROOT/reject-gated-visibility-$declaration"
+  create_case "$gated_visibility_case"
+  write_rs "$gated_visibility_case/crates/common/src/mod.rs" \
+    '#[cfg(feature = "python")]' \
+    'mod internal;' \
+    '' \
+    '#[cfg(feature = "python")]' \
+    "$declaration"
+  expect_failure "$gated_visibility_case" 'Module .* is in the wrong section'
+done
+
+for declaration in 'pub mod beta;' 'pub(crate) mod beta;' 'mod beta;'; do
+  gated_alphabetical_case="$CASE_ROOT/reject-gated-alphabetical-$declaration"
+  create_case "$gated_alphabetical_case"
+  write_rs "$gated_alphabetical_case/crates/common/src/mod.rs" \
+    '#[cfg(feature = "python")]' \
+    "${declaration/beta/zeta}" \
+    '#[cfg(feature = "python")]' \
+    "$declaration"
+  expect_failure "$gated_alphabetical_case" 'Module .*beta.* is not alphabetized'
+done
 
 wrong_section_case="$CASE_ROOT/reject-module-section-order"
 create_case "$wrong_section_case"
@@ -344,6 +457,121 @@ if (cd "$scope_case" && CHANGED_BASE_SHA="$base" bash "$HOOK") > "$scope_case/ou
   exit 1
 fi
 rg -q 'crates/common/src/lib.rs:8' "$scope_case/output.txt"
+
+precommit_case="$CASE_ROOT/precommit-branch"
+create_case "$precommit_case"
+write_rs "$precommit_case/crates/common/src/lib.rs" \
+  'fn existing() {' \
+  '    prepare();' \
+  '    if ready { run(); }' \
+  '}'
+git -C "$precommit_case" commit -qm Baseline
+base=$(git -C "$precommit_case" rev-parse HEAD)
+git -C "$precommit_case" update-ref refs/remotes/origin/develop "$base"
+write_rs "$precommit_case/crates/common/src/changed.rs" \
+  'fn changed() {' \
+  '    prepare();' \
+  '    if enabled { run(); }' \
+  '}'
+git -C "$precommit_case" commit -qm Changed
+
+mkdir "$precommit_case/bin"
+cat > "$precommit_case/bin/prek" << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "${CHANGED_BASE_SHA-unset}" "$@" > "$PRECOMMIT_LOG"
+exit "${PRECOMMIT_EXIT:-0}"
+EOF
+chmod +x "$precommit_case/bin/prek"
+
+run_precommit() {
+  (
+    cd "$REPO_ROOT"
+    GIT_DIR="$precommit_case/.git" GIT_WORK_TREE="$precommit_case" \
+      PATH="$precommit_case/bin:$PATH" PRECOMMIT_LOG="$precommit_case/prek.txt" \
+      make --no-print-directory -s -o check-cargo-cooldown pre-commit
+  ) > "$precommit_case/output.txt" 2>&1
+}
+
+(CHANGED_BASE_SHA=HEAD run_precommit)
+printf '%s\n' HEAD run --all-files > "$precommit_case/expected.txt"
+cmp "$precommit_case/expected.txt" "$precommit_case/prek.txt"
+rm "$precommit_case/prek.txt"
+
+if (CHANGED_BASE_SHA='' run_precommit); then
+  echo "Expected make pre-commit to use origin/develop when CHANGED_BASE_SHA is empty"
+  exit 1
+fi
+rg -q 'crates/common/src/changed.rs:3' "$precommit_case/output.txt"
+
+for local_change in clean staged unstaged outside deleted; do
+  case "$local_change" in
+    staged)
+      write_rs "$precommit_case/crates/common/src/local.rs" 'fn local() {}'
+      ;;
+    unstaged)
+      printf '\n// Local edit\n' >> "$precommit_case/crates/common/src/local.rs"
+      ;;
+    outside)
+      write_rs "$precommit_case/tests/other.rs" 'fn other() {}'
+      ;;
+    deleted)
+      rm "$precommit_case/crates/common/src/local.rs"
+      ;;
+  esac
+
+  if (
+    unset CHANGED_BASE_SHA
+    run_precommit
+  ); then
+    echo "Expected make pre-commit to detect a committed violation with $local_change changes"
+    exit 1
+  fi
+
+  rg -q 'crates/common/src/changed.rs:3' "$precommit_case/output.txt"
+  if rg -q 'crates/common/src/lib.rs:3' "$precommit_case/output.txt" ||
+    [[ -e "$precommit_case/prek.txt" ]]; then
+    echo "Expected only branch violations and no prek invocation"
+    exit 1
+  fi
+done
+
+write_rs "$precommit_case/crates/common/src/changed.rs" \
+  'fn changed() {' \
+  '    prepare();' \
+  '' \
+  '    if enabled { run(); }' \
+  '}'
+(
+  unset CHANGED_BASE_SHA
+  run_precommit
+)
+printf '%s\n' unset run --all-files > "$precommit_case/expected.txt"
+cmp "$precommit_case/expected.txt" "$precommit_case/prek.txt"
+
+write_rs "$precommit_case/crates/common/src/lib.rs" \
+  'fn existing() {' \
+  '    prepare();' \
+  '' \
+  '    if ready { run(); }' \
+  '}'
+(CHANGED_BASE_SHA=missing-ref run_precommit)
+rg -q 'Cannot resolve CHANGED_BASE_SHA' "$precommit_case/output.txt"
+printf '%s\n' missing-ref run --all-files > "$precommit_case/expected.txt"
+cmp "$precommit_case/expected.txt" "$precommit_case/prek.txt"
+
+rm "$precommit_case/prek.txt"
+if (
+  unset CHANGED_BASE_SHA
+  PRECOMMIT_EXIT=19 run_precommit
+); then
+  echo "Expected make pre-commit to propagate a prek failure"
+  exit 1
+else
+  [[ $? -eq 2 ]]
+fi
+printf '%s\n' unset run --all-files > "$precommit_case/expected.txt"
+cmp "$precommit_case/expected.txt" "$precommit_case/prek.txt"
 
 module_scope_case="$CASE_ROOT/changed-module-boundary"
 create_case "$module_scope_case"

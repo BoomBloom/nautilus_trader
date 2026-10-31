@@ -13,8 +13,13 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+mod emitter;
+mod external_account;
 mod manager;
 mod node;
+#[path = "../common/startup.rs"]
+mod startup;
+mod stress;
+
 #[cfg(feature = "streaming")]
 mod streaming;
-mod stress;

@@ -14,8 +14,7 @@
 // -------------------------------------------------------------------------------------------------
 
 //! Integration tests for the Derive WebSocket client against an axum mock
-//! server. Mirrors the established pattern in `hyperliquid/tests/integration/websocket.rs`
-//! and reuses the SESSION_KEY_HEX / TEST_WALLET constants from
+//! server. Reuses the SESSION_KEY_HEX / TEST_WALLET constants from
 //! `derive/tests/integration/http.rs`.
 
 use std::{
@@ -28,6 +27,10 @@ use std::{
     time::Duration,
 };
 
+use alloy::{
+    primitives::{Signature, eip191_hash_message, hex},
+    signers::local::PrivateKeySigner,
+};
 use axum::{
     Router,
     extract::{
@@ -61,11 +64,13 @@ struct ServerState {
     login_frames: Arc<tokio::sync::Mutex<Vec<Value>>>,
     subscribe_frames: Arc<tokio::sync::Mutex<Vec<Value>>>,
     unsubscribe_frames: Arc<tokio::sync::Mutex<Vec<Value>>>,
+    unsubscribe_result: Arc<tokio::sync::Mutex<Option<Value>>>,
     login_result: Arc<tokio::sync::Mutex<Option<Value>>>,
     subscribe_status: Arc<tokio::sync::Mutex<Option<HashMap<String, String>>>>,
+    subscribe_result: Arc<tokio::sync::Mutex<Option<Value>>>,
     subscribe_status_after_first: Arc<tokio::sync::Mutex<Option<HashMap<String, String>>>>,
-    subscribe_with_current_subscriptions: Arc<tokio::sync::Mutex<bool>>,
-    reject_login: Arc<tokio::sync::Mutex<bool>>,
+    login_error: Arc<tokio::sync::Mutex<Option<(i64, String)>>>,
+    login_error_after_first: Arc<tokio::sync::Mutex<Option<(i64, String)>>>,
     reject_subscribe: Arc<tokio::sync::Mutex<bool>>,
     login_failures_after_first: Arc<AtomicUsize>,
     subscribe_failures_after_first: Arc<AtomicUsize>,
@@ -75,6 +80,8 @@ struct ServerState {
     disconnect_recovery_subscribes: Arc<AtomicUsize>,
     disconnect_before_private_reply: Arc<AtomicBool>,
     private_frames: Arc<tokio::sync::Mutex<Vec<Value>>>,
+    cancel_on_disconnect_reply: Arc<tokio::sync::Mutex<Option<Value>>>,
+    cancel_on_disconnect_no_reply: Arc<AtomicBool>,
     push_notification_on_subscribe: Arc<tokio::sync::Mutex<Option<Value>>>,
     push_notification_after_first: Arc<AtomicBool>,
 }
@@ -111,218 +118,9 @@ async fn handle_socket(mut socket: WebSocket, state: ServerState) {
                 let Ok(payload) = serde_json::from_str::<Value>(&text) else {
                     continue;
                 };
-                let id = payload.get("id").and_then(Value::as_u64).unwrap_or(0);
-                let method = payload
-                    .get("method")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
 
-                match method.as_str() {
-                    "public/login" => {
-                        let login_count = {
-                            let mut frames = state.login_frames.lock().await;
-                            frames.push(payload.clone());
-                            frames.len()
-                        };
-                        let reject_reconnect = login_count > 1
-                            && state
-                                .login_failures_after_first
-                                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                                    remaining.checked_sub(1)
-                                })
-                                .is_ok();
-                        let reject = *state.reject_login.lock().await || reject_reconnect;
-                        let reply = if reject {
-                            json!({"id": id, "error": {"code": -32602, "message": "bad signature"}})
-                        } else {
-                            let result = state
-                                .login_result
-                                .lock()
-                                .await
-                                .clone()
-                                .unwrap_or_else(|| json!({"success": true}));
-                            json!({"id": id, "result": result})
-                        };
-
-                        if socket
-                            .send(Message::Text(reply.to_string().into()))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    "subscribe" => {
-                        let subscribe_count = {
-                            let mut frames = state.subscribe_frames.lock().await;
-                            frames.push(payload.clone());
-                            frames.len()
-                        };
-                        let reject_reconnect = subscribe_count > 1
-                            && state
-                                .subscribe_failures_after_first
-                                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                                    remaining.checked_sub(1)
-                                })
-                                .is_ok();
-                        let reject = *state.reject_subscribe.lock().await || reject_reconnect;
-                        let timeout_reconnect = subscribe_count > 1
-                            && state
-                                .subscribe_timeouts_after_first
-                                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                                    remaining.checked_sub(1)
-                                })
-                                .is_ok();
-
-                        if timeout_reconnect {
-                            continue;
-                        }
-                        let disconnect_recovery = subscribe_count > 1
-                            && state
-                                .disconnect_recovery_subscribes
-                                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                                    remaining.checked_sub(1)
-                                })
-                                .is_ok();
-
-                        if disconnect_recovery {
-                            let _ = socket.send(Message::Close(None)).await;
-                            break;
-                        }
-                        let reply = if reject {
-                            json!({"id": id, "error": {"code": -32603, "message": "subscribe denied"}})
-                        } else {
-                            let channels = payload
-                                .get("params")
-                                .and_then(|p| p.get("channels"))
-                                .cloned()
-                                .unwrap_or_else(|| json!([]));
-
-                            let reconnect_status = if subscribe_count > 1 {
-                                state.subscribe_status_after_first.lock().await.clone()
-                            } else {
-                                None
-                            };
-                            let status = match reconnect_status {
-                                Some(status) => Some(status),
-                                None => state.subscribe_status.lock().await.clone(),
-                            };
-
-                            if let Some(status) = status {
-                                let current_subscriptions = channels
-                                    .as_array()
-                                    .into_iter()
-                                    .flatten()
-                                    .filter(|channel| {
-                                        channel
-                                            .as_str()
-                                            .and_then(|channel| status.get(channel))
-                                            .is_some_and(|status| status == "ok")
-                                    })
-                                    .cloned()
-                                    .collect::<Vec<_>>();
-                                json!({
-                                    "id": id,
-                                    "result": {
-                                        "current_subscriptions": current_subscriptions,
-                                        "status": status,
-                                    },
-                                })
-                            } else if *state.subscribe_with_current_subscriptions.lock().await {
-                                let mut status = serde_json::Map::new();
-
-                                if let Some(channels) = channels.as_array() {
-                                    for channel in channels {
-                                        if let Some(channel) = channel.as_str() {
-                                            status.insert(channel.to_string(), json!("ok"));
-                                        }
-                                    }
-                                }
-                                json!({
-                                    "id": id,
-                                    "result": {
-                                        "current_subscriptions": channels,
-                                        "status": status,
-                                    },
-                                })
-                            } else {
-                                json!({"id": id, "result": {"channels": channels}})
-                            }
-                        };
-
-                        if socket
-                            .send(Message::Text(reply.to_string().into()))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-
-                        if !reject
-                            && (!state.push_notification_after_first.load(Ordering::SeqCst)
-                                || subscribe_count > 1)
-                            && let Some(notification) =
-                                state.push_notification_on_subscribe.lock().await.clone()
-                            && socket
-                                .send(Message::Text(notification.to_string().into()))
-                                .await
-                                .is_err()
-                        {
-                            break;
-                        }
-
-                        let disconnect_after_response = state
-                            .disconnect_after_subscribe_responses
-                            .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                                remaining.checked_sub(1)
-                            })
-                            .is_ok();
-
-                        if disconnect_after_response
-                            || state
-                                .disconnect_after_subscribe
-                                .swap(false, Ordering::SeqCst)
-                        {
-                            let _ = socket.send(Message::Close(None)).await;
-                            break;
-                        }
-                    }
-                    "unsubscribe" => {
-                        state.unsubscribe_frames.lock().await.push(payload.clone());
-                        let reply = json!({"id": id, "result": {"success": true}});
-                        if socket
-                            .send(Message::Text(reply.to_string().into()))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    "private/cancel_all" | "private/cancel_by_instrument" => {
-                        state.private_frames.lock().await.push(payload);
-                        if state
-                            .disconnect_before_private_reply
-                            .swap(false, Ordering::SeqCst)
-                        {
-                            let _ = socket.send(Message::Close(None)).await;
-                            break;
-                        }
-                        let result = if method == "private/cancel_by_instrument" {
-                            json!({"cancelled_orders": 0})
-                        } else {
-                            json!({})
-                        };
-                        let reply = json!({"id": id, "result": result});
-                        if socket
-                            .send(Message::Text(reply.to_string().into()))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    _ => {}
+                if !reply_request(&mut socket, &state, payload).await {
+                    break;
                 }
             }
             Message::Close(_) => break,
@@ -333,9 +131,333 @@ async fn handle_socket(mut socket: WebSocket, state: ServerState) {
     state.connection_count.fetch_sub(1, Ordering::SeqCst);
 }
 
+async fn reply_request(socket: &mut WebSocket, state: &ServerState, payload: Value) -> bool {
+    let id = payload.get("id").and_then(Value::as_u64).unwrap_or(0);
+    match payload.get("method").and_then(Value::as_str).unwrap_or("") {
+        "public/login" => reply_login(socket, state, &payload, id).await,
+        "subscribe" => reply_subscribe(socket, state, &payload, id).await,
+        "unsubscribe" => reply_unsubscribe(socket, state, &payload, id).await,
+        method @ ("private/cancel_all"
+        | "private/cancel_by_instrument"
+        | "private/set_cancel_on_disconnect") => {
+            reply_private(socket, state, &payload, id, method).await
+        }
+        _ => true,
+    }
+}
+
+async fn reply_login(
+    socket: &mut WebSocket,
+    state: &ServerState,
+    payload: &Value,
+    id: u64,
+) -> bool {
+    let login_count = {
+        let mut frames = state.login_frames.lock().await;
+        frames.push(payload.clone());
+        frames.len()
+    };
+
+    let reject_reconnect = login_count > 1
+        && state
+            .login_failures_after_first
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok();
+
+    let reconnect_error = if login_count > 1 {
+        state.login_error_after_first.lock().await.clone()
+    } else {
+        None
+    };
+
+    let error = state
+        .login_error
+        .lock()
+        .await
+        .clone()
+        .or(reconnect_error)
+        .or_else(|| reject_reconnect.then(|| (9002, "Backend unavailable".to_string())));
+
+    let reply = if let Some((code, message)) = error {
+        json!({"id": id, "error": {"code": code, "message": message}})
+    } else {
+        let result = state
+            .login_result
+            .lock()
+            .await
+            .clone()
+            .unwrap_or_else(|| json!([30769]));
+        json!({"id": id, "result": result})
+    };
+
+    if socket
+        .send(Message::Text(reply.to_string().into()))
+        .await
+        .is_err()
+    {
+        return false;
+    }
+
+    true
+}
+
+async fn reply_subscribe(
+    socket: &mut WebSocket,
+    state: &ServerState,
+    payload: &Value,
+    id: u64,
+) -> bool {
+    let subscribe_count = {
+        let mut frames = state.subscribe_frames.lock().await;
+        frames.push(payload.clone());
+        frames.len()
+    };
+
+    let reject_reconnect = subscribe_count > 1
+        && state
+            .subscribe_failures_after_first
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok();
+
+    let reject = *state.reject_subscribe.lock().await || reject_reconnect;
+
+    let timeout_reconnect = subscribe_count > 1
+        && state
+            .subscribe_timeouts_after_first
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok();
+
+    if timeout_reconnect {
+        return true;
+    }
+
+    let disconnect_recovery = subscribe_count > 1
+        && state
+            .disconnect_recovery_subscribes
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok();
+
+    if disconnect_recovery {
+        let _ = socket.send(Message::Close(None)).await;
+        return false;
+    }
+
+    let reply = subscription_reply(state, payload, id, reject, subscribe_count > 1).await;
+
+    if socket
+        .send(Message::Text(reply.to_string().into()))
+        .await
+        .is_err()
+    {
+        return false;
+    }
+
+    if !reject
+        && (!state.push_notification_after_first.load(Ordering::SeqCst) || subscribe_count > 1)
+        && let Some(notification) = state.push_notification_on_subscribe.lock().await.clone()
+        && socket
+            .send(Message::Text(notification.to_string().into()))
+            .await
+            .is_err()
+    {
+        return false;
+    }
+
+    let disconnect_after_response = state
+        .disconnect_after_subscribe_responses
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+            remaining.checked_sub(1)
+        })
+        .is_ok();
+
+    if disconnect_after_response
+        || state
+            .disconnect_after_subscribe
+            .swap(false, Ordering::SeqCst)
+    {
+        let _ = socket.send(Message::Close(None)).await;
+        return false;
+    }
+
+    true
+}
+
+async fn reply_unsubscribe(
+    socket: &mut WebSocket,
+    state: &ServerState,
+    payload: &Value,
+    id: u64,
+) -> bool {
+    state.unsubscribe_frames.lock().await.push(payload.clone());
+    let result = state
+        .unsubscribe_result
+        .lock()
+        .await
+        .clone()
+        .unwrap_or_else(|| {
+            let status: serde_json::Map<String, Value> = payload["params"]["channels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|channel| (channel.as_str().unwrap().to_string(), json!("ok")))
+                .collect();
+            json!({"status": status, "remaining_subscriptions": []})
+        });
+
+    let reply = json!({"id": id, "result": result});
+
+    if socket
+        .send(Message::Text(reply.to_string().into()))
+        .await
+        .is_err()
+    {
+        return false;
+    }
+
+    true
+}
+
+async fn reply_private(
+    socket: &mut WebSocket,
+    state: &ServerState,
+    payload: &Value,
+    id: u64,
+    method: &str,
+) -> bool {
+    state.private_frames.lock().await.push(payload.clone());
+    if state
+        .disconnect_before_private_reply
+        .swap(false, Ordering::SeqCst)
+    {
+        let _ = socket.send(Message::Close(None)).await;
+        return false;
+    }
+
+    if method == "private/set_cancel_on_disconnect" {
+        if state.cancel_on_disconnect_no_reply.load(Ordering::SeqCst) {
+            return true;
+        }
+
+        let mut reply = state
+            .cancel_on_disconnect_reply
+            .lock()
+            .await
+            .clone()
+            .unwrap_or_else(|| {
+                serde_json::from_str(include_str!(
+                    "../../test_data/common/cancel_on_disconnect_ok_response.json"
+                ))
+                .unwrap()
+            });
+
+        reply["id"] = json!(id);
+        return socket
+            .send(Message::Text(reply.to_string().into()))
+            .await
+            .is_ok();
+    }
+
+    let result = if method == "private/cancel_by_instrument" {
+        json!({"cancelled_orders": 0})
+    } else {
+        json!({})
+    };
+
+    let reply = json!({"id": id, "result": result});
+
+    if socket
+        .send(Message::Text(reply.to_string().into()))
+        .await
+        .is_err()
+    {
+        return false;
+    }
+
+    true
+}
+
+async fn subscription_reply(
+    state: &ServerState,
+    payload: &Value,
+    id: u64,
+    reject: bool,
+    reconnect: bool,
+) -> Value {
+    if reject {
+        json!({"id": id, "error": {"code": -32603, "message": "subscribe denied"}})
+    } else {
+        let channels = payload
+            .get("params")
+            .and_then(|p| p.get("channels"))
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+
+        let reconnect_status = if reconnect {
+            state.subscribe_status_after_first.lock().await.clone()
+        } else {
+            None
+        };
+
+        let status = match reconnect_status {
+            Some(status) => Some(status),
+            None => state.subscribe_status.lock().await.clone(),
+        };
+
+        if let Some(result) = state.subscribe_result.lock().await.clone() {
+            json!({"id": id, "result": result})
+        } else if let Some(status) = status {
+            let current_subscriptions = channels
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|channel| {
+                    channel
+                        .as_str()
+                        .and_then(|channel| status.get(channel))
+                        .is_some_and(|status| {
+                            matches!(status.as_str(), "ok" | "already subscribed")
+                        })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+
+            json!({
+                "id": id,
+                "result": {
+                    "current_subscriptions": current_subscriptions,
+                    "status": status,
+                },
+            })
+        } else {
+            let status: serde_json::Map<String, Value> = channels
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(|channel| (channel.to_string(), json!("ok")))
+                .collect();
+            json!({
+                "id": id,
+                "result": {
+                    "current_subscriptions": channels,
+                    "status": status,
+                },
+            })
+        }
+    }
+}
+
 async fn start_server(state: ServerState) -> SocketAddr {
     let router = Router::new()
-        .route("/ws", get(handle_upgrade))
+        .route("/v3/ws", get(handle_upgrade))
         .route("/health", get(|| async { StatusCode::OK }))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -343,6 +465,7 @@ async fn start_server(state: ServerState) -> SocketAddr {
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
+
     wait_for_http_health(addr).await;
     addr
 }
@@ -362,7 +485,7 @@ async fn wait_for_http_health(addr: SocketAddr) {
 }
 
 fn ws_url(addr: SocketAddr) -> String {
-    format!("ws://{addr}/ws")
+    format!("ws://{addr}/v3/ws")
 }
 
 fn test_credentials() -> DeriveWsCredentials {
@@ -430,21 +553,33 @@ async fn test_connect_with_credentials_completes_login() {
     let signature = params["signature"].as_str().expect("signature is string");
     assert!(signature.starts_with("0x"));
     assert_eq!(signature.len(), 2 + 130, "signature is 65-byte hex");
-    let timestamp: u64 = params["timestamp"]
-        .as_str()
-        .expect("timestamp string")
-        .parse()
-        .expect("timestamp parses");
+    let timestamp = params["timestamp"].as_str().expect("timestamp string");
+    let signer: PrivateKeySigner = SESSION_KEY_HEX.parse().unwrap();
+    let signature = Signature::try_from(
+        hex::decode(signature.trim_start_matches("0x"))
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap();
+    assert_eq!(
+        signature
+            .recover_address_from_prehash(&eip191_hash_message(timestamp.as_bytes()))
+            .unwrap(),
+        signer.address()
+    );
+    let timestamp: u64 = timestamp.parse().expect("timestamp parses");
     assert!(timestamp > 1_700_000_000_000);
 
     client.disconnect().await.unwrap();
 }
 
 #[rstest]
+#[case(vec![])]
+#[case(vec![30769, 42])]
 #[tokio::test]
-async fn test_connect_accepts_venue_array_login_result() {
+async fn test_connect_accepts_venue_array_login_result(#[case] subaccounts: Vec<u64>) {
     let state = ServerState::new();
-    *state.login_result.lock().await = Some(json!([30769]));
+    *state.login_result.lock().await = Some(json!(subaccounts));
     let addr = start_server(state).await;
 
     let mut client = DeriveWebSocketClient::with_credentials(
@@ -466,10 +601,14 @@ async fn test_connect_accepts_venue_array_login_result() {
 }
 
 #[rstest]
+#[case(json!({"success": false}))]
+#[case(json!({"success": true}))]
+#[case(Value::Null)]
+#[case(json!(["30769"]))]
 #[tokio::test]
-async fn test_connect_rejects_unsuccessful_login_result() {
+async fn test_connect_rejects_invalid_login_result(#[case] result: Value) {
     let state = ServerState::new();
-    *state.login_result.lock().await = Some(json!({"success": false}));
+    *state.login_result.lock().await = Some(result);
     let addr = start_server(state).await;
 
     let mut client = DeriveWebSocketClient::with_credentials(
@@ -484,7 +623,7 @@ async fn test_connect_rejects_unsuccessful_login_result() {
     let error = client
         .connect()
         .await
-        .expect_err("unsuccessful login result must reject connect");
+        .expect_err("invalid login result must reject connect");
 
     assert!(matches!(error, DeriveWsError::Authentication { .. }));
     assert!(!client.is_active());
@@ -492,10 +631,16 @@ async fn test_connect_rejects_unsuccessful_login_result() {
 }
 
 #[rstest]
+#[case(14014, "invalid_signature")]
+#[case(14026, "session_key_not_found")]
+#[case(14030, "session_key_expired")]
 #[tokio::test]
-async fn test_connect_with_login_rejection_tears_down_transport() {
+async fn test_connect_with_login_rejection_tears_down_transport(
+    #[case] expected_code: i64,
+    #[case] message: &str,
+) {
     let state = ServerState::new();
-    *state.reject_login.lock().await = true;
+    *state.login_error.lock().await = Some((expected_code, message.to_string()));
     let addr = start_server(state.clone()).await;
 
     let mut client = DeriveWebSocketClient::with_credentials(
@@ -509,15 +654,16 @@ async fn test_connect_with_login_rejection_tears_down_transport() {
     );
     let err = client.connect().await.expect_err("login must reject");
     match err {
-        DeriveWsError::JsonRpc { code, .. } => assert_eq!(code, -32602),
-        other => panic!("expected JsonRpc(-32602), was {other:?}"),
+        DeriveWsError::JsonRpc { code, .. } => assert_eq!(code, expected_code),
+        other => panic!("expected JsonRpc({expected_code}), was {other:?}"),
     }
+
     wait_for_inactive(&client, Duration::from_secs(2)).await;
     assert!(!client.is_active(), "transport must be torn down");
     assert!(!client.is_authenticated());
 
     // Retry must rebuild from a clean slate.
-    *state.reject_login.lock().await = false;
+    *state.login_error.lock().await = None;
     client.connect().await.expect("retry connect");
     wait_for_active(&client, Duration::from_secs(2)).await;
     assert!(client.is_authenticated());
@@ -602,7 +748,6 @@ async fn test_subscribe_ticker_sends_jsonrpc_subscribe_and_tracks_channel() {
 #[tokio::test]
 async fn test_subscribe_accepts_current_subscriptions_ack_and_tracks_channel() {
     let state = ServerState::new();
-    *state.subscribe_with_current_subscriptions.lock().await = true;
     let addr = start_server(state.clone()).await;
 
     let mut client = DeriveWebSocketClient::new(
@@ -693,6 +838,63 @@ async fn test_subscribe_trades_sends_jsonrpc_subscribe_and_tracks_channel() {
 }
 
 #[rstest]
+#[case("missing-topic-status")]
+#[case("missing-status")]
+#[case("not-subscribed")]
+#[tokio::test]
+async fn test_subscribe_requires_successful_topic_acknowledgement(
+    #[case] failure: &str,
+    #[values(true, false)] bulk: bool,
+) {
+    let state = ServerState::new();
+    let topic = "ticker_slim.ETH-PERP.1000";
+    *state.subscribe_result.lock().await = Some(match failure {
+        "missing-topic-status" => json!({"status": {}, "current_subscriptions": [topic]}),
+        "missing-status" => json!({"current_subscriptions": [topic]}),
+        "not-subscribed" => json!({"status": {topic: "ok"}, "current_subscriptions": []}),
+        _ => unreachable!(),
+    });
+
+    let addr = start_server(state.clone()).await;
+
+    let mut client = DeriveWebSocketClient::new(
+        Some(ws_url(addr)),
+        DeriveEnvironment::Mainnet,
+        TransportBackend::default(),
+        None,
+    );
+    client.connect().await.unwrap();
+    wait_for_active(&client, Duration::from_secs(2)).await;
+    let result = if bulk {
+        client
+            .subscribe_channels(vec![DeriveWsChannel::ticker_slim("ETH-PERP", "1000")])
+            .await
+    } else {
+        client.subscribe_ticker("ETH-PERP", "1000").await
+    };
+
+    client.disconnect().await.unwrap();
+    let error = result.expect_err("missing or contradictory acknowledgement must fail");
+
+    match failure {
+        "missing-status" => assert!(matches!(error, DeriveWsError::Serde(_))),
+        "missing-topic-status" => assert!(
+            matches!(error, DeriveWsError::Subscription { details } if details == format!("{topic}: missing channel status"))
+        ),
+        "not-subscribed" => assert!(
+            matches!(error, DeriveWsError::Subscription { details } if details == format!("{topic}: not subscribed"))
+        ),
+        _ => unreachable!(),
+    }
+
+    assert_eq!(client.subscription_count(), 0);
+    let captured = state.captured_subscribes().await;
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0]["method"], "subscribe");
+    assert_eq!(captured[0]["params"], json!({"channels": [topic]}));
+}
+
+#[rstest]
 #[tokio::test]
 async fn test_subscribe_failure_does_not_track_channel() {
     let state = ServerState::new();
@@ -717,6 +919,7 @@ async fn test_subscribe_failure_does_not_track_channel() {
         DeriveWsError::JsonRpc { code, .. } => assert_eq!(code, -32603),
         other => panic!("expected JsonRpc(-32603), was {other:?}"),
     }
+
     assert_eq!(
         client.subscription_count(),
         0,
@@ -886,6 +1089,53 @@ async fn test_disconnect_resets_state_and_allows_reconnect() {
 }
 
 #[rstest]
+#[case(14026, "session_key_not_found")]
+#[case(14030, "session_key_expired")]
+#[case(-32602, "bad signature")]
+#[tokio::test]
+async fn test_reconnect_does_not_retry_terminal_login_error(
+    #[case] code: i64,
+    #[case] message: &str,
+) {
+    let state = ServerState::new();
+    *state.login_error_after_first.lock().await = Some((code, message.to_string()));
+    state
+        .disconnect_after_subscribe
+        .store(true, Ordering::SeqCst);
+    let addr = start_server(state.clone()).await;
+    let mut client = DeriveWebSocketClient::with_credentials(
+        Some(ws_url(addr)),
+        DeriveEnvironment::Mainnet,
+        TransportBackend::default(),
+        None,
+        test_credentials(),
+        None,
+        None,
+    );
+    client.connect().await.unwrap();
+    client.subscribe_ticker("ETH-PERP", "1000").await.unwrap();
+
+    let reason = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match client.next_event().await {
+                Some(DeriveWsMessage::SessionRecoveryFailed(reason)) => break reason,
+                Some(_) => {}
+                None => panic!("recovery must surface its terminal failure"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    wait_for_inactive(&client, Duration::from_secs(2)).await;
+    assert_eq!(reason, format!("JSON-RPC error {code}: {message}"));
+    assert_eq!(state.login_frames.lock().await.len(), 2);
+    assert_eq!(state.subscribe_frames.lock().await.len(), 1);
+    assert!(!client.is_active());
+    assert!(!client.is_authenticated());
+}
+
+#[rstest]
 #[tokio::test]
 async fn test_reconnect_retries_login_before_signaling_reconnected() {
     let state = ServerState::new();
@@ -919,6 +1169,7 @@ async fn test_reconnect_retries_login_before_signaling_reconnected() {
         Duration::from_secs(5),
     )
     .await;
+
     assert!(!client.is_authenticated());
 
     let recovered = tokio::time::timeout(Duration::from_secs(5), async {
@@ -986,6 +1237,73 @@ async fn test_reconnect_restores_public_session_without_credentials() {
     assert_eq!(data["instrument_name"], "ETH-PERP");
     assert_eq!(data["mark_price"], "3500.5");
 
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_reconnect_replays_pending_and_confirmed_subscribe_intent_in_order() {
+    let state = ServerState::new();
+    *state.subscribe_status.lock().await = Some(HashMap::from([
+        ("ticker_slim.ETH-PERP.1000".to_string(), "ok".to_string()),
+        (
+            "ticker_slim.BTC-PERP.1000".to_string(),
+            "denied".to_string(),
+        ),
+    ]));
+    *state.subscribe_status_after_first.lock().await = Some(HashMap::from([
+        ("ticker_slim.ETH-PERP.1000".to_string(), "ok".to_string()),
+        ("ticker_slim.BTC-PERP.1000".to_string(), "ok".to_string()),
+    ]));
+    state
+        .disconnect_after_subscribe
+        .store(true, Ordering::SeqCst);
+    let addr = start_server(state.clone()).await;
+
+    let mut client = DeriveWebSocketClient::new(
+        Some(ws_url(addr)),
+        DeriveEnvironment::Mainnet,
+        TransportBackend::default(),
+        None,
+    );
+    client.connect().await.unwrap();
+    let error = client
+        .subscribe_channels(vec![
+            DeriveWsChannel::ticker_slim("ETH-PERP", "1000"),
+            DeriveWsChannel::ticker_slim("BTC-PERP", "1000"),
+        ])
+        .await
+        .unwrap_err();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match client.next_event().await {
+                Some(DeriveWsMessage::Reconnected) => break,
+                Some(DeriveWsMessage::SessionRecoveryFailed(reason)) => {
+                    panic!("pending intent recovery failed: {reason}")
+                }
+                Some(_) => {}
+                None => panic!("event stream closed before recovery completed"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        matches!(error, DeriveWsError::Subscription { details } if details == "ticker_slim.BTC-PERP.1000: denied")
+    );
+    assert!(client.is_active());
+    assert_eq!(client.subscription_count(), 2);
+    let frames = state.captured_subscribes().await;
+    assert_eq!(frames.len(), 2);
+    assert_eq!(
+        frames[0]["params"]["channels"],
+        json!(["ticker_slim.ETH-PERP.1000", "ticker_slim.BTC-PERP.1000"])
+    );
+    assert_eq!(
+        frames[1]["params"]["channels"],
+        json!(["ticker_slim.BTC-PERP.1000", "ticker_slim.ETH-PERP.1000"])
+    );
     client.disconnect().await.unwrap();
 }
 
@@ -1073,12 +1391,13 @@ async fn test_reconnect_surfaces_exhausted_login_retries_and_closes_transport() 
     })
     .await
     .expect("recovery failure timed out");
+
     let error = execution
         .cancel_all_orders(&DeriveCancelAllParams::new(30769))
         .await
         .expect_err("private request must fail after exhausted re-login");
 
-    assert!(reason.contains("bad signature"));
+    assert!(reason.contains("Backend unavailable"));
     assert!(matches!(error, DeriveWsError::Authentication { .. }));
     assert_eq!(state.login_frames.lock().await.len(), 4);
     wait_for_inactive(&client, Duration::from_secs(2)).await;
@@ -1132,6 +1451,7 @@ async fn test_reconnect_retries_complete_session_after_subscription_failure() {
         Duration::from_secs(5),
     )
     .await;
+
     assert!(!client.is_authenticated());
 
     let pending_private = tokio::spawn(async move {
@@ -1139,6 +1459,7 @@ async fn test_reconnect_retries_complete_session_after_subscription_failure() {
             .cancel_all_orders(&DeriveCancelAllParams::new(30769))
             .await
     });
+
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
         !pending_private.is_finished(),
@@ -1250,6 +1571,7 @@ async fn test_reconnect_retries_session_after_second_connection_loss() {
     })
     .await
     .expect("second-loss recovery timed out");
+
     execution
         .cancel_all_orders(&DeriveCancelAllParams::new(30769))
         .await
@@ -1304,6 +1626,7 @@ async fn test_reconnect_recovers_loss_after_replay_ack() {
     })
     .await
     .expect("post-ack connection loss was not recovered");
+
     execution
         .cancel_all_orders(&DeriveCancelAllParams::new(30769))
         .await
@@ -1355,10 +1678,12 @@ async fn test_reconnect_does_not_replay_acknowledged_unsubscribe() {
         Duration::from_secs(5),
     )
     .await;
+
     let unsubscribe = {
         let pending = async move { subscriptions.unsubscribe_ticker("ETH-PERP", "1000").await };
         tokio::spawn(pending)
     };
+
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(
         !unsubscribe.is_finished(),
@@ -1376,6 +1701,7 @@ async fn test_reconnect_does_not_replay_acknowledged_unsubscribe() {
     })
     .await
     .expect("unsubscribe recovery timed out");
+
     unsubscribe
         .await
         .expect("unsubscribe task failed")
@@ -1425,6 +1751,7 @@ async fn test_subscribe_waits_for_recovery_after_second_connection_loss() {
         Duration::from_secs(5),
     )
     .await;
+
     state
         .disconnect_after_subscribe
         .store(true, Ordering::SeqCst);
@@ -1563,6 +1890,7 @@ async fn test_reconnect_surfaces_exhausted_subscription_retries() {
     })
     .await
     .expect("recovery failure timed out");
+
     let error = execution
         .cancel_all_orders(&DeriveCancelAllParams::new(30769))
         .await
@@ -1575,6 +1903,64 @@ async fn test_reconnect_surfaces_exhausted_subscription_retries() {
     wait_for_inactive(&client, Duration::from_secs(2)).await;
     assert!(!client.is_active());
     assert!(!client.is_authenticated());
+}
+
+#[rstest]
+#[case("rejected")]
+#[case("missing")]
+#[case("still-subscribed")]
+#[tokio::test]
+async fn test_unsubscribe_checks_topic_acknowledgement(
+    #[case] failure: &str,
+    #[values(true, false)] bulk: bool,
+) {
+    let state = ServerState::new();
+    let topic = "ticker_slim.ETH-PERP.1000";
+    *state.unsubscribe_result.lock().await = Some(match failure {
+        "rejected" => json!({"status": {topic: "denied"}, "remaining_subscriptions": [topic]}),
+        "missing" => json!({"status": {}, "remaining_subscriptions": []}),
+        "still-subscribed" => json!({"status": {topic: "ok"}, "remaining_subscriptions": [topic]}),
+        _ => unreachable!(),
+    });
+
+    let addr = start_server(state.clone()).await;
+
+    let mut client = DeriveWebSocketClient::new(
+        Some(ws_url(addr)),
+        DeriveEnvironment::Mainnet,
+        TransportBackend::default(),
+        None,
+    );
+    client.connect().await.unwrap();
+    wait_for_active(&client, Duration::from_secs(2)).await;
+    client.subscribe_ticker("ETH-PERP", "1000").await.unwrap();
+    let error = if bulk {
+        client
+            .unsubscribe_channels(vec![DeriveWsChannel::ticker_slim("ETH-PERP", "1000")])
+            .await
+            .unwrap_err()
+    } else {
+        client
+            .unsubscribe_ticker("ETH-PERP", "1000")
+            .await
+            .unwrap_err()
+    };
+
+    let detail = match failure {
+        "rejected" => "denied",
+        "missing" => "missing channel status",
+        "still-subscribed" => "still subscribed",
+        _ => unreachable!(),
+    };
+
+    assert!(
+        matches!(&error, DeriveWsError::Subscription { details } if details == &format!("{topic}: {detail}"))
+    );
+    let captured = state.captured_unsubscribes().await;
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0]["method"], "unsubscribe");
+    assert_eq!(captured[0]["params"], json!({"channels": [topic]}));
+    client.disconnect().await.unwrap();
 }
 
 #[rstest]
@@ -1686,4 +2072,214 @@ async fn test_unsubscribe_trades_removes_from_tracked_set() {
     assert_eq!(frames[0]["params"]["channels"][0], "trades.perp.ETH");
 
     client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[case::enable(true, include_str!("../../test_data/common/cancel_on_disconnect_enable_params.json"))]
+#[case::disable(false, include_str!("../../test_data/common/cancel_on_disconnect_disable_params.json"))]
+#[tokio::test]
+async fn test_cancel_on_disconnect_explicit_request(#[case] enabled: bool, #[case] fixture: &str) {
+    let state = ServerState::new();
+    let addr = start_server(state.clone()).await;
+    let mut client = DeriveWebSocketClient::with_credentials(
+        Some(ws_url(addr)),
+        DeriveEnvironment::Mainnet,
+        TransportBackend::default(),
+        None,
+        test_credentials(),
+        None,
+        None,
+    );
+    client.connect().await.unwrap();
+    assert!(state.private_frames.lock().await.is_empty());
+
+    client.set_cancel_on_disconnect(enabled).await.unwrap();
+    client.disconnect().await.unwrap();
+
+    let frames = state.private_frames.lock().await;
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0]["jsonrpc"], "2.0");
+    assert_eq!(frames[0]["method"], "private/set_cancel_on_disconnect");
+    assert_eq!(
+        frames[0]["params"],
+        serde_json::from_str::<Value>(fixture).unwrap()
+    );
+}
+
+#[rstest]
+#[case::scope_error(include_str!("../../test_data/common/cancel_on_disconnect_scope_error_response.json"), true)]
+#[case::null_result(include_str!("../../test_data/common/cancel_on_disconnect_invalid_response.json"), false)]
+#[case::unknown_result(include_str!("../../test_data/common/cancel_on_disconnect_unknown_response.json"), false)]
+#[case::object_result(include_str!("../../test_data/common/cancel_on_disconnect_object_response.json"), false)]
+#[tokio::test]
+async fn test_cancel_on_disconnect_rejects_failed_response(
+    #[case] fixture: &str,
+    #[case] scope_error: bool,
+) {
+    let state = ServerState::new();
+    *state.cancel_on_disconnect_reply.lock().await = Some(serde_json::from_str(fixture).unwrap());
+    let addr = start_server(state.clone()).await;
+    let mut client = DeriveWebSocketClient::with_credentials(
+        Some(ws_url(addr)),
+        DeriveEnvironment::Mainnet,
+        TransportBackend::default(),
+        None,
+        test_credentials(),
+        None,
+        None,
+    );
+    client.connect().await.unwrap();
+    let error = client.set_cancel_on_disconnect(true).await.unwrap_err();
+    client.disconnect().await.unwrap();
+
+    if scope_error {
+        let DeriveWsError::JsonRpc {
+            code,
+            message,
+            data,
+        } = error
+        else {
+            panic!("expected JSON-RPC error")
+        };
+
+        assert_eq!(code, -32602);
+        assert_eq!(message, "Trade(All) scope required");
+        assert_eq!(data, Some(json!({"scope": "Trade(All)"})));
+    } else {
+        assert!(matches!(error, DeriveWsError::Serde(_)));
+    }
+
+    assert_eq!(state.private_frames.lock().await.len(), 1);
+}
+
+#[rstest]
+#[case::timeout(false)]
+#[case::connection_loss(true)]
+#[tokio::test]
+async fn test_cancel_on_disconnect_lost_response_is_not_replayed(#[case] connection_loss: bool) {
+    let state = ServerState::new();
+    state
+        .disconnect_before_private_reply
+        .store(connection_loss, Ordering::SeqCst);
+    state
+        .cancel_on_disconnect_no_reply
+        .store(!connection_loss, Ordering::SeqCst);
+    let addr = start_server(state.clone()).await;
+    let mut client = DeriveWebSocketClient::with_credentials(
+        Some(ws_url(addr)),
+        DeriveEnvironment::Mainnet,
+        TransportBackend::default(),
+        None,
+        test_credentials(),
+        None,
+        None,
+    );
+    client.set_request_timeout(if connection_loss {
+        Duration::from_secs(5)
+    } else {
+        Duration::from_millis(200)
+    });
+
+    client.connect().await.unwrap();
+    let error = client.set_cancel_on_disconnect(true).await.unwrap_err();
+
+    if connection_loss {
+        assert!(
+            matches!(error, DeriveWsError::Transport(ref reason) if reason == "WebSocket reconnected before response was received"),
+            "{error:?}",
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = client.next_event().await {
+                if matches!(event, DeriveWsMessage::Reconnected) {
+                    return;
+                }
+            }
+
+            panic!("stream ended before recovery");
+        })
+        .await
+        .unwrap();
+    } else {
+        assert!(
+            matches!(error, DeriveWsError::Timeout { ref method } if method == "private/set_cancel_on_disconnect")
+        );
+    }
+
+    client.disconnect().await.unwrap();
+    assert_eq!(state.private_frames.lock().await.len(), 1);
+}
+
+#[rstest]
+#[case::default(None)]
+#[case::enabled(Some(true))]
+#[case::disabled(Some(false))]
+#[tokio::test]
+async fn test_cancel_on_disconnect_reconnect_does_not_toggle_wallet(#[case] enabled: Option<bool>) {
+    let state = ServerState::new();
+    state
+        .disconnect_after_subscribe
+        .store(true, Ordering::SeqCst);
+    let addr = start_server(state.clone()).await;
+    let mut client = DeriveWebSocketClient::with_credentials(
+        Some(ws_url(addr)),
+        DeriveEnvironment::Mainnet,
+        TransportBackend::default(),
+        None,
+        test_credentials(),
+        None,
+        None,
+    );
+    client.connect().await.unwrap();
+    if let Some(enabled) = enabled {
+        client.set_cancel_on_disconnect(enabled).await.unwrap();
+    }
+
+    client.subscribe_ticker("ETH-PERP", "1000").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = client.next_event().await {
+            if matches!(event, DeriveWsMessage::Reconnected) {
+                return;
+            }
+        }
+
+        panic!("stream ended before recovery");
+    })
+    .await
+    .unwrap();
+
+    assert!(client.is_authenticated());
+    client.disconnect().await.unwrap();
+    assert_eq!(state.login_frames.lock().await.len(), 2);
+    let frames = state.private_frames.lock().await;
+    assert_eq!(frames.len(), usize::from(enabled.is_some()));
+
+    if let Some(enabled) = enabled {
+        assert_eq!(frames[0]["params"]["enabled"], enabled);
+    }
+}
+
+#[tokio::test]
+async fn test_cancel_on_disconnect_requires_credentials_and_authentication() {
+    let mut client = DeriveWebSocketClient::new(
+        None,
+        DeriveEnvironment::Mainnet,
+        TransportBackend::default(),
+        None,
+    );
+    assert!(
+        matches!(client.set_cancel_on_disconnect(true).await.unwrap_err(), DeriveWsError::MissingCredentials { operation } if operation == "private/set_cancel_on_disconnect")
+    );
+    client = DeriveWebSocketClient::with_credentials(
+        None,
+        DeriveEnvironment::Mainnet,
+        TransportBackend::default(),
+        None,
+        test_credentials(),
+        None,
+        None,
+    );
+    client.set_request_timeout(Duration::from_millis(10));
+    assert!(
+        matches!(client.set_cancel_on_disconnect(false).await.unwrap_err(), DeriveWsError::Authentication { operation, .. } if operation == "private/set_cancel_on_disconnect")
+    );
 }
